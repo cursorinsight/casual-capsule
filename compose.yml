@@ -1,13 +1,14 @@
 services:
   cli:
     build: .
+    working_dir: /workspace
     environment:
       - GITHUB_TOKEN
       - OPENAI_BASE_URL
       - OPENAI_API_KEY
-    restart: unless-stopped
+    restart: "no"
     volumes:
-      - /Users/b/Work/TEMP:/mnt/TEMP
-      - /Users/b/.codex:/home/b/.codex
-      - /Users/b/.config/gh:/home/b/.config/gh
-      - /Users/b/.local/share/gh:/home/b/.local/share/gh
+      - ${PWD}:/workspace
+      - ${HOME}/.codex:/home/user/.codex
+      - ${HOME}/.config/gh:/home/user/.config/gh
+      - ${HOME}/.local/share/gh:/home/user/.local/share/gh
