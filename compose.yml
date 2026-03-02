@@ -10,7 +10,7 @@ services:
       - DOCKER_GID=${DOCKER_GID:-999}
     restart: "no"
     volumes:
-      - ${CC_WORKDIR:-${PWD}}:/workspace
+      - ${CAPSULE_WORKDIR:-${CC_WORKDIR:-${PWD}}}:/workspace
       - /var/run/docker.sock:/var/run/docker.sock
       - home:/home/user
 

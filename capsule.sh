@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
-export CC_WORKDIR="${CC_WORKDIR:-$(pwd -P)}"
+export CAPSULE_WORKDIR="${CAPSULE_WORKDIR:-${CC_WORKDIR:-$(pwd -P)}}"
 
 if [[ -z "${DOCKER_GID:-}" ]]; then
   DOCKER_SOCK_PATH=""

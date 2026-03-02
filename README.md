@@ -9,7 +9,8 @@ common developer tools.
   Codex, OpenAI CLI, Docker CLI, Compose plugin, and Copilot CLI.
 - `compose.yml`: Local compose service (`cli`) that builds from `Dockerfile`,
   runs as `8888:100`, and adds Docker socket access via `DOCKER_GID`.
-- `cc.sh`: Launcher script for running the CLI from any project directory.
+- `capsule.sh`: Launcher script for running the CLI from any project
+  directory.
 
 ## Prerequisites
 
@@ -44,29 +45,29 @@ codex
 copilot
 ```
 
-### 3. Use `cc.sh` (recommended)
+### 3. Use `capsule.sh` (recommended)
 
-`cc.sh` sets `CC_WORKDIR` to your current directory and runs the CLI
-service from this repository's Compose file. `compose.yml` also falls back
-to `PWD` if `CC_WORKDIR` is not set. It also detects `DOCKER_GID` from
-the active Docker socket when possible.
+`capsule.sh` sets `CAPSULE_WORKDIR` to your current directory and runs the
+CLI service from this repository's Compose file. `compose.yml` falls back to
+`CC_WORKDIR` and then `PWD` if `CAPSULE_WORKDIR` is not set. It also detects
+`DOCKER_GID` from the active Docker socket when possible.
 The service runs as `uid=8888,gid=100` and uses `group_add` with
 `DOCKER_GID` for host Docker socket access.
 If detection fails, it defaults to `991` on macOS and `999` on Linux.
-On macOS, if auto-detection returns `20` (`staff`), `cc.sh` overrides it to
-`991` because `20` is commonly not usable for Docker socket access here.
-If you export `DOCKER_GID` yourself, `cc.sh` keeps your explicit value.
+On macOS, if auto-detection returns `20` (`staff`), `capsule.sh` overrides it
+to `991` because `20` is commonly not usable for Docker socket access here.
+If you export `DOCKER_GID` yourself, `capsule.sh` keeps your explicit value.
 
 From this repo:
 
 ```bash
-./cc.sh
+./capsule.sh
 ```
 
 From any directory, with an alias:
 
 ```bash
-alias cc="/absolute/path/to/casual-capsule/cc.sh"
+alias capsule="/absolute/path/to/casual-capsule/capsule.sh"
 ```
 
 Add that alias to one of these files:
@@ -77,15 +78,15 @@ Add that alias to one of these files:
 Then reload your shell and run:
 
 ```bash
-cc
+capsule
 ```
 
 Optional: pass a command instead of the default shell.
 
 ```bash
-cc codex
-cc bash -lc "go version && node -v"
-cc docker ps
+capsule codex
+capsule bash -lc "go version && node -v"
+capsule docker ps
 ```
 
 ### 4. Use Docker Compose directly
@@ -124,8 +125,8 @@ untrusted code, untrusted users, or shared multi-tenant hosts.
 
 ### High
 
-1. Resolved: host-specific volume mounts were replaced with `CC_WORKDIR`
-   and `${HOME}` for portability.
+1. Resolved: host-specific volume mounts were replaced with portable working
+   directory environment variables for better portability.
    - `compose.yml:10`
    - `compose.yml:11`
    - `compose.yml:12`
@@ -152,4 +153,4 @@ untrusted code, untrusted users, or shared multi-tenant hosts.
 ## Suggested Follow-up Fixes
 
 1. Pin base image digests for stronger reproducibility.
-2. Add shell completion for `cc.sh` command argument passthrough.
+2. Add shell completion for `capsule.sh` command argument passthrough.
