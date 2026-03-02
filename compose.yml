@@ -1,7 +1,9 @@
 services:
   cli:
     build: .
-    user: "8888"
+    user: "8888:100"
+    group_add:
+      - "${DOCKER_GID:-999}"
     working_dir: /workspace
     environment:
       - DOCKER_HOST=unix:///var/run/docker.sock
