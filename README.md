@@ -3,7 +3,7 @@
 Containerized CLI workspace for AI coding agents (`codex`, Copilot CLI) with
 common developer tools.
 
-## What is in this repo
+## Project Structure
 
 - `Dockerfile`: Main image based on `jdxcode/mise` with Node, Go, npm,
   Codex, OpenAI CLI, Docker CLI, Compose plugin, Copilot CLI, and agent
@@ -173,36 +173,3 @@ the container can control the host Docker daemon.
 Treat this as effectively host-level access. Do not use this setup with
 untrusted code, untrusted users, or shared multi-tenant hosts.
 
-## Code Review Findings
-
-### High
-
-1. Resolved: host-specific volume mounts were replaced with portable working
-   directory environment variables for better portability.
-   - `compose.yml:10`
-   - `compose.yml:11`
-   - `compose.yml:12`
-   - `compose.yml:13`
-2. Resolved: Node setup now uses a stable major (`24`) without a
-   conflicting `latest` selector.
-   - `Dockerfile:25`
-   - `Dockerfile:26`
-
-### Medium
-
-1. Resolved: restart policy is now `no` for an interactive CLI service.
-   - `compose.yml:8`
-2. Resolved: image provisioning no longer runs `apt-get upgrade`,
-   reducing package drift risk.
-   - `Dockerfile:6`
-
-### Low
-
-1. README previously lacked runnable setup details and operational
-   notes; this file now provides baseline usage.
-   - `README.md:1`
-
-## Suggested Follow-up Fixes
-
-1. Pin base image digests for stronger reproducibility.
-2. Add shell completion for `capsule.sh` command argument passthrough.
