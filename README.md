@@ -173,3 +173,9 @@ the container can control the host Docker daemon.
 Treat this as effectively host-level access. Do not use this setup with
 untrusted code, untrusted users, or shared multi-tenant hosts.
 
+## License
+
+Copyright 2026 Cursor Insight
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
+
