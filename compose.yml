@@ -10,7 +10,7 @@ services:
       secrets:
         - github_api_token
     volumes:
-      - ${CAPSULE_WORKDIR:-${PWD}}:/home/workspace
+      - ${CAPSULE_HOST_WORKDIR:-${CAPSULE_WORKDIR:-${PWD}}}:/home/workspace
       - /var/run/docker.sock:/var/run/docker.sock
       - home:/home/user
     environment:
@@ -18,6 +18,7 @@ services:
       - DOCKER_GID=${DOCKER_GID:-999}
       - CAPSULE_UID=${CAPSULE_UID:-}
       - CAPSULE_GID=${CAPSULE_GID:-}
+      - CAPSULE_HOST_WORKDIR=${CAPSULE_HOST_WORKDIR:-}
     working_dir: /home/workspace
     restart: "no"
     hostname: capsule

@@ -32,7 +32,9 @@ common developer tools.
   `CAPSULE_UID`/`CAPSULE_GID`. Also sets hostname `capsule` and persists the
   home directory in a named volume.
 - `capsule.sh`: Launcher script for running the CLI from any project directory.
-- `tests/test_capsule.sh`: Bash test suite for launcher and Compose contract.
+- `tests/suite_fast.sh`: Fast Bash tests for the launcher and Compose contract.
+- `tests/suite_e2e.sh`: Docker-backed end-to-end example-project test.
+- `tests/test_all.sh`: Runs the fast and end-to-end suites in order.
 
 ## 📋 Prerequisites
 
@@ -139,6 +141,24 @@ Then reload your shell and run:
 capsule
 ```
 
+#### Bind mounts in containers started in a Capsule
+
+When you start a Docker container inside a Capsule Docker container, sometimes
+you want to mount directories to that container that are in the workspace
+(`/home/workspace`). For example `tests/suite_e2e.sh` does this.
+
+So when you do this, `capsule.sh` translates directory paths as seen on the
+container (for example, `/home/workspace/mydir`) back to the original host path
+(for example, `/home/myuser/myproject/mydir`) before asking the Docker server
+(which runs on the host machine) to create the workspace bind mount.
+
+For this mechanism to work, you need to set the following environment variable
+when starting the container:
+
+- `CAPSULE_HOST_WORKDIR`: host-visible path for `/home/workspace`.
+
+See more information about it in `capsule.sh`.
+
 #### Examples
 
 Pass a command instead of the default shell:
@@ -188,10 +208,20 @@ docker compose run --rm cli
 ### 5. 🧪 Run tests
 
 ```bash
-./tests/test_capsule.sh
+CAPSULE_HOST_WORKDIR=$(pwd) tests/test_all.sh
 ```
 
-The tests use command stubs, so they do not require a running Docker daemon.
+`test_all.sh` prints each suite name before running it.
+
+*   The fast suite uses command stubs, so it does not require a running Docker
+    daemon.
+
+*   The end-to-end suite builds and runs the real capsule image when Docker and
+    Compose are available. It skips cleanly when the daemon is unavailable.
+
+    The end-to-end suite also prints the path to a per-run logfile under
+    `_build/tests/`. The logfile is kept after the run and records suite events
+    and plain Docker/Capsule output with UTC timestamps on every line.
 
 ### 6. 🤖 Included agent tooling
 

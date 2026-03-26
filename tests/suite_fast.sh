@@ -1,4 +1,14 @@
 #!/usr/bin/env bash
+#-------------------------------------------------------------------------------
+# Copyright (C) 2026- Cursor Insight
+#
+# SPDX-License-Identifier: Apache-2.0
+#-------------------------------------------------------------------------------
+# Test suite that contain fast test cases.
+#
+# These test cases use mocking to avoid calling into Docker.
+#-------------------------------------------------------------------------------
+
 set -euo pipefail
 
 ROOT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
@@ -6,12 +16,14 @@ SCRIPT_PATH="$ROOT_DIR/capsule.sh"
 COMPOSE_PATH="$ROOT_DIR/compose.yml"
 DOCKERFILE_PATH="$ROOT_DIR/Dockerfile"
 ENTRYPOINT_PATH="$ROOT_DIR/docker/entrypoint.sh"
+EXAMPLE_PROJECT_DIR="$ROOT_DIR/tests/fixtures/example-project"
 
 TEST_TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TEST_TMPDIR"' EXIT
 
 PASS_COUNT=0
 FAIL_COUNT=0
+SKIP_COUNT=0
 
 fail() {
   printf 'FAIL: %s\n' "$1" >&2
@@ -21,6 +33,11 @@ fail() {
 pass() {
   printf 'PASS: %s\n' "$1"
   PASS_COUNT=$((PASS_COUNT + 1))
+}
+
+skip() {
+  printf 'SKIP: %s\n' "$1"
+  SKIP_COUNT=$((SKIP_COUNT + 1))
 }
 
 assert_file_contains() {
@@ -38,20 +55,6 @@ assert_equals() {
   local expected="$1"
   local actual="$2"
   local msg="$3"
-  if [[ "$expected" == "$actual" ]]; then
-    pass "$msg"
-  else
-    fail "$msg (expected=$expected actual=$actual)"
-  fi
-}
-
-assert_log_line() {
-  local expected="$1"
-  local line_no="$2"
-  local file="$3"
-  local msg="$4"
-  local actual=""
-  actual="$(sed -n "${line_no}p" "$file")"
   if [[ "$expected" == "$actual" ]]; then
     pass "$msg"
   else
@@ -78,6 +81,7 @@ if [[ "${1:-}" == "compose" ]]; then
   {
     printf 'ENV_DOCKER_GID=%s\n' "${DOCKER_GID:-}"
     printf 'ENV_CAPSULE_WORKDIR=%s\n' "${CAPSULE_WORKDIR:-}"
+    printf 'ENV_CAPSULE_HOST_WORKDIR=%s\n' "${CAPSULE_HOST_WORKDIR:-}"
     printf 'ENV_CAPSULE_UID=%s\n' "${CAPSULE_UID:-}"
     printf 'ENV_CAPSULE_GID=%s\n' "${CAPSULE_GID:-}"
     printf 'ARGS=%s\n' "$*"
@@ -142,13 +146,20 @@ run_capsule() {
   shift 2
   echo "${CAPSULE_WORKDIR:-$(pwd -P)}" >"${cfg_file}"
   PATH="$mock_bin:$PATH" MOCK_LOG="$log_file" CAPSULE_CONFIG="$cfg_file" \
-      "$SCRIPT_PATH" "$@"
+    "$SCRIPT_PATH" "$@"
 }
 
 value_from_log() {
   local key="$1"
   local log_file="$2"
   grep -F "$key=" "$log_file" | tail -n1 | cut -d= -f2-
+}
+
+entry_from_log() {
+  local key="$1"
+  local index="$2"
+  local log_file="$3"
+  grep -F "$key=" "$log_file" | sed -n "${index}p"
 }
 
 # shellcheck disable=SC2016
@@ -166,8 +177,11 @@ test_compose_contract() {
     'CAPSULE_GID=${CAPSULE_GID:-}' \
     "compose passes CAPSULE_GID to container environment"
   assert_file_contains "$COMPOSE_PATH" \
-    '${CAPSULE_WORKDIR:-${PWD}}:/home/workspace' \
-    "compose keeps CAPSULE_WORKDIR with compatibility fallback"
+    '${CAPSULE_HOST_WORKDIR:-${CAPSULE_WORKDIR:-${PWD}}}:/home/workspace' \
+    "compose mounts the host-visible capsule workdir"
+  assert_file_contains "$COMPOSE_PATH" \
+    'CAPSULE_HOST_WORKDIR=${CAPSULE_HOST_WORKDIR:-}' \
+    "compose passes host workdir to nested capsule"
 }
 
 test_dockerfile_tooling_contract() {
@@ -249,16 +263,19 @@ test_build_flag_runs_build_then_runtime() {
   DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" --build true
 
   expected_build="ARGS=compose -f $COMPOSE_PATH --project-directory $ROOT_DIR"
-  expected_build="$expected_build build --build-arg MISE_VERSION=${mise_ver} cli"
+  expected_build="$expected_build build --build-arg MISE_VERSION=${mise_ver}"
+  expected_build="$expected_build cli"
   expected_run="ARGS=compose -f $COMPOSE_PATH --project-directory $ROOT_DIR"
   expected_run="$expected_run run --rm cli true"
 
-  assert_log_line \
+  assert_equals \
     "$expected_build" \
-    5 "$log_file" "build flag runs compose build first"
-  assert_log_line \
+    "$(entry_from_log ARGS 1 "$log_file")" \
+    "build flag runs compose build first"
+  assert_equals \
     "$expected_run" \
-    10 "$log_file" "build flag still runs compose runtime"
+    "$(entry_from_log ARGS 2 "$log_file")" \
+    "build flag still runs compose runtime"
 }
 
 test_double_dash_keeps_runtime_flags() {
@@ -293,16 +310,19 @@ test_build_flag_without_runtime_args() {
   DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" -b
 
   expected_build="ARGS=compose -f $COMPOSE_PATH --project-directory $ROOT_DIR"
-  expected_build="$expected_build build --build-arg MISE_VERSION=${mise_ver} cli"
+  expected_build="$expected_build build --build-arg MISE_VERSION=${mise_ver}"
+  expected_build="$expected_build cli"
   expected_run="ARGS=compose -f $COMPOSE_PATH --project-directory $ROOT_DIR"
   expected_run="$expected_run run --rm cli"
 
-  assert_log_line \
+  assert_equals \
     "$expected_build" \
-    5 "$log_file" "build flag works without runtime args (build call)"
-  assert_log_line \
+    "$(entry_from_log ARGS 1 "$log_file")" \
+    "build flag works without runtime args (build call)"
+  assert_equals \
     "$expected_run" \
-    10 "$log_file" "build flag works without runtime args (run call)"
+    "$(entry_from_log ARGS 2 "$log_file")" \
+    "build flag works without runtime args (run call)"
 }
 
 test_plain_runtime_without_args() {
@@ -430,6 +450,44 @@ test_workdir_precedence() {
     "current directory is fallback when workdir vars are unset"
 }
 
+test_host_workdir_defaults_to_current_workdir() {
+  local tdir="$TEST_TMPDIR/host-workdir-default"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  (
+    unset CAPSULE_HOST_WORKDIR
+    cd "$EXAMPLE_PROJECT_DIR"
+    DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" true
+  )
+
+  assert_equals "$EXAMPLE_PROJECT_DIR" \
+    "$(value_from_log ENV_CAPSULE_HOST_WORKDIR "$log_file")" \
+    "host capsule uses current workdir as host workdir"
+}
+
+test_nested_capsule_uses_host_workdir() {
+  local tdir="$TEST_TMPDIR/nested-workdir"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local nested_dir="/home/workspace/project/subdir"
+  make_mock_bin "$mock_bin"
+
+  DOCKER_GID=1111 \
+    CAPSULE_WORKDIR="$nested_dir" \
+    CAPSULE_HOST_WORKDIR="/host/workspace" \
+    run_capsule "$mock_bin" "$log_file" true
+
+  assert_equals "$nested_dir" \
+    "$(value_from_log ENV_CAPSULE_WORKDIR "$log_file")" \
+    "nested capsule keeps container-local workdir for approval"
+  assert_equals "/host/workspace/project/subdir" \
+    "$(value_from_log ENV_CAPSULE_HOST_WORKDIR "$log_file")" \
+    "nested capsule forwards host-visible nested workdir"
+}
+
 test_linux_gid_autodetect_from_docker_host() {
   local tdir="$TEST_TMPDIR/linux-detect"
   local mock_bin="$tdir/bin"
@@ -507,13 +565,13 @@ main() {
   fi
 
   if command -v shellcheck >/dev/null 2>&1; then
-      if ! shellcheck "$SCRIPT_PATH"; then
-          fail "capsule.sh has linting errors"
-      else
-          pass "capsule.sh is lint free"
-      fi
+    if ! shellcheck "$SCRIPT_PATH"; then
+      fail "capsule.sh has linting errors"
+    else
+      pass "capsule.sh is lint free"
+    fi
   else
-      printf 'SKIP: shellcheck not installed; skipping lint check\n'
+    skip "shellcheck not installed; skipping lint check"
   fi
 
   test_compose_contract
@@ -529,12 +587,15 @@ main() {
   test_uid_gid_fallback_when_id_fails
   test_explicit_uid_gid_passthrough
   test_workdir_precedence
+  test_host_workdir_defaults_to_current_workdir
+  test_nested_capsule_uses_host_workdir
   test_linux_gid_autodetect_from_docker_host
   test_bad_docker_host_falls_back_to_context_socket
   test_macos_staff_gid_override
   test_default_gid_when_detection_fails
 
-  printf '\nSummary: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
+  printf '\nSummary: %d passed, %d failed, %d skipped\n' \
+    "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT"
   [[ "$FAIL_COUNT" -eq 0 ]]
 }
 
