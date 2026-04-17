@@ -17,7 +17,7 @@ RUN --mount=type=cache,id=apt-global,sharing=locked,target=/var/cache/apt \
     apt-get update && \
     apt-get -y --no-install-recommends install \
     bash-completion build-essential busybox ca-certificates curl git gnupg \
-    openssh-client procps shellcheck sudo tree unzip vim zip && \
+    less openssh-client procps shellcheck sudo tree unzip vim zip && \
     rm -rf /var/lib/apt/lists/* && \
     busybox --install -s
 
