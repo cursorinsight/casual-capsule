@@ -26,11 +26,12 @@ common developer tools.
 - `docker/mise.sh`: Placed in `/etc/profile.d/`; activates mise and its shell
   completions for interactive shells.
   container.
-- `compose.yml`: Local Compose service (`cli`) that builds from `Dockerfile` and
-  adds Docker socket access via `DOCKER_GID`. The container user matches the
-  host user's UID/GID (auto-detected by `capsule.sh`); override with
-  `CAPSULE_UID`/`CAPSULE_GID`. Also sets hostname `capsule` and persists the
-  home directory in a named volume.
+- `compose.yml`: Local Compose service (`cli`) that builds from `Dockerfile`,
+  publishes the stable base image name `casual-capsule:local`, and adds Docker
+  socket access via `DOCKER_GID`. The container user matches the host user's
+  UID/GID (auto-detected by `capsule.sh`); override with `CAPSULE_UID`/
+  `CAPSULE_GID`. Also sets hostname `capsule` and persists the home directory
+  in a named volume.
 - `capsule.sh`: Launcher script for running the CLI from any project directory.
 - `tests/suite_fast.sh`: Fast Bash tests for the launcher and Compose contract.
 - `tests/suite_e2e.sh`: Docker-backed end-to-end example-project test.
@@ -86,7 +87,9 @@ service via Compose. It auto-detects the host user's UID/GID via `id -u`/`id -g`
 and `DOCKER_GID` from the active Docker socket (falling back to `991` on macOS,
 `999` on Linux). If UID/GID detection fails (e.g. `id` is unavailable), it falls
 back to `1000:100` and prints a warning. The entrypoint handles UID/GID
-adjustment and Docker socket group membership at startup.
+adjustment and Docker socket group membership at startup. If
+`CAPSULE_CUSTOM_COMPOSE` is set, Capsule layers that compose file on top of the
+base `compose.yml` for both runtime and `--build`.
 
 On the first run in a new directory, `capsule.sh` prompts for explicit approval
 and records the approved path in `~/.config/capsule` (overridable via
@@ -116,6 +119,8 @@ CAPSULE_UID=2000 CAPSULE_GID=2000 capsule --build
 - `CAPSULE_GID`: Container user GID (auto-detected from host).
 - `DOCKER_GID`: Docker socket GID (auto-detected).
 - `CAPSULE_WORKDIR`: Workspace directory (default: cwd).
+- `CAPSULE_CUSTOM_COMPOSE`: Optional custom compose override file
+  (`compose.yml`).
 - `CAPSULE_CONFIG`: Path to the allowlist file (default: `~/.config/capsule`).
 - `GITHUB_API_TOKEN`: Passed as a build secret for `gh` auth and Copilot CLI.
 
@@ -158,6 +163,54 @@ when starting the container:
 - `CAPSULE_HOST_WORKDIR`: host-visible path for `/home/workspace`.
 
 See more information about it in `capsule.sh`.
+
+#### Custom Capsule images
+
+If you want to extend the Docker image or Compose configuration provided by
+Capsule, you can do that by creating a custom `compose.yml` file and setting its
+path in `CAPSULE_CUSTOM_COMPOSE`.
+
+The custom `compose.yml` file must override the `cli` section.
+
+Example layout:
+
+```text
+/home/myuser/python-capsule/
+|- Dockerfile
+`- compose.yml
+```
+
+Example `Dockerfile`:
+
+```dockerfile
+FROM casual-capsule:local
+
+RUN uv tool install black
+```
+
+Example `compose.yml`:
+
+```yaml
+services:
+  cli:
+    image: python-capsule:local
+    build:
+      context: ${CAPSULE_CUSTOM_DIR}
+      dockerfile: ${CAPSULE_CUSTOM_DIR}/Dockerfile
+    environment:
+      PYTHON_CAPSULE: "1"
+```
+
+Use it like this:
+
+```bash
+export CAPSULE_CUSTOM_COMPOSE=/home/myuser/python-capsule/compose.yml
+./capsule.sh --build
+```
+
+With a custom compose file, `capsule.sh --build` first rebuilds the base image
+`casual-capsule:local`, then builds the merged custom `cli` image, and finally
+starts the container from that merged configuration.
 
 #### Examples
 
