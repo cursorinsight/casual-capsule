@@ -104,22 +104,18 @@ CAPSULE_UID=2000 CAPSULE_GID=2000 capsule --build
 
 #### ⚙️ Launcher options
 
-| Flag            | Description                                                   |
-|-----------------|---------------------------------------------------------------|
-| `-b`, `--build` | Run `docker compose build cli` before `run`.                  |
-| `-h`, `--help`  | Show usage message.                                           |
-| `--`            | Stop launcher option parsing; pass remaining args to runtime. |
+- `-b`, `--build`: Run `docker compose build cli` before `run`.
+- `-h`, `--help`: Show usage message.
+- `--`: Stop launcher option parsing; pass remaining args to runtime.
 
 #### ⚙️ Environment variables
 
-| Variable           | Description                                                |
-|--------------------|------------------------------------------------------------|
-| `CAPSULE_UID`      | Container user UID (auto-detected from host).              |
-| `CAPSULE_GID`      | Container user GID (auto-detected from host).              |
-| `DOCKER_GID`       | Docker socket GID (auto-detected).                         |
-| `CAPSULE_WORKDIR`  | Workspace directory (default: cwd).                        |
-| `CAPSULE_CONFIG`   | Path to the allowlist file (default: `~/.config/capsule`). |
-| `GITHUB_API_TOKEN` | Passed as a build secret for `gh` auth and Copilot CLI.    |
+- `CAPSULE_UID`: Container user UID (auto-detected from host).
+- `CAPSULE_GID`: Container user GID (auto-detected from host).
+- `DOCKER_GID`: Docker socket GID (auto-detected).
+- `CAPSULE_WORKDIR`: Workspace directory (default: cwd).
+- `CAPSULE_CONFIG`: Path to the allowlist file (default: `~/.config/capsule`).
+- `GITHUB_API_TOKEN`: Passed as a build secret for `gh` auth and Copilot CLI.
 
 #### 🔧 Install as an alias
 
@@ -202,31 +198,26 @@ The tests use command stubs, so they do not require a running Docker daemon.
 The image includes utilities commonly used by coding agents, installed via
 `mise` (configured in the `MISE_SYSTEM_TOOLS` Dockerfile ARG):
 
-| Tool             | Purpose                                          |
-|------------------|--------------------------------------------------|
-| `bat`            | Syntax-highlighted file viewing                  |
-| `eza`            | Enhanced directory listing                       |
-| `fd`             | Fast file discovery                              |
-| `gh`             | GitHub CLI operations                            |
-| `jq`             | JSON filtering and inspection                    |
-| `rg` (`ripgrep`) | Fast content search                              |
-| `uv`             | Python version, tool, and environment management |
+- `bat`: Syntax-highlighted file viewing.
+- `eza`: Enhanced directory listing.
+- `fd`: Fast file discovery.
+- `gh`: GitHub CLI operations.
+- `jq`: JSON filtering and inspection.
+- `rg` (`ripgrep`): Fast content search.
+- `uv`: Python version, tool, and environment management.
 
 Installed via `apt`:
 
-| Tool         | Purpose                           |
-|--------------|-----------------------------------|
-| `shellcheck` | Shell script linting              |
-| `tree`       | Directory structure visualization |
+- `shellcheck`: Shell script linting.
+- `tree`: Directory structure visualization.
 
 Python tooling (installed via `uv`; binaries available on `PATH` via
 `~/.local/bin`):
 
-| Tool     | Purpose                                                              |
-|----------|----------------------------------------------------------------------|
-| `python` | Python runtime (version set by `PYTHON_VERSION` ARG, default `3.14`) |
-| `ruff`   | Fast Python linter and formatter                                     |
-| `ty`     | Python type checker                                                  |
+- `python`: Python runtime (version set by `PYTHON_VERSION` ARG, default
+  `3.14`).
+- `ruff`: Fast Python linter and formatter.
+- `ty`: Python type checker.
 
 Verify inside capsule:
 
