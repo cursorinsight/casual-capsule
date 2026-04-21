@@ -268,7 +268,6 @@ fi
 BASE_COMPOSE_CMD=(
   docker compose
   -f "$SCRIPT_DIR/compose.yml"
-  --project-directory "$SCRIPT_DIR"
 )
 
 COMPOSE_CMD=("${BASE_COMPOSE_CMD[@]}")
@@ -277,7 +276,6 @@ if [[ -n "$CAPSULE_CUSTOM_COMPOSE" ]]; then
     docker compose
     -f "$SCRIPT_DIR/compose.yml"
     -f "$CAPSULE_CUSTOM_COMPOSE"
-    --project-directory "$SCRIPT_DIR"
   )
 fi
 

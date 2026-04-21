@@ -266,10 +266,10 @@ test_build_flag_runs_build_then_runtime() {
 
   DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" --build true
 
-  expected_build="ARGS=compose -f $COMPOSE_PATH --project-directory $ROOT_DIR"
+  expected_build="ARGS=compose -f $COMPOSE_PATH"
   expected_build="$expected_build build --build-arg MISE_VERSION=${mise_ver}"
   expected_build="$expected_build cli"
-  expected_run="ARGS=compose -f $COMPOSE_PATH --project-directory $ROOT_DIR"
+  expected_run="ARGS=compose -f $COMPOSE_PATH"
   expected_run="$expected_run run --rm cli true"
 
   assert_equals \
@@ -314,7 +314,7 @@ test_double_dash_keeps_runtime_flags() {
 
   DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" -- --build true
 
-  expected_args="compose -f $COMPOSE_PATH --project-directory $ROOT_DIR"
+  expected_args="compose -f $COMPOSE_PATH"
   expected_args="$expected_args run --rm cli --build true"
 
   assert_equals \
@@ -335,10 +335,10 @@ test_build_flag_without_runtime_args() {
 
   DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" -b
 
-  expected_build="ARGS=compose -f $COMPOSE_PATH --project-directory $ROOT_DIR"
+  expected_build="ARGS=compose -f $COMPOSE_PATH"
   expected_build="$expected_build build --build-arg MISE_VERSION=${mise_ver}"
   expected_build="$expected_build cli"
-  expected_run="ARGS=compose -f $COMPOSE_PATH --project-directory $ROOT_DIR"
+  expected_run="ARGS=compose -f $COMPOSE_PATH"
   expected_run="$expected_run run --rm cli"
 
   assert_equals \
@@ -361,7 +361,7 @@ test_plain_runtime_without_args() {
 
   DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file"
 
-  expected_run="compose -f $COMPOSE_PATH --project-directory $ROOT_DIR"
+  expected_run="compose -f $COMPOSE_PATH"
   expected_run="$expected_run run --rm cli"
   assert_equals \
     "$expected_run" \
@@ -385,7 +385,7 @@ test_custom_compose_runtime_uses_merged_config() {
     run_capsule "$mock_bin" "$log_file" true
 
   expected_run="compose -f $COMPOSE_PATH -f $custom_compose"
-  expected_run="$expected_run --project-directory $ROOT_DIR run --rm cli true"
+  expected_run="$expected_run run --rm cli true"
 
   assert_equals \
     "$expected_run" \
@@ -415,15 +415,14 @@ test_custom_compose_builds_base_then_custom_then_runs() {
   DOCKER_GID=1111 CAPSULE_CUSTOM_COMPOSE="$custom_compose" \
     run_capsule "$mock_bin" "$log_file" --build true
 
-  expected_build="ARGS=compose -f $COMPOSE_PATH --project-directory $ROOT_DIR"
+  expected_build="ARGS=compose -f $COMPOSE_PATH"
   expected_build="$expected_build build --build-arg MISE_VERSION=${mise_ver}"
   expected_build="$expected_build cli"
   expected_custom_build="ARGS=compose -f $COMPOSE_PATH -f $custom_compose"
-  expected_custom_build="$expected_custom_build --project-directory $ROOT_DIR"
   expected_custom_build="$expected_custom_build build --build-arg"
   expected_custom_build="$expected_custom_build MISE_VERSION=${mise_ver} cli"
   expected_run="ARGS=compose -f $COMPOSE_PATH -f $custom_compose"
-  expected_run="$expected_run --project-directory $ROOT_DIR run --rm cli true"
+  expected_run="$expected_run run --rm cli true"
 
   assert_equals \
     "$expected_build" \
