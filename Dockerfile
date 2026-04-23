@@ -54,12 +54,20 @@ COPY --chmod=644 docker/mise.sh /etc/profile.d/
 # Copy entrypoint (owned by root for security)
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/
 
+# Prepare the final non-root user's home directories.
+RUN install -d -o user -g "${CAPSULE_GID}" \
+    /home/user/.cache \
+    /home/user/.config/mise \
+    /home/user/.local/bin \
+    /home/user/.local/share/mise/shims && \
+    HOME=/home/user MISE_CONFIG_DIR=/home/user/.config/mise \
+    mise use --global ${MISE_SYSTEM_TOOLS} && \
+    chown -R user: /home/user
+
+ENV HOME="/home/user"
+
 # Switch user
 USER user
-
-# Activate system tools
-RUN --mount=type=secret,id=github_api_token,env=GITHUB_API_TOKEN,required=false \
-    mise use --global ${MISE_SYSTEM_TOOLS}
 
 # GitHub token login
 RUN --mount=type=secret,id=github_api_token,uid=1000,required=false \
