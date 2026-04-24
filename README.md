@@ -25,7 +25,6 @@ common developer tools.
   `docker-buildx-plugin`.
 - `docker/mise.sh`: Placed in `/etc/profile.d/`; activates mise and its shell
   completions for interactive shells.
-- `docker/AGENTS.md`: Shared agent policy file mounted at `/home/` inside the
   container.
 - `compose.yml`: Local Compose service (`cli`) that builds from `Dockerfile` and
   adds Docker socket access via `DOCKER_GID`. The container user matches the

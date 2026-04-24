@@ -81,9 +81,6 @@ RUN mise x -- uv python install --default ${PYTHON_VERSION} && \
     mise x -- uv tool install ruff && \
     mise x -- uv tool install ty
 
-# Use a common AGENTS.md in the direct parent of `workspace`
-COPY --chmod=644 docker/AGENTS.md /home/
-
 # Add mise shims to path
 ENV PATH="/home/user/.local/share/mise/shims:/home/user/.local/bin:$PATH"
 
