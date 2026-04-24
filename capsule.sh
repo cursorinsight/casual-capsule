@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+if [[ "${CAPSULE_DEBUG:-}" == "1" ]]; then
+  set -x
+fi
+
 set -euo pipefail
 
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)"
@@ -103,6 +107,7 @@ Options:
   -h, --help   Show this help message.
 
 Environment:
+  CAPSULE_DEBUG    Enable shell xtrace when set to 1.
   CAPSULE_UID      Container user UID (auto-detected).
   CAPSULE_GID      Container user GID (auto-detected).
   DOCKER_GID       Docker socket GID (auto-detected).

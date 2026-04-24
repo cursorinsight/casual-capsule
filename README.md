@@ -442,6 +442,10 @@ Options:
 
 ### Environment variables
 
+*   `CAPSULE_DEBUG`: Enable shell xtrace for `capsule.sh`.
+
+    Default: empty. When set to `1`, `capsule.sh` runs with `set -x`.
+
 *   `CAPSULE_UID`: Container user UID (user ID).
 
     Default: The output of `id -u` on the host. If that doesn't work, then 1000.

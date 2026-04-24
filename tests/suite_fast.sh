@@ -532,6 +532,22 @@ test_explicit_docker_gid_passthrough() {
     "capsule forwards explicit CAPSULE_WORKDIR"
 }
 
+test_debug_mode_enables_xtrace() {
+  local tdir="$TEST_TMPDIR/debug-mode"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local err_file="$tdir/err"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  CAPSULE_DEBUG=1 DOCKER_GID=1111 \
+    run_capsule "$mock_bin" "$log_file" true 2>"$err_file"
+
+  assert_file_contains "$err_file" \
+    "+ set -euo pipefail" \
+    "CAPSULE_DEBUG=1 enables shell xtrace"
+}
+
 test_uid_gid_autodetect() {
   local tdir="$TEST_TMPDIR/uid-autodetect"
   local mock_bin="$tdir/bin"
@@ -760,6 +776,7 @@ main() {
   test_custom_compose_requires_readable_file
   test_custom_compose_requires_cli_image
   test_explicit_docker_gid_passthrough
+  test_debug_mode_enables_xtrace
   test_uid_gid_autodetect
   test_uid_gid_fallback_when_id_fails
   test_explicit_uid_gid_passthrough
