@@ -9,14 +9,16 @@
 5. When adding shell flags or argument parsing, include edge-case tests for
    empty-argument invocations.
 
-## Commit Ownership
+## Git usage
+
+### Commit Ownership
 
 1. The repository owner creates and GPG-signs commits.
 2. Agents must not run `git commit` unless explicitly asked.
 3. If asked for a message, base it on currently staged changes.
 4. If staged and unstaged differ, state that the message is staged-only.
 
-## Commit Message Rules
+### Commit Message Rules
 
 1. Headline format: `<type>(<scope>): <Headline>`.
 2. Use a prefix and capitalize the first character of the headline.
@@ -24,7 +26,7 @@
 4. Write the body as bullet points.
 5. Write each bullet as a full sentence explaining what changed and why.
 
-## Commit Attribution
+### Commit Attribution
 
 Include an `Assisted-by` trailer for every commit where an AI agent
 contributed, following the Linux kernel gen-AI attribution convention:
@@ -67,3 +69,28 @@ Assisted-by: Copilot:claude-sonnet-4.6
    `jq`, `shellcheck`, `gh`, and `tree`.
 9. When changing Dockerfile tool packages, update README tooling docs
    and tests to keep the tooling contract explicit.
+
+## Project Structure
+
+- `Dockerfile`: Main image based on `debian:trixie-slim`; installs development
+  and build tools, then uses `mise` to manage agent utilities (`bat`, `eza`,
+  `fd`, `gh`, `jq`, `rg`, `uv`), Docker CLI, Compose plugin, Copilot and Codex
+  CLI; installs Python, `ruff`, and `ty` via `uv`.
+- `docker/entrypoint.sh`: Startup script that runs as root, adjusts the
+  container user to match `CAPSULE_UID`/`CAPSULE_GID`, adds it to the Docker
+  socket group, and drops privileges via `setpriv`.
+- `docker/setup-docker.sh`: Configures the Docker APT source and installs
+  `docker-ce-cli`, `docker-compose-plugin`, and
+  `docker-buildx-plugin`.
+- `docker/mise.sh`: Placed in `/etc/profile.d/`; activates mise and its shell
+  completions for interactive shells.
+- `compose.yml`: Local Compose service (`cli`) that builds from `Dockerfile`,
+  publishes the stable base image name `casual-capsule:local`, and adds Docker
+  socket access via `DOCKER_GID`. The container user matches the host user's
+  UID/GID (auto-detected by `capsule.sh`); override with `CAPSULE_UID`/
+  `CAPSULE_GID`. Also sets hostname `capsule` and persists the home directory
+  in a named volume.
+- `capsule.sh`: Launcher script for running the CLI from any project directory.
+- `tests/suite_fast.sh`: Fast Bash tests for the launcher and Compose contract.
+- `tests/suite_e2e.sh`: Docker-backed end-to-end example-project test.
+- `tests/test_all.sh`: Runs the fast and end-to-end suites in order.
