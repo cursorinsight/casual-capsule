@@ -11,155 +11,293 @@
 Containerized CLI workspace for AI coding agents (Copilot CLI, Codex CLI) with
 common developer tools.
 
-## 📁 Project Structure
+## Table of contents
 
-- `Dockerfile`: Main image based on `debian:trixie-slim`; installs development
-  and build tools, then uses `mise` to manage agent utilities (`bat`, `eza`,
-  `fd`, `gh`, `jq`, `rg`, `uv`), Docker CLI, Compose plugin, Copilot and Codex
-  CLI; installs Python, `ruff`, and `ty` via `uv`.
-- `docker/entrypoint.sh`: Startup script that runs as root, adjusts the
-  container user to match `CAPSULE_UID`/`CAPSULE_GID`, adds it to the Docker
-  socket group, and drops privileges via `setpriv`.
-- `docker/setup-docker.sh`: Configures the Docker APT source and installs
-  `docker-ce-cli`, `docker-compose-plugin`, and
-  `docker-buildx-plugin`.
-- `docker/mise.sh`: Placed in `/etc/profile.d/`; activates mise and its shell
-  completions for interactive shells.
-  container.
-- `compose.yml`: Local Compose service (`cli`) that builds from `Dockerfile` and
-  adds Docker socket access via `DOCKER_GID`. The container user matches the
-  host user's UID/GID (auto-detected by `capsule.sh`); override with
-  `CAPSULE_UID`/`CAPSULE_GID`. Also sets hostname `capsule` and persists the
-  home directory in a named volume.
-- `capsule.sh`: Launcher script for running the CLI from any project directory.
-- `tests/suite_fast.sh`: Fast Bash tests for the launcher and Compose contract.
-- `tests/suite_e2e.sh`: Docker-backed end-to-end example-project test.
-- `tests/test_all.sh`: Runs the fast and end-to-end suites in order.
+- [Prerequisites](#-prerequisites)
+- [Initial setup](#-initial-setup)
+  - [Phase 1: Prepare credentials](#phase-1-prepare-credentials)
+  - [Phase 2: Start Capsule](#phase-2-start-capsule)
+  - [Phase 3: Verify the container](#phase-3-verify-the-container)
+  - [Phase 4: Verify GitHub auth](#phase-4-verify-github-auth)
+  - [Phase 5: Verify Copilot (optional)](#phase-5-verify-copilot-optional)
+  - [Phase 6: Verify Codex (optional)](#phase-6-verify-codex-optional)
+- [Usage](#-usage)
+- [Capsule command examples](#%EF%B8%8F-capsule-command-examples)
+- [Additional features](#-additional-features)
+  - [UID and GID detection](#uid-and-gid-detection)
+  - [Directory approval list](#directory-approval-list)
+  - [Custom Capsule images](#custom-capsule-images)
+  - [Bind mounts in containers started in a Capsule](#bind-mounts-in-containers-started-in-a-capsule)
+- [Configuration reference](#-configuration-reference)
+  - [Command line options](#command-line-options)
+  - [Environment variables](#environment-variables)
+- [Run tests](#-run-tests)
+- [Included agent tooling](#-included-agent-tooling)
+- [Security Note](#-security-note)
+- [License](#-license)
 
 ## 📋 Prerequisites
 
 - Docker Engine 24+ and Docker Compose v2
+- Access to GitHub Copilot or Codex.
 
-## 🚀 Usage
+## 🚀 Initial setup
 
-### 1. Build the main image
+There is no true quick start for the first run. Capsule persists GitHub auth
+state in the home volume, so it is worth doing setup in this order: prepare the
+token first, then start Capsule, then verify the workspace and `gh` auth before
+opening Copilot or Codex. These checkpoints make later troubleshooting much
+easier.
 
-```bash
-docker build -t casual-capsule:latest .
+| Phase | What it proves |
+| --- | --- |
+| Prepare credentials | The first Capsule run can persist working GitHub auth. |
+| Start Capsule | The image builds and the container starts successfully. |
+| Verify the container | The workspace mount and persistent home volume work. |
+| Verify GitHub auth | `gh` is already logged in before agent startup. |
+| Verify your agent | Copilot or Codex can read the workspace. |
+
+### Phase 1: Prepare credentials
+
+1.  Decide if you want to use GitHub Copilot, Codex, or both.
+
+2.  Generate a GitHub access token.
+
+    1.  Open <https://github.com/settings/personal-access-tokens>.
+
+    2.  Make sure that you are logged in.
+
+    3.  Click on the "Generate new token" button.
+
+    4.  Confirm access if the UI asks you to do so.
+
+    5.  Fill in the "New fine-grained personal access token" form:
+
+        *   Token name: Choose any name. For example, "Capsule".
+
+        *   Fill in the other fields as you see fit. It's ok to leave them on
+            the default values.
+
+    6.  If you want to use Copilot, add the necessary permissions.
+
+        1.  Click on the "Add permission" button.
+
+        2.  Choose the following permissions:
+
+            *   Copilot Chat
+
+            *   Copilot Editor Context
+
+            *   Copilot Requests
+
+            *   Models
+
+            *   Plan
+
+    7.  Click on the "Generate token" button below the form.
+
+    8.  Click on the "Generate token" button in the popup window.
+
+    9.  Copy the token and save it somewhere safe.
+
+    10. You may close the GitHub website.
+
+3.  Create a project directory that we can use as a test.
+
+    ```
+    $ mkdir /home/myuser/myproject
+    $ cd /home/myuser/myproject
+    $ echo "My favorite color is purple." > AGENTS.md
+    ```
+
+4.  Create an alias:
+
+    ```
+    alias capsule="/absolute/path/to/casual-capsule/capsule.sh"
+    ```
+
+    You might want to add this to your init script (such as `~/.bashrc` or
+    `~/.zshrc`).
+
+5.  Set `GITHUB_API_TOKEN` to the value you received from GitHub (replace
+    `[GITHUB_API_TOKEN]`).
+
+    Set this before the first build/run so the persistent home volume starts
+    with working GitHub auth.
+
+    ```
+    $ export GITHUB_API_TOKEN=[GITHUB_API_TOKEN]
+    ```
+
+### Phase 2: Start Capsule
+
+1.  Build the Capsule Docker image and start it in the current directory.
+
+    ```
+    $ capsule --build
+    ```
+
+2.  When Capsule asks the following, type "y".
+
+    ```
+    Allow capsule to run in /home/myuser/myproject (y/N)?
+    ```
+
+3.  You should see that Docker builds the Capsule image, creates a container and
+    starts it:
+
+    ```
+    $ capsule --build
+    Allow capsule to run in /home/myuser/myproject (y/N)? y
+    [...]
+    [+] build 1/1
+     ✔ Image hcs-capsule:local Built
+     ✔ Volume casual-capsule_home Created
+    Container casual-capsule-cli-run-4d7e2776d2fd Creating
+    Container casual-capsule-cli-run-4d7e2776d2fd Created
+    user@capsule:/home/workspace$
+    ```
+
+    **Checkpoint:** the base image built and Capsule started successfully.
+
+### Phase 3: Verify the container
+
+1.  Check your workspace:
+
+    ```
+    user@capsule:/home/workspace$ cat AGENTS.md
+    My favorite color is purple.
+    ```
+
+    Your `/home/myuser/myproject` directory is mounted to `/home/workspace`
+    inside the container.
+
+    **Checkpoint:** the workspace bind mount is correct before you start an
+    agent.
+
+2.  Check the user home directory:
+
+    ```
+    user@capsule:/home/workspace$ cat /home/user/.config/gh/hosts.yml
+    github.com:
+        users:
+            myuser:
+                oauth_token: [GITHUB_API_TOKEN]
+        oauth_token: [GITHUB_API_TOKEN]
+        user: myuser
+    ```
+
+    The Docker daemon created a `casual-capsule_home` Docker volume when it
+    started the container. This volume is mounted to `/home/user`. This volume
+    is persistent and shared between Capsule instances.
+
+    The `/home/user/.config/gh/hosts.yml` file should contain your GitHub API
+    token.
+
+    **Checkpoint:** the persistent home volume contains the expected GitHub
+    auth configuration.
+
+### Phase 4: Verify GitHub auth
+
+1.  Check that you are logged in to GitHub.
+
+    ```
+    user@capsule:/home/workspace$ gh auth status
+    github.com
+      ✓ Logged in to github.com account myuser (/home/user/.config/gh/hosts.yml)
+      - Active account: true
+      - Git operations protocol: https
+      - Token: [GITHUB_API_TOKEN]
+    ```
+
+    **Checkpoint:** `gh` is ready before you open Copilot or Codex.
+
+    If `gh auth status` says that you are not logged in, add your GitHub token
+    to `github_api_token.txt` (inside the container) and log in manually:
+
+    ```
+    $ gh auth login --with-token < github_api_token.txt
+    ```
+
+    You can do the same when your token expires in the future.
+
+### Phase 5: Verify Copilot (optional)
+
+1.  Start Copilot:
+
+    ```
+    $ copilot
+    ```
+
+2.  Copilot asks if you trust `/home/workspace`.
+
+    Choose the following response: "Yes, and remember this folder for future
+    sessions."
+
+3.  Test the connection and that Copilot can read `AGENTS.md`:
+
+    ```
+    ❯ What is my favorite color?
+    ● Your favorite color is purple! 💜
+    ```
+
+### Phase 6: Verify Codex (optional)
+
+1.  Start Codex:
+
+    ```
+    $ codex
+    ```
+
+2.  Select "Sign in with Device Code."
+
+3.  Follow the instructions to log in.
+
+4.  Codex asks if you trust `/home/workspace`.
+
+    Choose the following response: "Yes, continue".
+
+5.  Codex probably prints the following warning:
+
+    ```
+    Codex could not find bubblewrap on PATH. Install bubblewrap with your OS
+    package manager. See the sandbox prerequisites:
+    https://developers.openai.com/codex/concepts/sandboxing#prerequisites.
+    Codex will use the vendored bubblewrap in the meantime.
+    ```
+
+    You can continue this setup, but later you might want to fix this warning.
+    There are at least two ways:
+
+    *   One way to eliminate this warning is to run `codex` with
+        `--dangerously-bypass-approvals-and-sandbox`. This disables the sandbox
+        which would use `bubblewrap`.
+
+    *   Another way to eliminate the warning is to use a custom `compose.yml`
+        file that adds `privileged: True` to the `cli` service, and use a
+        custom `Dockerfile` that installs the `bubblewrap` package with `apt`.
+        See more information about this kind of customization in the *Custom
+        Capsule images* section.
+
+6.  Test the connection and that Codex can read `AGENTS.md`:
+
+    ```
+    › What is my favorite color?
+    • Your favorite color is purple.
+    ```
+
+## 💡 Usage
+
+Once you set up Capsule, you can start it in any project directory. You can even
+start Copilot or Codex directly:
+
+```
+$ cd /home/myuser/myproject
+$ capsule copilot
+$ capsule codex
 ```
 
-To pass a GitHub API token as a build secret (enables `gh` auth and Copilot CLI
-activation at build time):
-
-```bash
-GITHUB_API_TOKEN=ghp_… docker build \
-  --secret id=github_api_token,env=GITHUB_API_TOKEN \
-  -t casual-capsule:latest .
-```
-
-### 2. Run the main image (interactive shell)
-
-```bash
-docker run --rm -it \
-  -e DOCKER_GID="$(stat -c '%g' /var/run/docker.sock)" \
-  -w /home/workspace \
-  -v "$PWD:/home/workspace" \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  casual-capsule:latest
-```
-
-The entrypoint runs as root, adjusts the container user to
-`CAPSULE_UID`:`CAPSULE_GID` (default `1000:100`), adds it to the `DOCKER_GID`
-group, sets `HOME`/`USER`/`LOGNAME`, and drops privileges. No `--user` or
-`--group-add` flags required.
-
-Inside container:
-
-```bash
-copilot
-```
-
-### 3. Use `capsule.sh` ✨ (recommended)
-
-`capsule.sh` sets `CAPSULE_WORKDIR` to your current directory and runs the CLI
-service via Compose. It auto-detects the host user's UID/GID via `id -u`/`id -g`
-and `DOCKER_GID` from the active Docker socket (falling back to `991` on macOS,
-`999` on Linux). If UID/GID detection fails (e.g. `id` is unavailable), it falls
-back to `1000:100` and prints a warning. The entrypoint handles UID/GID
-adjustment and Docker socket group membership at startup.
-
-On the first run in a new directory, `capsule.sh` prompts for explicit approval
-and records the approved path in `~/.config/capsule` (overridable via
-`CAPSULE_CONFIG`).
-
-Override UID/GID or DOCKER_GID via environment:
-
-```bash
-CAPSULE_UID=2000 CAPSULE_GID=2000 capsule
-```
-
-Bake a custom UID/GID into the image (avoids runtime `chown`):
-
-```bash
-CAPSULE_UID=2000 CAPSULE_GID=2000 capsule --build
-```
-
-#### ⚙️ Launcher options
-
-- `-b`, `--build`: Run `docker compose build cli` before `run`.
-- `-h`, `--help`: Show usage message.
-- `--`: Stop launcher option parsing; pass remaining args to runtime.
-
-#### ⚙️ Environment variables
-
-- `CAPSULE_UID`: Container user UID (auto-detected from host).
-- `CAPSULE_GID`: Container user GID (auto-detected from host).
-- `DOCKER_GID`: Docker socket GID (auto-detected).
-- `CAPSULE_WORKDIR`: Workspace directory (default: cwd).
-- `CAPSULE_CONFIG`: Path to the allowlist file (default: `~/.config/capsule`).
-- `GITHUB_API_TOKEN`: Passed as a build secret for `gh` auth and Copilot CLI.
-
-#### 🔧 Install as an alias
-
-From this repo:
-
-```bash
-./capsule.sh
-```
-
-From any directory, add an alias to your shell profile:
-
-```bash
-# Bash: ~/.bashrc or ~/.bash_profile
-# Zsh:  ~/.zshrc
-alias capsule="/absolute/path/to/casual-capsule/capsule.sh"
-```
-
-Then reload your shell and run:
-
-```bash
-capsule
-```
-
-#### Bind mounts in containers started in a Capsule
-
-When you start a Docker container inside a Capsule Docker container, sometimes
-you want to mount directories to that container that are in the workspace
-(`/home/workspace`). For example `tests/suite_e2e.sh` does this.
-
-So when you do this, `capsule.sh` translates directory paths as seen on the
-container (for example, `/home/workspace/mydir`) back to the original host path
-(for example, `/home/myuser/myproject/mydir`) before asking the Docker server
-(which runs on the host machine) to create the workspace bind mount.
-
-For this mechanism to work, you need to set the following environment variable
-when starting the container:
-
-- `CAPSULE_HOST_WORKDIR`: host-visible path for `/home/workspace`.
-
-See more information about it in `capsule.sh`.
-
-#### Examples
+## ⌨️ Capsule command examples
 
 Pass a command instead of the default shell:
 
@@ -182,33 +320,174 @@ Use `--` when arguments overlap launcher flags:
 capsule -- --build true
 ```
 
-### 4. Use Docker Compose directly
+## 🧩 Additional features
+
+### UID and GID detection
+
+Capsule auto-detects the host user's UID/GID via `id -u`/`id -g` and
+`DOCKER_GID` from the active Docker socket (falling back to `991` on macOS,
+`999` on Linux). If UID/GID detection fails (e.g. `id` is unavailable), it falls
+back to `1000:100` and prints a warning. The entrypoint handles UID/GID
+adjustment and Docker socket group membership at startup.
+
+This mechanism ensures that the user inside the container can access the
+`/home/workspace` directory and the host's Docker daemon.
+
+You can override UID/GID or DOCKER_GID by using environment variables:
 
 ```bash
-docker compose run --rm cli
+CAPSULE_UID=2000 CAPSULE_GID=2000 capsule
 ```
 
-Build and run in one step:
+Bake a custom UID/GID into the image (avoids runtime `chown`):
 
 ```bash
-docker compose run --rm --build cli
+CAPSULE_UID=2000 CAPSULE_GID=2000 capsule --build
 ```
 
-If Docker socket permissions fail, set `DOCKER_GID` and retry:
+### Directory approval list
 
-```bash
-# Linux
-export DOCKER_GID="$(stat -c '%g' /var/run/docker.sock)"
-# macOS
-export DOCKER_GID="$(stat -f '%g' /var/run/docker.sock)"
 
-docker compose run --rm cli
+On the first run in a new directory, `capsule.sh` prompts for explicit approval
+and records the approved path in `~/.config/capsule` (overridable via
+`CAPSULE_CONFIG`).
+
+### Custom Capsule images
+
+If you want to extend the Docker image or Compose configuration provided by
+Capsule, you can do that by creating a custom `compose.yml` file and setting its
+path in `CAPSULE_CUSTOM_COMPOSE`.
+
+The custom `compose.yml` file must override the `cli` section.
+
+Example layout:
+
+```text
+/home/myuser/python-capsule/
+|- Dockerfile
+`- compose.yml
 ```
 
-### 5. 🧪 Run tests
+Example `Dockerfile`:
+
+```dockerfile
+FROM casual-capsule:local
+
+RUN uv tool install black
+```
+
+Example `compose.yml`:
+
+```yaml
+services:
+  cli:
+    image: python-capsule:local
+    build:
+      context: ${CAPSULE_CUSTOM_DIR}
+      dockerfile: ${CAPSULE_CUSTOM_DIR}/Dockerfile
+    environment:
+      PYTHON_CAPSULE: "1"
+```
+
+Use it like this:
 
 ```bash
-CAPSULE_HOST_WORKDIR=$(pwd) tests/test_all.sh
+export CAPSULE_CUSTOM_COMPOSE=/home/myuser/python-capsule/compose.yml
+./capsule --build
+```
+
+With a custom compose file, `capsule.sh --build` first rebuilds the base image
+`casual-capsule:local`, then builds the merged custom `cli` image, and finally
+starts the container from that merged configuration.
+
+### Bind mounts in containers started in a Capsule
+
+When you start a Docker container inside a Capsule Docker container, sometimes
+you want to mount directories to that container that are in the workspace
+(`/home/workspace`). For example `tests/suite_e2e.sh` does this.
+
+So when you do this, `capsule.sh` translates directory paths as seen on the
+container (for example, `/home/workspace/mydir`) back to the original host path
+(for example, `/home/myuser/myproject/mydir`) before asking the Docker server
+(which runs on the host machine) to create the workspace bind mount.
+
+For this mechanism to work, you need to set the environment variable
+`CAPSULE_HOST_WORKDIR` when starting the container.
+
+```bash
+CAPSULE_HOST_WORKDIR=$(pwd) capsule
+```
+
+See more information about it in `capsule.sh`.
+
+## 🔧 Configuration reference
+
+### Command line options
+
+Usage:
+
+```
+capsule.sh [OPTIONS]
+capsule.sh [OPTIONS] -- [ARGS]
+```
+
+Options:
+
+*   `-b`, `--build`: Run `docker compose build cli` before `run`.
+
+*   `-h`, `--help`: Show usage message.
+
+*   `--`: Stop launcher option parsing; pass remaining arguments to
+    `docker compose run cli`.
+
+### Environment variables
+
+*   `CAPSULE_DEBUG`: Enable shell xtrace for `capsule.sh`.
+
+    Default: empty. When set to `1`, `capsule.sh` runs with `set -x`.
+
+*   `CAPSULE_UID`: Container user UID (user ID).
+
+    Default: The output of `id -u` on the host. If that doesn't work, then 1000.
+
+*   `CAPSULE_GID`: Container user GID (group ID).
+
+    Default: The output of `id -g` on the host. If that doesn't work, then 100.
+
+*   `DOCKER_GID`: Docker socket GID.
+
+    Default: Auto-detected from the host.
+
+*   `CAPSULE_WORKDIR`: Workspace directory.
+
+    Default: current working directory.
+
+*   `CAPSULE_CUSTOM_COMPOSE`: Optional custom compose override file.
+
+    Default: empty.
+
+*   `CAPSULE_CONFIG`: Path to the file that contains the approved directories.
+
+    Default: `~/.config/capsule`.
+
+*   `CAPSULE_HOST_WORKDIR`: host-visible path for `/home/workspace`.
+
+    Default: empty.
+
+*   `GITHUB_API_TOKEN`: Passed as a build secret for `gh` auth and Copilot CLI.
+
+## 🧪 Run tests
+
+Run the tests on the host:
+
+```bash
+$ tests/test_all.sh
+```
+
+Run the tests inside a Capsule:
+
+```
+$ CAPSULE_HOST_WORKDIR=$(pwd) capsule tests/test_all.sh
 ```
 
 `test_all.sh` prints each suite name before running it.
@@ -223,7 +502,7 @@ CAPSULE_HOST_WORKDIR=$(pwd) tests/test_all.sh
     `_build/tests/`. The logfile is kept after the run and records suite events
     and plain Docker/Capsule output with UTC timestamps on every line.
 
-### 6. 🤖 Included agent tooling
+## 🤖 Included agent tooling
 
 The image includes utilities commonly used by coding agents, installed via
 `mise` (configured in the `MISE_SYSTEM_TOOLS` Dockerfile ARG):

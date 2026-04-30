@@ -14,6 +14,7 @@ set -euo pipefail
 ROOT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
 SCRIPT_PATH="$ROOT_DIR/capsule.sh"
 EXAMPLE_PROJECT_DIR="$ROOT_DIR/tests/fixtures/example-project"
+CUSTOM_CAPSULE_DIR="$ROOT_DIR/tests/fixtures/custom-capsule"
 BUILD_DIR="$ROOT_DIR/_build/tests"
 
 mkdir -p "$BUILD_DIR"
@@ -80,6 +81,28 @@ assert_file_contains() {
   fi
 }
 
+# Check whether Docker, Compose, and the daemon are available for e2e tests.
+require_docker_prereqs() {
+  if ! command -v docker >/dev/null 2>&1; then
+    skip "$1 requires docker"
+    return 1
+  fi
+
+  log_message "Checking docker compose availability"
+  if ! docker compose version >/dev/null 2>&1; then
+    skip "$1 requires docker compose"
+    return 1
+  fi
+
+  log_message "Checking docker daemon availability"
+  if ! docker info >/dev/null 2>&1; then
+    skip "$1 requires a reachable docker daemon"
+    return 1
+  fi
+
+  return 0
+}
+
 # Verify that capsule.sh can run the example project end to end.
 test_example_project_end_to_end() {
   local tdir="$TEST_TMPDIR/example-project-e2e"
@@ -90,20 +113,7 @@ test_example_project_end_to_end() {
   mkdir -p "$tdir"
   log_message "Starting test_example_project_end_to_end"
 
-  if ! command -v docker >/dev/null 2>&1; then
-    skip "example project e2e requires docker"
-    return
-  fi
-
-  log_message "Checking docker compose availability"
-  if ! docker compose version >/dev/null 2>&1; then
-    skip "example project e2e requires docker compose"
-    return
-  fi
-
-  log_message "Checking docker daemon availability"
-  if ! docker info >/dev/null 2>&1; then
-    skip "example project e2e requires a reachable docker daemon"
+  if ! require_docker_prereqs "example project e2e"; then
     return
   fi
 
@@ -127,11 +137,46 @@ test_example_project_end_to_end() {
   rm -f "$token_file"
 }
 
+# Verify that capsule.sh can run with a custom compose override end to end.
+test_custom_compose_end_to_end() {
+  local tdir="$TEST_TMPDIR/custom-compose-e2e"
+  local config_file="$tdir/config"
+  local custom_compose="$CUSTOM_CAPSULE_DIR/compose.yml"
+  local check_cmd=""
+  mkdir -p "$tdir"
+  log_message "Starting test_custom_compose_end_to_end"
+
+  if ! require_docker_prereqs "custom compose e2e"; then
+    return
+  fi
+
+  printf '%s\n' "$EXAMPLE_PROJECT_DIR" >"$config_file"
+  check_cmd='bash ./check-env.sh && [[ "${CUSTOM_CAPSULE_IMAGE:-}" == "1" ]]'
+  check_cmd="$check_cmd && [[ \"\${CUSTOM_CAPSULE_COMPOSE:-}\" == \"1\" ]]"
+  check_cmd="$check_cmd && printf \"custom capsule ok\\n\""
+
+  log_message "Running capsule.sh --build with CAPSULE_CUSTOM_COMPOSE"
+  if run_logged bash -c '
+    unset CAPSULE_WORKDIR
+    cd "$1" &&
+      CAPSULE_CONFIG="$2" CAPSULE_CUSTOM_COMPOSE="$3" \
+      "$4" --build bash -lc "$5"
+  ' bash "$EXAMPLE_PROJECT_DIR" "$config_file" "$custom_compose" \
+    "$SCRIPT_PATH" "$check_cmd"; then
+    assert_file_contains "$LOG_FILE" \
+      "custom capsule ok" \
+      "custom compose runs end to end through capsule.sh"
+  else
+    fail "custom compose runs end to end through capsule.sh"
+  fi
+}
+
 # Run the suite, print the logfile path, and report the final summary.
 main() {
   printf 'E2E log: %s\n' "$LOG_FILE"
   log_message "Suite started"
   test_example_project_end_to_end
+  test_custom_compose_end_to_end
 
   log_message \
     "Summary: $PASS_COUNT passed, $FAIL_COUNT failed, $SKIP_COUNT skipped"

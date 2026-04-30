@@ -82,6 +82,7 @@ if [[ "${1:-}" == "compose" ]]; then
     printf 'ENV_DOCKER_GID=%s\n' "${DOCKER_GID:-}"
     printf 'ENV_CAPSULE_WORKDIR=%s\n' "${CAPSULE_WORKDIR:-}"
     printf 'ENV_CAPSULE_HOST_WORKDIR=%s\n' "${CAPSULE_HOST_WORKDIR:-}"
+    printf 'ENV_CAPSULE_CUSTOM_DIR=%s\n' "${CAPSULE_CUSTOM_DIR:-}"
     printf 'ENV_CAPSULE_UID=%s\n' "${CAPSULE_UID:-}"
     printf 'ENV_CAPSULE_GID=%s\n' "${CAPSULE_GID:-}"
     printf 'ARGS=%s\n' "$*"
@@ -164,6 +165,9 @@ entry_from_log() {
 
 # shellcheck disable=SC2016
 test_compose_contract() {
+  assert_file_contains "$COMPOSE_PATH" \
+    'image: casual-capsule:local' \
+    "compose pins a stable base image name"
   assert_file_contains "$COMPOSE_PATH" \
     'CAPSULE_UID:-1000' \
     "compose uses CAPSULE_UID build-arg default"
@@ -262,10 +266,10 @@ test_build_flag_runs_build_then_runtime() {
 
   DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" --build true
 
-  expected_build="ARGS=compose -f $COMPOSE_PATH --project-directory $ROOT_DIR"
+  expected_build="ARGS=compose -f $COMPOSE_PATH"
   expected_build="$expected_build build --build-arg MISE_VERSION=${mise_ver}"
   expected_build="$expected_build cli"
-  expected_run="ARGS=compose -f $COMPOSE_PATH --project-directory $ROOT_DIR"
+  expected_run="ARGS=compose -f $COMPOSE_PATH"
   expected_run="$expected_run run --rm cli true"
 
   assert_equals \
@@ -278,6 +282,28 @@ test_build_flag_runs_build_then_runtime() {
     "build flag still runs compose runtime"
 }
 
+# Create a minimal custom compose fixture plus Dockerfile for override tests.
+make_custom_compose() {
+  local dir="$1"
+  local image_name="$2"
+  mkdir -p "$dir"
+
+  cat >"$dir/compose.yml" <<EOF
+services:
+  cli:
+    image: ${image_name}
+    build:
+      context: \${CAPSULE_CUSTOM_DIR}
+      dockerfile: \${CAPSULE_CUSTOM_DIR}/Dockerfile
+    environment:
+      CUSTOM_FLAG: enabled
+EOF
+
+  cat >"$dir/Dockerfile" <<'EOF'
+FROM casual-capsule:local
+EOF
+}
+
 test_double_dash_keeps_runtime_flags() {
   local tdir="$TEST_TMPDIR/double-dash"
   local mock_bin="$tdir/bin"
@@ -288,7 +314,7 @@ test_double_dash_keeps_runtime_flags() {
 
   DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" -- --build true
 
-  expected_args="compose -f $COMPOSE_PATH --project-directory $ROOT_DIR"
+  expected_args="compose -f $COMPOSE_PATH"
   expected_args="$expected_args run --rm cli --build true"
 
   assert_equals \
@@ -309,10 +335,10 @@ test_build_flag_without_runtime_args() {
 
   DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" -b
 
-  expected_build="ARGS=compose -f $COMPOSE_PATH --project-directory $ROOT_DIR"
+  expected_build="ARGS=compose -f $COMPOSE_PATH"
   expected_build="$expected_build build --build-arg MISE_VERSION=${mise_ver}"
   expected_build="$expected_build cli"
-  expected_run="ARGS=compose -f $COMPOSE_PATH --project-directory $ROOT_DIR"
+  expected_run="ARGS=compose -f $COMPOSE_PATH"
   expected_run="$expected_run run --rm cli"
 
   assert_equals \
@@ -335,12 +361,158 @@ test_plain_runtime_without_args() {
 
   DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file"
 
-  expected_run="compose -f $COMPOSE_PATH --project-directory $ROOT_DIR"
+  expected_run="compose -f $COMPOSE_PATH"
   expected_run="$expected_run run --rm cli"
   assert_equals \
     "$expected_run" \
     "$(value_from_log ARGS "$log_file")" \
     "plain runtime works without runtime args"
+}
+
+# Verify runtime uses both compose files and exports CAPSULE_CUSTOM_DIR.
+test_custom_compose_runtime_uses_merged_config() {
+  local tdir="$TEST_TMPDIR/custom-runtime"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local custom_dir="$tdir/custom"
+  local custom_compose="$custom_dir/compose.yml"
+  local expected_run=""
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+  make_custom_compose "$custom_dir" "custom-capsule:local"
+
+  DOCKER_GID=1111 CAPSULE_CUSTOM_COMPOSE="$custom_compose" \
+    run_capsule "$mock_bin" "$log_file" true
+
+  expected_run="compose -f $COMPOSE_PATH -f $custom_compose"
+  expected_run="$expected_run run --rm cli true"
+
+  assert_equals \
+    "$expected_run" \
+    "$(value_from_log ARGS "$log_file")" \
+    "custom compose runtime uses merged config"
+  assert_equals \
+    "$custom_dir" \
+    "$(value_from_log ENV_CAPSULE_CUSTOM_DIR "$log_file")" \
+    "custom compose exports CAPSULE_CUSTOM_DIR"
+}
+
+# Verify --build runs base build, merged build, then merged runtime.
+test_custom_compose_builds_base_then_custom_then_runs() {
+  local tdir="$TEST_TMPDIR/custom-build"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local custom_dir="$tdir/custom"
+  local custom_compose="$custom_dir/compose.yml"
+  local expected_build=""
+  local expected_custom_build=""
+  local expected_run=""
+  local mise_ver="2024.1.0"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+  make_custom_compose "$custom_dir" "python-capsule:local"
+
+  DOCKER_GID=1111 CAPSULE_CUSTOM_COMPOSE="$custom_compose" \
+    run_capsule "$mock_bin" "$log_file" --build true
+
+  expected_build="ARGS=compose -f $COMPOSE_PATH"
+  expected_build="$expected_build build --build-arg MISE_VERSION=${mise_ver}"
+  expected_build="$expected_build cli"
+  expected_custom_build="ARGS=compose -f $COMPOSE_PATH -f $custom_compose"
+  expected_custom_build="$expected_custom_build build --build-arg"
+  expected_custom_build="$expected_custom_build MISE_VERSION=${mise_ver} cli"
+  expected_run="ARGS=compose -f $COMPOSE_PATH -f $custom_compose"
+  expected_run="$expected_run run --rm cli true"
+
+  assert_equals \
+    "$expected_build" \
+    "$(entry_from_log ARGS 1 "$log_file")" \
+    "custom build first builds the base image"
+  assert_equals \
+    "$expected_custom_build" \
+    "$(entry_from_log ARGS 2 "$log_file")" \
+    "custom build then builds the merged config"
+  assert_equals \
+    "$expected_run" \
+    "$(entry_from_log ARGS 3 "$log_file")" \
+    "custom build still runs the merged config"
+}
+
+# Verify a missing custom compose path fails before any Compose invocation.
+test_custom_compose_requires_existing_file() {
+  local tdir="$TEST_TMPDIR/custom-missing"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local err_file="$tdir/err"
+  local missing_file="$tdir/missing/compose.yml"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  if DOCKER_GID=1111 CAPSULE_CUSTOM_COMPOSE="$missing_file" \
+    run_capsule "$mock_bin" "$log_file" true 2>"$err_file"; then
+    fail "custom compose missing file fails early"
+  else
+    pass "custom compose missing file fails early"
+  fi
+  assert_file_contains "$err_file" \
+    "custom compose file not found" \
+    "custom compose missing file reports a clear error"
+}
+
+# Verify an unreadable custom compose file fails validation early.
+test_custom_compose_requires_readable_file() {
+  local tdir="$TEST_TMPDIR/custom-unreadable"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local err_file="$tdir/err"
+  local custom_dir="$tdir/custom"
+  local custom_compose="$custom_dir/compose.yml"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+  make_custom_compose "$custom_dir" "hidden-capsule:local"
+  chmod 000 "$custom_compose"
+
+  if DOCKER_GID=1111 CAPSULE_CUSTOM_COMPOSE="$custom_compose" \
+    run_capsule "$mock_bin" "$log_file" true 2>"$err_file"; then
+    fail "custom compose unreadable file fails early"
+  else
+    pass "custom compose unreadable file fails early"
+  fi
+  assert_file_contains "$err_file" \
+    "custom compose file is not readable" \
+    "custom compose unreadable file reports a clear error"
+  chmod 600 "$custom_compose"
+}
+
+# Verify the custom compose contract requires services.cli.image.
+test_custom_compose_requires_cli_image() {
+  local tdir="$TEST_TMPDIR/custom-image"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local err_file="$tdir/err"
+  local custom_dir="$tdir/custom"
+  local custom_compose="$custom_dir/compose.yml"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+  mkdir -p "$custom_dir"
+
+  cat >"$custom_compose" <<'EOF'
+services:
+  cli:
+    build:
+      context: ${CAPSULE_CUSTOM_DIR}
+      dockerfile: ${CAPSULE_CUSTOM_DIR}/Dockerfile
+EOF
+
+  if DOCKER_GID=1111 CAPSULE_CUSTOM_COMPOSE="$custom_compose" \
+    run_capsule "$mock_bin" "$log_file" true 2>"$err_file"; then
+    fail "custom compose without cli.image fails early"
+  else
+    pass "custom compose without cli.image fails early"
+  fi
+  assert_file_contains "$err_file" \
+    "custom compose must define services.cli.image" \
+    "custom compose without cli.image reports a clear error"
 }
 
 test_explicit_docker_gid_passthrough() {
@@ -358,6 +530,22 @@ test_explicit_docker_gid_passthrough() {
   assert_equals "/tmp/capsule-workdir" \
     "$(value_from_log ENV_CAPSULE_WORKDIR "$log_file")" \
     "capsule forwards explicit CAPSULE_WORKDIR"
+}
+
+test_debug_mode_enables_xtrace() {
+  local tdir="$TEST_TMPDIR/debug-mode"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local err_file="$tdir/err"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  CAPSULE_DEBUG=1 DOCKER_GID=1111 \
+    run_capsule "$mock_bin" "$log_file" true 2>"$err_file"
+
+  assert_file_contains "$err_file" \
+    "+ set -euo pipefail" \
+    "CAPSULE_DEBUG=1 enables shell xtrace"
 }
 
 test_uid_gid_autodetect() {
@@ -582,7 +770,13 @@ main() {
   test_double_dash_keeps_runtime_flags
   test_build_flag_without_runtime_args
   test_plain_runtime_without_args
+  test_custom_compose_runtime_uses_merged_config
+  test_custom_compose_builds_base_then_custom_then_runs
+  test_custom_compose_requires_existing_file
+  test_custom_compose_requires_readable_file
+  test_custom_compose_requires_cli_image
   test_explicit_docker_gid_passthrough
+  test_debug_mode_enables_xtrace
   test_uid_gid_autodetect
   test_uid_gid_fallback_when_id_fails
   test_explicit_uid_gid_passthrough
