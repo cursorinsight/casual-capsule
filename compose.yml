@@ -2,6 +2,7 @@ name: casual-capsule
 
 services:
   cli:
+    image: casual-capsule:local
     build:
       context: .
       args:

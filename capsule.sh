@@ -91,6 +91,8 @@ if [[ "$_CAPSULE_ID_WARN" -eq 1 ]]; then
 fi
 BUILD_BEFORE_RUN=0
 RUNTIME_ARGS=()
+CAPSULE_CUSTOM_COMPOSE="${CAPSULE_CUSTOM_COMPOSE:-}"
+CAPSULE_CUSTOM_DIR=""
 
 usage() {
   cat <<'EOF'
@@ -105,7 +107,38 @@ Environment:
   CAPSULE_GID      Container user GID (auto-detected).
   DOCKER_GID       Docker socket GID (auto-detected).
   CAPSULE_WORKDIR  Workspace directory (default: cwd).
+  CAPSULE_CUSTOM_COMPOSE  Optional override compose file.
 EOF
+}
+
+# Return success when the custom compose file defines services.cli.image.
+#
+# This validates the minimum override contract before invoking Compose.
+custom_compose_has_cli_image() {
+  local compose_file="$1"
+
+  awk '
+    /^[[:space:]]*services:[[:space:]]*$/ {
+      in_services = 1
+      in_cli = 0
+      next
+    }
+    in_services && /^[^[:space:]#]/ {
+      in_services = 0
+      in_cli = 0
+    }
+    in_services && /^  [^[:space:]#][^:]*:[[:space:]]*$/ {
+      in_cli = ($0 ~ /^  cli:[[:space:]]*$/)
+      next
+    }
+    in_cli && /^    image:[[:space:]]*[^[:space:]#]+/ {
+      found = 1
+      exit 0
+    }
+    END {
+      exit(found ? 0 : 1)
+    }
+  ' "$compose_file"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -129,6 +162,32 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -n "$CAPSULE_CUSTOM_COMPOSE" ]]; then
+  if [[ ! -e "$CAPSULE_CUSTOM_COMPOSE" ]]; then
+    printf 'capsule: error: custom compose file not found: %s\n' \
+      "$CAPSULE_CUSTOM_COMPOSE" >&2
+    exit 1
+  fi
+  if [[ ! -r "$CAPSULE_CUSTOM_COMPOSE" ]]; then
+    printf 'capsule: error: custom compose file is not readable: %s\n' \
+      "$CAPSULE_CUSTOM_COMPOSE" >&2
+    exit 1
+  fi
+
+  CAPSULE_CUSTOM_DIR="$(
+    CDPATH='' cd -- "$(dirname -- "$CAPSULE_CUSTOM_COMPOSE")" && pwd -P
+  )"
+  CAPSULE_CUSTOM_COMPOSE="$CAPSULE_CUSTOM_DIR/$(basename \
+    -- "$CAPSULE_CUSTOM_COMPOSE")"
+  export CAPSULE_CUSTOM_COMPOSE CAPSULE_CUSTOM_DIR
+
+  if ! custom_compose_has_cli_image "$CAPSULE_CUSTOM_COMPOSE"; then
+    printf '%s\n' \
+      'capsule: error: custom compose must define services.cli.image' >&2
+    exit 1
+  fi
+fi
 
 # Require explicit approval before mounting a host path into the container.
 CAPSULE_CONFIG=${CAPSULE_CONFIG:-"${HOME}/.config/capsule"}
@@ -206,11 +265,19 @@ if [[ -z "${DOCKER_GID:-}" ]]; then
   fi
 fi
 
-COMPOSE_CMD=(
+BASE_COMPOSE_CMD=(
   docker compose
   -f "$SCRIPT_DIR/compose.yml"
-  --project-directory "$SCRIPT_DIR"
 )
+
+COMPOSE_CMD=("${BASE_COMPOSE_CMD[@]}")
+if [[ -n "$CAPSULE_CUSTOM_COMPOSE" ]]; then
+  COMPOSE_CMD=(
+    docker compose
+    -f "$SCRIPT_DIR/compose.yml"
+    -f "$CAPSULE_CUSTOM_COMPOSE"
+  )
+fi
 
 if [[ "$BUILD_BEFORE_RUN" -eq 1 ]]; then
     if ! MISE_VERSION="$(curl -fsSL https://mise.jdx.dev/VERSION)"; then
@@ -223,7 +290,12 @@ if [[ "$BUILD_BEFORE_RUN" -eq 1 ]]; then
             'capsule: error: fetched empty MISE_VERSION' >&2
         exit 1
     fi
-    "${COMPOSE_CMD[@]}" build --build-arg "MISE_VERSION=${MISE_VERSION}" cli
+    "${BASE_COMPOSE_CMD[@]}" build \
+      --build-arg "MISE_VERSION=${MISE_VERSION}" cli
+    if [[ -n "$CAPSULE_CUSTOM_COMPOSE" ]]; then
+      "${COMPOSE_CMD[@]}" build \
+        --build-arg "MISE_VERSION=${MISE_VERSION}" cli
+    fi
 fi
 
 if [[ "${#RUNTIME_ARGS[@]}" -gt 0 ]]; then

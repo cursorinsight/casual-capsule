@@ -1,0 +1,8 @@
+services:
+  cli:
+    image: fixture-custom-capsule:local
+    build:
+      context: ${CAPSULE_CUSTOM_DIR}
+      dockerfile: ${CAPSULE_CUSTOM_DIR}/Dockerfile
+    environment:
+      CUSTOM_CAPSULE_COMPOSE: "1"
