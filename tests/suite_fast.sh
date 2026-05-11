@@ -201,6 +201,12 @@ test_compose_contract() {
   assert_file_contains "$COMPOSE_PATH" \
     'CAPSULE_HOST_WORKDIR=${CAPSULE_HOST_WORKDIR:-}' \
     "compose passes host workdir to nested capsule"
+  assert_file_contains "$COMPOSE_PATH" \
+    'environment: GITHUB_API_TOKEN' \
+    "compose sources github token from GITHUB_API_TOKEN env"
+  assert_file_contains "$COMPOSE_PATH" \
+    '- github_api_token' \
+    "compose mounts github token as a runtime secret"
 }
 
 test_dockerfile_tooling_contract() {
@@ -276,6 +282,12 @@ test_entrypoint_contract() {
   assert_file_contains "$ENTRYPOINT_PATH" \
     'exec "$@"' \
     "entrypoint has non-root fast path"
+  assert_file_contains "$ENTRYPOINT_PATH" \
+    '/run/secrets/github_api_token' \
+    "entrypoint reads github token from compose secret mount"
+  assert_file_contains "$ENTRYPOINT_PATH" \
+    'gh auth login --with-token' \
+    "entrypoint refreshes gh credentials from runtime secret"
 }
 
 test_build_flag_runs_build_then_runtime() {

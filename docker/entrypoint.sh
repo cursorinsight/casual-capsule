@@ -73,6 +73,21 @@ export HOME="${USER_HOME:-/home/user}"
 export USER=user
 export LOGNAME=user
 
+# Export GitHub token and authenticate when a runtime secret is
+# present.  This makes the token available to all child processes
+# (curl, docker, etc.) and avoids API throttling.
+_GH_SECRET=/run/secrets/github_api_token
+if [ -s "$_GH_SECRET" ]; then
+    GITHUB_API_TOKEN="$(cat "$_GH_SECRET")"
+    export GITHUB_API_TOKEN
+    setpriv \
+        --reuid="$(id -u user)" \
+        --regid="$(id -g user)" \
+        --init-groups \
+        -- gh auth login --with-token < "$_GH_SECRET" \
+        || printf 'capsule: warning: gh auth login failed\n' >&2
+fi
+
 exec setpriv \
   --reuid="$(id -u user)" \
   --regid="$(id -g user)" \
