@@ -19,6 +19,10 @@ ENTRYPOINT_PATH="$ROOT_DIR/docker/entrypoint.sh"
 EXAMPLE_PROJECT_DIR="$ROOT_DIR/tests/fixtures/example-project"
 
 TEST_TMPDIR="$(mktemp -d)"
+# Resolve symlinks so paths match what capsule.sh produces via pwd -P.
+# On macOS mktemp -d returns /var/folders/… which resolves to
+# /private/var/folders/… — without this the path comparisons fail.
+TEST_TMPDIR="$(CDPATH='' cd -- "$TEST_TMPDIR" && pwd -P)"
 trap 'rm -rf "$TEST_TMPDIR"' EXIT
 
 PASS_COUNT=0
