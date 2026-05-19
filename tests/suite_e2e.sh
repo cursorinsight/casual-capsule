@@ -178,12 +178,49 @@ test_custom_compose_end_to_end() {
   fi
 }
 
+# Verify that capsule.sh can rebuild only the custom image end to end.
+test_custom_compose_build_custom_end_to_end() {
+  local tdir="$TEST_TMPDIR/custom-compose-build-custom-e2e"
+  local config_file="$tdir/config"
+  local custom_compose="$CUSTOM_CAPSULE_DIR/compose.yml"
+  local check_cmd=""
+  mkdir -p "$tdir"
+  log_message "Starting test_custom_compose_build_custom_end_to_end"
+
+  if ! require_docker_prereqs "custom compose build-custom e2e"; then
+    return
+  fi
+
+  printf '%s\n' "$EXAMPLE_PROJECT_DIR" >"$config_file"
+  # shellcheck disable=SC2016
+  check_cmd='bash ./check-env.sh && [[ "${CUSTOM_CAPSULE_IMAGE:-}" == "1" ]]'
+  check_cmd="$check_cmd && [[ \"\${CUSTOM_CAPSULE_COMPOSE:-}\" == \"1\" ]]"
+  check_cmd="$check_cmd && printf \"custom build-only capsule ok\\n\""
+
+  log_message "Running capsule.sh --build-custom with CAPSULE_CUSTOM_COMPOSE"
+  # shellcheck disable=SC2016
+  if run_logged bash -c '
+    unset CAPSULE_WORKDIR
+    cd "$1" &&
+      CAPSULE_CONFIG="$2" CAPSULE_CUSTOM_COMPOSE="$3" \
+      "$4" --build-custom bash -lc "$5"
+  ' bash "$EXAMPLE_PROJECT_DIR" "$config_file" "$custom_compose" \
+    "$SCRIPT_PATH" "$check_cmd"; then
+    assert_file_contains "$LOG_FILE" \
+      "custom build-only capsule ok" \
+      "build-custom runs custom compose end to end through capsule.sh"
+  else
+    fail "build-custom runs custom compose end to end through capsule.sh"
+  fi
+}
+
 # Run the suite, print the logfile path, and report the final summary.
 main() {
   printf 'E2E log: %s\n' "$LOG_FILE"
   log_message "Suite started"
   test_example_project_end_to_end
   test_custom_compose_end_to_end
+  test_custom_compose_build_custom_end_to_end
 
   log_message \
     "Summary: $PASS_COUNT passed, $FAIL_COUNT failed, $SKIP_COUNT skipped"

@@ -16,8 +16,8 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN --mount=type=cache,id=apt-global,sharing=locked,target=/var/cache/apt \
     apt-get update && \
     apt-get -y --no-install-recommends install \
-    bash-completion build-essential busybox ca-certificates curl git gnupg \
-    less openssh-client procps shellcheck sudo tree unzip vim zip && \
+    bash-completion build-essential busybox ca-certificates curl file git \
+    gnupg less openssh-client procps shellcheck sudo tree unzip vim zip && \
     rm -rf /var/lib/apt/lists/* && \
     busybox --install -s
 

@@ -93,7 +93,9 @@ if [[ "$_CAPSULE_ID_WARN" -eq 1 ]]; then
     "cannot detect host UID/GID; using defaults" \
     "$CAPSULE_UID" "$CAPSULE_GID" >&2
 fi
-BUILD_BEFORE_RUN=0
+BUILD_MODE="none"
+BUILD_MODE_FLAG=""
+NO_CACHE=0
 RUNTIME_ARGS=()
 CAPSULE_CUSTOM_COMPOSE="${CAPSULE_CUSTOM_COMPOSE:-}"
 CAPSULE_CUSTOM_DIR=""
@@ -104,6 +106,8 @@ Usage: capsule.sh [options] [--] [command...]
 
 Options:
   -b, --build  Run "docker compose build cli" before runtime.
+      --build-custom  Run the custom compose build before runtime.
+      --no-cache  Pass --no-cache to build commands run by this script.
   -h, --help   Show this help message.
 
 Environment:
@@ -146,10 +150,38 @@ custom_compose_has_cli_image() {
   ' "$compose_file"
 }
 
+# Record the selected build mode and reject conflicting build flags.
+set_build_mode() {
+  local new_mode="$1"
+  local new_flag="$2"
+
+  if [[ "$BUILD_MODE" == "none" ]]; then
+    BUILD_MODE="$new_mode"
+    BUILD_MODE_FLAG="$new_flag"
+    return
+  fi
+
+  if [[ "$BUILD_MODE" == "$new_mode" ]]; then
+    return
+  fi
+
+  printf 'capsule: error: %s cannot be combined with %s\n' \
+    "$new_flag" "$BUILD_MODE_FLAG" >&2
+  exit 1
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -b|--build)
-      BUILD_BEFORE_RUN=1
+      set_build_mode "all" "$1"
+      shift
+      ;;
+    --build-custom)
+      set_build_mode "custom" "$1"
+      shift
+      ;;
+    --no-cache)
+      NO_CACHE=1
       shift
       ;;
     -h|--help)
@@ -192,6 +224,12 @@ if [[ -n "$CAPSULE_CUSTOM_COMPOSE" ]]; then
       'capsule: error: custom compose must define services.cli.image' >&2
     exit 1
   fi
+fi
+
+if [[ "$BUILD_MODE" == "custom" ]] && [[ -z "$CAPSULE_CUSTOM_COMPOSE" ]]; then
+  printf '%s\n' \
+    'capsule: error: --build-custom requires CAPSULE_CUSTOM_COMPOSE' >&2
+  exit 1
 fi
 
 # Require explicit approval before mounting a host path into the container.
@@ -284,7 +322,7 @@ if [[ -n "$CAPSULE_CUSTOM_COMPOSE" ]]; then
   )
 fi
 
-if [[ "$BUILD_BEFORE_RUN" -eq 1 ]]; then
+if [[ "$BUILD_MODE" != "none" ]]; then
     if ! MISE_VERSION="$(curl -fsSL https://mise.jdx.dev/VERSION)"; then
         printf '%s\n' \
             'capsule: error: failed to fetch MISE_VERSION' >&2
@@ -295,12 +333,28 @@ if [[ "$BUILD_BEFORE_RUN" -eq 1 ]]; then
             'capsule: error: fetched empty MISE_VERSION' >&2
         exit 1
     fi
+fi
+
+BUILD_NO_CACHE_ARGS=()
+if [[ "$NO_CACHE" -eq 1 ]]; then
+    BUILD_NO_CACHE_ARGS=(--no-cache)
+fi
+
+if [[ "$BUILD_MODE" == "all" ]]; then
     "${BASE_COMPOSE_CMD[@]}" build \
+      ${BUILD_NO_CACHE_ARGS[@]+"${BUILD_NO_CACHE_ARGS[@]}"} \
       --build-arg "MISE_VERSION=${MISE_VERSION}" cli
     if [[ -n "$CAPSULE_CUSTOM_COMPOSE" ]]; then
       "${COMPOSE_CMD[@]}" build \
+        ${BUILD_NO_CACHE_ARGS[@]+"${BUILD_NO_CACHE_ARGS[@]}"} \
         --build-arg "MISE_VERSION=${MISE_VERSION}" cli
     fi
+fi
+
+if [[ "$BUILD_MODE" == "custom" ]]; then
+    "${COMPOSE_CMD[@]}" build \
+      ${BUILD_NO_CACHE_ARGS[@]+"${BUILD_NO_CACHE_ARGS[@]}"} \
+      --build-arg "MISE_VERSION=${MISE_VERSION}" cli
 fi
 
 if [[ "${#RUNTIME_ARGS[@]}" -gt 0 ]]; then

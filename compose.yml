@@ -1,8 +1,7 @@
-name: casual-capsule
+name: ${CAPSULE_COMPOSE_PROJECT_NAME:-casual-capsule}
 
 services:
   cli:
-    image: casual-capsule:local
     build:
       context: .
       args:

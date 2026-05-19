@@ -314,6 +314,13 @@ capsule --build
 capsule -b copilot
 ```
 
+Build only the custom image before starting:
+
+```bash
+CAPSULE_CUSTOM_COMPOSE=/home/myuser/python-capsule/compose.yml \
+  capsule --build-custom
+```
+
 Use `--` when arguments overlap launcher flags:
 
 ```bash
@@ -371,7 +378,7 @@ Example layout:
 Example `Dockerfile`:
 
 ```dockerfile
-FROM casual-capsule:local
+FROM casual-capsule-cli:latest
 
 RUN uv tool install black
 ```
@@ -397,8 +404,12 @@ export CAPSULE_CUSTOM_COMPOSE=/home/myuser/python-capsule/compose.yml
 ```
 
 With a custom compose file, `capsule.sh --build` first rebuilds the base image
-`casual-capsule:local`, then builds the merged custom `cli` image, and finally
-starts the container from that merged configuration.
+`casual-capsule-cli:latest`, then builds the merged custom `cli` image, and
+finally starts the container from that merged configuration.
+
+If you only want to rebuild the merged custom `cli` image, use
+`capsule.sh --build-custom` instead. This flag requires
+`CAPSULE_CUSTOM_COMPOSE`.
 
 ### Bind mounts in containers started in a Capsule
 
@@ -434,6 +445,12 @@ capsule.sh [OPTIONS] -- [ARGS]
 Options:
 
 *   `-b`, `--build`: Run `docker compose build cli` before `run`.
+
+*   `--build-custom`: Run `docker compose build cli` only for the merged custom
+    compose configuration before `run`. Requires `CAPSULE_CUSTOM_COMPOSE`.
+
+*   `--no-cache`: Pass `--no-cache` to the build commands triggered by
+    `--build` or `--build-custom`.
 
 *   `-h`, `--help`: Show usage message.
 
