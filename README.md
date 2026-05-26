@@ -27,6 +27,7 @@ common developer tools.
   - [UID and GID detection](#uid-and-gid-detection)
   - [Directory approval list](#directory-approval-list)
   - [Custom Capsule images](#custom-capsule-images)
+  - [Updating your GitHub token](#updating-your-github-token)
   - [Bind mounts in containers started in a Capsule](#bind-mounts-in-containers-started-in-a-capsule)
 - [Configuration reference](#-configuration-reference)
   - [Command line options](#command-line-options)
@@ -410,6 +411,27 @@ finally starts the container from that merged configuration.
 If you only want to rebuild the merged custom `cli` image, use
 `capsule.sh --build-custom` instead. This flag requires
 `CAPSULE_CUSTOM_COMPOSE`.
+
+### Updating your GitHub token
+
+The entrypoint reads the `GITHUB_API_TOKEN` secret on every container
+start and calls `gh auth login --with-token` automatically.  To rotate
+your token:
+
+1. Export the new token in your shell:
+
+   ```bash
+   export GITHUB_API_TOKEN=ghp_...
+   ```
+
+2. Start a new Capsule session — the entrypoint handles the rest:
+
+   ```bash
+   capsule
+   ```
+
+The updated credentials are written to the persistent home volume and
+survive subsequent restarts.  No rebuild is required.
 
 ### Bind mounts in containers started in a Capsule
 
