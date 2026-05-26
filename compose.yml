@@ -7,6 +7,8 @@ services:
       args:
         CAPSULE_UID: "${CAPSULE_UID:-1000}"
         CAPSULE_GID: "${CAPSULE_GID:-100}"
+      secrets:
+        - github_api_token
     volumes:
       - ${CAPSULE_HOST_WORKDIR:-${CAPSULE_WORKDIR:-${PWD}}}:/home/workspace
       - /var/run/docker.sock:/run/docker.sock

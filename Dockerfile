@@ -45,7 +45,7 @@ RUN curl -fsSL https://mise.run | sh
 # Install system AI agents and tools with mise
 ARG MISE_SYSTEM_TOOLS="bat codex copilot eza fd gemini-cli \
         gh jq node ripgrep usage uv"
-RUN --mount=type=secret,id=github_api_token,env=GITHUB_API_TOKEN,required=false \
+RUN --mount=type=secret,id=github_api_token,env=GITHUB_API_TOKEN,required=true \
     mise install --system node && \
     PATH="$(mise where node)/bin:$PATH" \
       mise install --system ${MISE_SYSTEM_TOOLS} && \
@@ -59,12 +59,6 @@ COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/
 
 # Switch user
 USER user
-
-# GitHub token login
-RUN --mount=type=secret,id=github_api_token,env=GITHUB_API_TOKEN,required=false \
-    if [ -s /run/secrets/github_api_token ]; then \
-        mise x -- gh auth login --with-token </run/secrets/github_api_token; \
-    fi
 
 # Install python and uv tools
 ARG PYTHON_VERSION=3.14
