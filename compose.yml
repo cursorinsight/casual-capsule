@@ -25,7 +25,6 @@ services:
     working_dir: /home/workspace
     restart: "no"
     hostname: capsule
-    pull_policy: missing
 
 volumes:
   home:

@@ -22,6 +22,7 @@ unset CAPSULE_CUSTOM_COMPOSE
 unset CAPSULE_EXTRA_APPROVALS
 unset CAPSULE_GID
 unset CAPSULE_HOME_HOST_DIR
+unset CAPSULE_HOST_PATH_MAP
 unset CAPSULE_HOST_WORKDIR
 unset CAPSULE_UID
 unset CAPSULE_WORKDIR
@@ -194,6 +195,7 @@ run_capsule() {
     printf '%s\n' "${CAPSULE_EXTRA_APPROVALS}" >>"${cfg_file}"
   fi
   PATH="$mock_bin:$PATH" MOCK_LOG="$log_file" CAPSULE_CONFIG="$cfg_file" \
+    CAPSULE_HOST_PATH_MAP="${CAPSULE_HOST_PATH_MAP-}" \
     CAPSULE_HOST_WORKDIR="${CAPSULE_HOST_WORKDIR-}" \
     CAPSULE_HOME_HOST_DIR="${CAPSULE_HOME_HOST_DIR-}" \
     DOCKER_HOST="${DOCKER_HOST-}" \
@@ -543,6 +545,78 @@ test_private_home_flag_uses_user_home_bind_mount() {
   else
     fail "private-home flag creates the local home bind directory"
   fi
+}
+
+test_private_home_uses_host_path_map_for_home_dir() {
+  local tdir="$TEST_TMPDIR/private-home-path-map"
+  local home_dir="$tdir/container-home"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local cfg_file="$tdir/config"
+  local host_path_map=""
+  mkdir -p "$home_dir"
+  make_mock_bin "$mock_bin"
+  printf '%s\n' "/host/workspace/project" >"$cfg_file"
+  host_path_map="/workspace=/host/workspace"
+  host_path_map="${host_path_map}:${home_dir}=/host/home/alice"
+
+  if HOME="$home_dir" DOCKER_GID=1111 \
+    CAPSULE_WORKDIR="/workspace/project" \
+    CAPSULE_HOST_PATH_MAP="$host_path_map" \
+    PATH="$mock_bin:$PATH" \
+    MOCK_LOG="$log_file" \
+    CAPSULE_CONFIG="$cfg_file" \
+    CAPSULE_HOST_WORKDIR="${CAPSULE_HOST_WORKDIR-}" \
+    CAPSULE_HOME_HOST_DIR="${CAPSULE_HOME_HOST_DIR-}" \
+    DOCKER_HOST="${DOCKER_HOST-}" \
+    "$SCRIPT_PATH" --private-home true </dev/null; then
+    pass "private-home uses host path map for home dir"
+  else
+    fail "private-home uses host path map for home dir"
+  fi
+
+  assert_equals "/host/home/alice/.capsule-home" \
+    "$(value_from_log ENV_CAPSULE_HOME_HOST_DIR "$log_file")" \
+    "private-home resolves mapped host home path"
+  assert_equals "/host/home/alice/.capsule-home:/home/user" \
+    "$(value_from_log ENV_CAPSULE_HOME_MOUNT "$log_file")" \
+    "private-home mount uses mapped host home path"
+  if [[ -e "$home_dir/.capsule-home" ]]; then
+    fail "private-home does not create a container-local home dir"
+  else
+    pass "private-home does not create a container-local home dir"
+  fi
+}
+
+test_private_home_requires_home_mapping_with_host_path_map() {
+  local tdir="$TEST_TMPDIR/private-home-path-map-missing"
+  local home_dir="$tdir/container-home"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local err_file="$tdir/err"
+  local cfg_file="$tdir/config"
+  mkdir -p "$home_dir"
+  make_mock_bin "$mock_bin"
+  printf '%s\n' "/host/workspace/project" >"$cfg_file"
+
+  if HOME="$home_dir" DOCKER_GID=1111 \
+    CAPSULE_WORKDIR="/workspace/project" \
+    CAPSULE_HOST_PATH_MAP="/workspace=/host/workspace" \
+    PATH="$mock_bin:$PATH" \
+    MOCK_LOG="$log_file" \
+    CAPSULE_CONFIG="$cfg_file" \
+    CAPSULE_HOST_WORKDIR="${CAPSULE_HOST_WORKDIR-}" \
+    CAPSULE_HOME_HOST_DIR="${CAPSULE_HOME_HOST_DIR-}" \
+    DOCKER_HOST="${DOCKER_HOST-}" \
+    "$SCRIPT_PATH" --private-home true </dev/null 2>"$err_file"; then
+    fail "private-home requires a home mapping with host path map"
+  else
+    pass "private-home requires a home mapping with host path map"
+  fi
+
+  assert_file_contains "$err_file" \
+    "CAPSULE_HOST_PATH_MAP requires a mapping for" \
+    "private-home reports a clear missing home mapping error"
 }
 
 test_remote_flag_requires_target() {
@@ -1180,6 +1254,96 @@ test_host_workdir_defaults_to_current_workdir() {
     "host capsule uses current workdir as host workdir"
 }
 
+test_host_path_map_remaps_container_workdir() {
+  local tdir="$TEST_TMPDIR/host-path-map"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local cfg_file="$tdir/config"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+  printf '%s\n' "/host/workspace/project/subdir" >"$cfg_file"
+
+  if DOCKER_GID=1111 \
+    CAPSULE_WORKDIR="/workspace/project/subdir" \
+    CAPSULE_HOST_PATH_MAP="/workspace=/host/workspace:/src=/host/src" \
+    PATH="$mock_bin:$PATH" \
+    MOCK_LOG="$log_file" \
+    CAPSULE_CONFIG="$cfg_file" \
+    CAPSULE_HOST_WORKDIR="${CAPSULE_HOST_WORKDIR-}" \
+    CAPSULE_HOME_HOST_DIR="${CAPSULE_HOME_HOST_DIR-}" \
+    DOCKER_HOST="${DOCKER_HOST-}" \
+    "$SCRIPT_PATH" true </dev/null; then
+    pass "host path map remaps container workdir"
+  else
+    fail "host path map remaps container workdir"
+  fi
+
+  assert_equals "/host/workspace/project/subdir" \
+    "$(value_from_log ENV_CAPSULE_HOST_WORKDIR "$log_file")" \
+    "host path map remaps container workdir to daemon-host path"
+}
+
+test_host_path_map_uses_first_match() {
+  local tdir="$TEST_TMPDIR/host-path-map-first-match"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local cfg_file="$tdir/config"
+  local host_path_map=""
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+  printf '%s\n' "/host/first/project" >"$cfg_file"
+  host_path_map="/workspace=/host/first"
+  host_path_map="${host_path_map}:/workspace/project=/host/second"
+
+  if DOCKER_GID=1111 \
+    CAPSULE_WORKDIR="/workspace/project" \
+    CAPSULE_HOST_PATH_MAP="$host_path_map" \
+    PATH="$mock_bin:$PATH" \
+    MOCK_LOG="$log_file" \
+    CAPSULE_CONFIG="$cfg_file" \
+    CAPSULE_HOST_WORKDIR="${CAPSULE_HOST_WORKDIR-}" \
+    CAPSULE_HOME_HOST_DIR="${CAPSULE_HOME_HOST_DIR-}" \
+    DOCKER_HOST="${DOCKER_HOST-}" \
+    "$SCRIPT_PATH" true </dev/null; then
+    pass "host path map uses first match"
+  else
+    fail "host path map uses first match"
+  fi
+
+  assert_equals "/host/first/project" \
+    "$(value_from_log ENV_CAPSULE_HOST_WORKDIR "$log_file")" \
+    "host path map uses the first matching prefix"
+}
+
+test_host_path_map_uses_mapped_allowlist_entry() {
+  local tdir="$TEST_TMPDIR/host-path-map-approval"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local cfg_file="$tdir/config"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+  printf '%s\n' "/host/workspace/project" >"$cfg_file"
+
+  if DOCKER_GID=1111 \
+    CAPSULE_WORKDIR="/workspace/project" \
+    CAPSULE_HOST_PATH_MAP="/workspace=/host/workspace" \
+    PATH="$mock_bin:$PATH" \
+    MOCK_LOG="$log_file" \
+    CAPSULE_CONFIG="$cfg_file" \
+    CAPSULE_HOST_WORKDIR="${CAPSULE_HOST_WORKDIR-}" \
+    CAPSULE_HOME_HOST_DIR="${CAPSULE_HOME_HOST_DIR-}" \
+    DOCKER_HOST="${DOCKER_HOST-}" \
+    "$SCRIPT_PATH" true </dev/null; then
+    pass "host path map uses mapped allowlist entry"
+  else
+    fail "host path map uses mapped allowlist entry"
+  fi
+
+  assert_equals "/host/workspace/project" \
+    "$(value_from_log ENV_CAPSULE_HOST_WORKDIR "$log_file")" \
+    "host path map keeps using the mapped daemon-host path"
+}
+
 test_nested_capsule_uses_host_workdir() {
   local tdir="$TEST_TMPDIR/nested-workdir"
   local mock_bin="$tdir/bin"
@@ -1341,6 +1505,8 @@ main() {
   test_build_custom_flag_requires_custom_compose
   test_build_and_build_custom_flags_conflict
   test_private_home_flag_uses_user_home_bind_mount
+  test_private_home_uses_host_path_map_for_home_dir
+  test_private_home_requires_home_mapping_with_host_path_map
   test_remote_flag_requires_target
   test_remote_flag_requires_absolute_workdir_syntax
   test_remote_flag_requires_authorization
@@ -1366,6 +1532,9 @@ main() {
   test_explicit_uid_gid_passthrough
   test_workdir_precedence
   test_host_workdir_defaults_to_current_workdir
+  test_host_path_map_remaps_container_workdir
+  test_host_path_map_uses_first_match
+  test_host_path_map_uses_mapped_allowlist_entry
   test_nested_capsule_uses_host_workdir
   test_nested_private_home_uses_host_visible_home_dir
   test_nested_private_home_requires_host_visible_home_dir

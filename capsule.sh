@@ -7,6 +7,83 @@ set -euo pipefail
 
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)"
 
+trim_trailing_slash() {
+  local path="$1"
+
+  if [[ "$path" != "/" ]]; then
+    path="${path%/}"
+  fi
+
+  printf '%s\n' "$path"
+}
+
+join_host_path() {
+  local base="$1"
+  local suffix="$2"
+
+  if [[ "$base" == "/" ]]; then
+    printf '%s\n' "$suffix"
+    return
+  fi
+
+  printf '%s%s\n' "$base" "$suffix"
+}
+
+resolve_host_path_map() {
+  local path="$1"
+  local map_entries=()
+  local entry=""
+  local container_prefix=""
+  local host_prefix=""
+  local suffix=""
+
+  if [[ -z "${CAPSULE_HOST_PATH_MAP:-}" ]]; then
+    return 1
+  fi
+
+  IFS=: read -r -a map_entries <<<"${CAPSULE_HOST_PATH_MAP}"
+  for entry in "${map_entries[@]}"; do
+    if [[ "$entry" != *=* ]]; then
+      printf 'capsule: error: invalid CAPSULE_HOST_PATH_MAP entry: %s\n' \
+        "$entry" >&2
+      exit 1
+    fi
+
+    container_prefix="$(trim_trailing_slash "${entry%%=*}")"
+    host_prefix="$(trim_trailing_slash "${entry#*=}")"
+    if [[ -z "$container_prefix" || -z "$host_prefix" ]]; then
+      printf 'capsule: error: invalid CAPSULE_HOST_PATH_MAP entry: %s\n' \
+        "$entry" >&2
+      exit 1
+    fi
+
+    if [[ "$container_prefix" != /* || "$host_prefix" != /* ]]; then
+      printf '%s\n' \
+        "capsule: error: CAPSULE_HOST_PATH_MAP paths must be absolute: $entry" \
+        >&2
+      exit 1
+    fi
+
+    if [[ "$path" == "$container_prefix" ]]; then
+      printf '%s\n' "$host_prefix"
+      return 0
+    fi
+
+    if [[ "$container_prefix" == "/" ]]; then
+      printf '%s\n' "$(join_host_path "$host_prefix" "$path")"
+      return 0
+    fi
+
+    if [[ "$path" == "$container_prefix"/* ]]; then
+      suffix="${path#"$container_prefix"}"
+      printf '%s\n' "$(join_host_path "$host_prefix" "$suffix")"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 # This block sets two variables:
 #
 # *   CAPSULE_WORKDIR is the path of the working directory (project directory)
@@ -25,6 +102,10 @@ SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)"
 #             started by another execution of capsule.sh),
 #             CAPSULE_HOST_WORKDIR is the directory on the Docker daemon host
 #             that is mapped to /home/workspace inside the container.
+#
+#         *   If capsule.sh is running inside some other container,
+#             CAPSULE_HOST_PATH_MAP can map container paths back to daemon-host
+#             paths.
 #
 #     -   After the if construct below:
 #
@@ -47,6 +128,7 @@ SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)"
 ORIG_CAPSULE_HOST_WORKDIR="${CAPSULE_HOST_WORKDIR:-}"
 export CAPSULE_WORKDIR="${CAPSULE_WORKDIR:-$(pwd -P)}"
 CAPSULE_CONTAINER_WORKDIR="/home/workspace"
+LOCAL_APPROVAL_PATH="$CAPSULE_WORKDIR"
 IN_NESTED_CAPSULE=0
 _CAPSULE_ID_WARN=0
 
@@ -58,7 +140,12 @@ if [[ -n "$ORIG_CAPSULE_HOST_WORKDIR" ]]; then
 fi
 
 if [[ -z "${CAPSULE_HOST_WORKDIR:-}" ]]; then
-  export CAPSULE_HOST_WORKDIR="$CAPSULE_WORKDIR"
+  if CAPSULE_HOST_WORKDIR="$(resolve_host_path_map "$CAPSULE_WORKDIR")"; then
+    LOCAL_APPROVAL_PATH="$CAPSULE_HOST_WORKDIR"
+    export CAPSULE_HOST_WORKDIR
+  else
+    export CAPSULE_HOST_WORKDIR="$CAPSULE_WORKDIR"
+  fi
 elif [[ "$CAPSULE_WORKDIR" == "$CAPSULE_CONTAINER_WORKDIR" ]]; then
   export CAPSULE_HOST_WORKDIR
 elif [[ "$CAPSULE_WORKDIR" == "$CAPSULE_CONTAINER_WORKDIR"/* ]]; then
@@ -69,8 +156,9 @@ elif [[ "$CAPSULE_WORKDIR" == "$CAPSULE_CONTAINER_WORKDIR"/* ]]; then
   )"
   export CAPSULE_HOST_WORKDIR
 else
-  # A non-Capsule path inside a container is not host-mountable via DOOD.
-  # Fall back to the local path and let Docker surface any mount error.
+  # A non-Capsule path inside a container needs CAPSULE_HOST_PATH_MAP to resolve
+  # back to a daemon-host path. Without that, fall back to the local path and
+  # let Docker surface any mount error.
   export CAPSULE_HOST_WORKDIR="$CAPSULE_WORKDIR"
 fi
 
@@ -133,6 +221,7 @@ Environment:
   DOCKER_GID       Docker socket GID (auto-detected).
   DOCKER_HOST      Docker daemon endpoint. --remote sets ssh://HOST[:PORT].
   CAPSULE_HOME_HOST_DIR  Host path used by --private-home.
+  CAPSULE_HOST_PATH_MAP  Colon-separated container=host path prefixes.
   CAPSULE_WORKDIR  Workspace directory (default: cwd).
   CAPSULE_CUSTOM_COMPOSE  Optional override compose file.
 EOF
@@ -266,22 +355,22 @@ require_remote_approval() {
 require_local_approval() {
   local prompt=""
 
-  if grep -Fxqs "${CAPSULE_WORKDIR}" "${CAPSULE_CONFIG}"; then
+  if grep -Fxqs "${LOCAL_APPROVAL_PATH}" "${CAPSULE_CONFIG}"; then
     return
   fi
 
   if [[ ! -t 0 ]]; then
     printf 'capsule: error: %s not in allowlist; ' \
-      "${CAPSULE_WORKDIR}" >&2
+      "${LOCAL_APPROVAL_PATH}" >&2
     printf 'pre-approve in %s\n' "${CAPSULE_CONFIG}" >&2
     exit 1
   fi
 
-  prompt="Allow capsule to run in ${CAPSULE_WORKDIR} (y/N)? "
+  prompt="Allow capsule to run in ${LOCAL_APPROVAL_PATH} (y/N)? "
   read -rs -n 1 -p "$prompt" key
   if [[ $key == 'y' || $key == 'Y' ]]; then
     printf 'y\n' >&2
-    printf '%s\n' "${CAPSULE_WORKDIR}" >>"${CAPSULE_CONFIG}"
+    printf '%s\n' "${LOCAL_APPROVAL_PATH}" >>"${CAPSULE_CONFIG}"
     return
   fi
 
@@ -314,8 +403,17 @@ detect_remote_home_dir() {
   run_remote_ssh "printf '%s/.capsule-home' \"\$HOME\""
 }
 
+default_private_home_dir() {
+  local home_dir=""
+
+  home_dir="$(trim_trailing_slash "$HOME")"
+  join_host_path "$home_dir" "/.capsule-home"
+}
+
 configure_private_home() {
   local err_msg=""
+  local create_private_home_dir=0
+  local default_home_dir=""
 
   if [[ -z "${CAPSULE_HOME_HOST_DIR:-}" ]]; then
     if [[ -n "$REMOTE_HOST" ]]; then
@@ -332,7 +430,23 @@ configure_private_home() {
       printf '%s\n' "$err_msg" >&2
       exit 1
     else
-      CAPSULE_HOME_HOST_DIR="${HOME}/.capsule-home"
+      default_home_dir="$(default_private_home_dir)"
+      if [[ -n "${CAPSULE_HOST_PATH_MAP:-}" ]]; then
+        if CAPSULE_HOME_HOST_DIR="$(
+          resolve_host_path_map "$default_home_dir"
+        )"; then
+          :
+        else
+          err_msg='capsule: error: --private-home with '
+          err_msg="${err_msg}CAPSULE_HOST_PATH_MAP requires a mapping for "
+          err_msg="${err_msg}${HOME} or explicit CAPSULE_HOME_HOST_DIR"
+          printf '%s\n' "$err_msg" >&2
+          exit 1
+        fi
+      else
+        CAPSULE_HOME_HOST_DIR="$default_home_dir"
+        create_private_home_dir=1
+      fi
     fi
   fi
 
@@ -342,7 +456,7 @@ configure_private_home() {
     exit 1
   fi
 
-  if [[ -z "$REMOTE_HOST" ]] && [[ "$IN_NESTED_CAPSULE" -eq 0 ]]; then
+  if [[ "$create_private_home_dir" -eq 1 ]]; then
     mkdir -p "$CAPSULE_HOME_HOST_DIR"
   fi
 

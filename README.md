@@ -381,7 +381,9 @@ capsule -p -r buildbox:/srv/casual-capsule
 
 This keeps Capsule state per user instead of per Docker Compose project.
 When `--remote` is active, Capsule resolves `~/.capsule-home` on the remote
-host.
+host. When `CAPSULE_HOST_PATH_MAP` is active inside another container, Capsule
+resolves `~/.capsule-home` through that map; if the map does not cover `$HOME`,
+set `CAPSULE_HOME_HOST_DIR` explicitly.
 
 ### Custom Capsule images
 
@@ -467,14 +469,18 @@ container (for example, `/home/workspace/mydir`) back to the original host path
 (for example, `/home/myuser/myproject/mydir`) before asking the Docker server
 (which runs on the host machine) to create the workspace bind mount.
 
-For this mechanism to work, you need to set the environment variable
-`CAPSULE_HOST_WORKDIR` when starting the container.
+For this mechanism to work, you can either pass the workspace root explicitly as
+`CAPSULE_HOST_WORKDIR`, or define `CAPSULE_HOST_PATH_MAP` when the inner
+container sees the same files under a different absolute path.
 
 ```bash
 CAPSULE_HOST_WORKDIR=$(pwd) capsule
+CAPSULE_HOST_PATH_MAP=/workspace=/home/myuser/myproject capsule
+CAPSULE_HOST_PATH_MAP=/workspace=/src/project:/tmp/cache=/var/cache capsule
 ```
 
-See more information about it in `capsule.sh`.
+`CAPSULE_HOST_PATH_MAP` is a colon-separated list of
+`container_prefix=host_prefix` pairs. The first matching prefix wins.
 
 ### Remote Docker host
 
@@ -550,7 +556,14 @@ Options:
     `--private-home` is active.
 
     Default: empty. `--private-home` resolves it to `~/.capsule-home` on the
-    Docker daemon host.
+    Docker daemon host, using `CAPSULE_HOST_PATH_MAP` when needed.
+
+*   `CAPSULE_HOST_PATH_MAP`: Colon-separated
+    `container_prefix=host_prefix` mappings for resolving daemon-host paths
+    from inside non-Capsule containers.
+
+    Default: empty. The first matching prefix wins, and the mapped host path is
+    used for allowlist checks.
 
 *   `CAPSULE_WORKDIR`: Workspace directory.
 
