@@ -495,7 +495,7 @@ capsule --remote buildbox:/srv/casual-capsule --build
 ```
 
 The remote target must be approved first. Use an SSH config host alias when you
-need a non-default port or extra SSH options.
+need extra SSH options beyond the optional port in `HOST[:PORT]`.
 
 ## 🔧 Configuration reference
 
