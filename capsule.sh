@@ -23,20 +23,19 @@ SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)"
 #
 #         *   If capsule.sh is running inside a capsule (that is, a container
 #             started by another execution of capsule.sh),
-#             CAPSULE_HOST_WORKDIR is the directory on the host that is mapped
-#             to /home/workspace inside the container.
+#             CAPSULE_HOST_WORKDIR is the directory on the Docker daemon host
+#             that is mapped to /home/workspace inside the container.
 #
 #     -   After the if construct below:
 #
 #         *   CAPSULE_HOST_WORKDIR will point to the same directory as
-#             CAPSULE_WORKDIR, but on the host machine (where the Docker daemon
-#             is running).
+#             CAPSULE_WORKDIR, but on the Docker daemon host.
 #
 # To sum up: the following values all point to the same working directory, but
 # in different systems:
 #
 # *   CAPSULE_HOST_WORKDIR (after the if construct below): The working
-#     directory's path on the host machine.
+#     directory's path on the Docker daemon host.
 #
 # *   CAPSULE_WORKDIR: The working directory's path on the machine where this
 #     capsule.sh is running. This might be on the host machine or in a
@@ -45,9 +44,18 @@ SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)"
 #
 # *   /home/workspace: The working directory's path in the container started by
 #     capsule.sh.
+ORIG_CAPSULE_HOST_WORKDIR="${CAPSULE_HOST_WORKDIR:-}"
 export CAPSULE_WORKDIR="${CAPSULE_WORKDIR:-$(pwd -P)}"
 CAPSULE_CONTAINER_WORKDIR="/home/workspace"
+IN_NESTED_CAPSULE=0
 _CAPSULE_ID_WARN=0
+
+if [[ -n "$ORIG_CAPSULE_HOST_WORKDIR" ]]; then
+  if [[ "$CAPSULE_WORKDIR" == "$CAPSULE_CONTAINER_WORKDIR" ]] || \
+    [[ "$CAPSULE_WORKDIR" == "$CAPSULE_CONTAINER_WORKDIR"/* ]]; then
+    IN_NESTED_CAPSULE=1
+  fi
+fi
 
 if [[ -z "${CAPSULE_HOST_WORKDIR:-}" ]]; then
   export CAPSULE_HOST_WORKDIR="$CAPSULE_WORKDIR"
@@ -96,9 +104,15 @@ fi
 BUILD_MODE="none"
 BUILD_MODE_FLAG=""
 NO_CACHE=0
+PRIVATE_HOME=0
 RUNTIME_ARGS=()
 CAPSULE_CUSTOM_COMPOSE="${CAPSULE_CUSTOM_COMPOSE:-}"
 CAPSULE_CUSTOM_DIR=""
+REMOTE_HOST=""
+REMOTE_SSH_DEST=""
+REMOTE_SSH_PORT=""
+REMOTE_WORKDIR=""
+unset CAPSULE_HOME_MOUNT 2>/dev/null || true
 
 usage() {
   cat <<'EOF'
@@ -106,6 +120,8 @@ Usage: capsule.sh [options] [--] [command...]
 
 Options:
   -b, --build  Run "docker compose build cli" before runtime.
+  -p, --private-home  Bind-mount a per-user home directory.
+  -r, --remote HOST[:PORT]:/abs/path  Run on a remote Docker host over SSH.
       --build-custom  Run the custom compose build before runtime.
       --no-cache  Pass --no-cache to build commands run by this script.
   -h, --help   Show this help message.
@@ -115,6 +131,8 @@ Environment:
   CAPSULE_UID      Container user UID (auto-detected).
   CAPSULE_GID      Container user GID (auto-detected).
   DOCKER_GID       Docker socket GID (auto-detected).
+  DOCKER_HOST      Docker daemon endpoint. --remote sets ssh://HOST[:PORT].
+  CAPSULE_HOME_HOST_DIR  Host path used by --private-home.
   CAPSULE_WORKDIR  Workspace directory (default: cwd).
   CAPSULE_CUSTOM_COMPOSE  Optional override compose file.
 EOF
@@ -170,6 +188,168 @@ set_build_mode() {
   exit 1
 }
 
+parse_remote_target() {
+  local remote_target="$1"
+  local remote_err=''
+
+  if [[ -n "$REMOTE_HOST" ]]; then
+    printf '%s\n' \
+      'capsule: error: --remote cannot be specified more than once' >&2
+    exit 1
+  fi
+
+  remote_err='capsule: error: --remote requires '
+  remote_err="${remote_err}HOST[:PORT]:/absolute/workdir"
+  if [[ ! "$remote_target" =~ ^(.+):(/.*)$ ]]; then
+    printf '%s\n' "$remote_err" >&2
+    exit 1
+  fi
+
+  REMOTE_HOST="${BASH_REMATCH[1]}"
+  REMOTE_WORKDIR="${BASH_REMATCH[2]}"
+
+  if [[ -z "$REMOTE_HOST" || -z "$REMOTE_WORKDIR" ]]; then
+    printf '%s\n' "$remote_err" >&2
+    exit 1
+  fi
+
+  REMOTE_SSH_DEST="$REMOTE_HOST"
+  REMOTE_SSH_PORT=""
+  if [[ "$REMOTE_HOST" =~ ^([^:]+):([0-9]+)$ ]]; then
+    REMOTE_SSH_DEST="${BASH_REMATCH[1]}"
+    REMOTE_SSH_PORT="${BASH_REMATCH[2]}"
+  elif [[ "$REMOTE_HOST" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
+    REMOTE_SSH_DEST="${BASH_REMATCH[1]}"
+    REMOTE_SSH_PORT="${BASH_REMATCH[2]}"
+  fi
+
+  if [[ "$REMOTE_WORKDIR" != /* ]]; then
+    printf 'capsule: error: --remote workdir must be absolute: %s\n' \
+      "$REMOTE_WORKDIR" >&2
+    exit 1
+  fi
+}
+
+remote_approval_key() {
+  printf 'ssh://%s%s\n' "$REMOTE_HOST" "$REMOTE_WORKDIR"
+}
+
+require_remote_approval() {
+  local approval_key=""
+  local prompt=""
+
+  approval_key="$(remote_approval_key)"
+  if grep -Fxqs "$approval_key" "$CAPSULE_CONFIG"; then
+    return
+  fi
+
+  if [[ ! -t 0 ]]; then
+    printf 'capsule: error: %s not in allowlist; ' \
+      "$approval_key" >&2
+    printf 'pre-approve in %s\n' "$CAPSULE_CONFIG" >&2
+    exit 1
+  fi
+
+  prompt="Allow capsule to run on ${REMOTE_HOST} with workspace "
+  prompt="${prompt}${REMOTE_WORKDIR} (y/N)? "
+  read -rs -n 1 -p "$prompt" key
+  if [[ $key == 'y' || $key == 'Y' ]]; then
+    printf 'y\n' >&2
+    printf '%s\n' "$approval_key" >>"$CAPSULE_CONFIG"
+    return
+  fi
+
+  printf 'n\n' >&2
+  exit 1
+}
+
+require_local_approval() {
+  local prompt=""
+
+  if grep -Fxqs "${CAPSULE_WORKDIR}" "${CAPSULE_CONFIG}"; then
+    return
+  fi
+
+  if [[ ! -t 0 ]]; then
+    printf 'capsule: error: %s not in allowlist; ' \
+      "${CAPSULE_WORKDIR}" >&2
+    printf 'pre-approve in %s\n' "${CAPSULE_CONFIG}" >&2
+    exit 1
+  fi
+
+  prompt="Allow capsule to run in ${CAPSULE_WORKDIR} (y/N)? "
+  read -rs -n 1 -p "$prompt" key
+  if [[ $key == 'y' || $key == 'Y' ]]; then
+    printf 'y\n' >&2
+    printf '%s\n' "${CAPSULE_WORKDIR}" >>"${CAPSULE_CONFIG}"
+    return
+  fi
+
+  printf 'n\n' >&2
+  exit 1
+}
+
+run_remote_ssh() {
+  local remote_cmd="$1"
+  local ssh_args=()
+
+  if [[ -n "$REMOTE_SSH_PORT" ]]; then
+    ssh_args=(-p "$REMOTE_SSH_PORT")
+  fi
+
+  # shellcheck disable=SC2029
+  ssh "${ssh_args[@]}" "$REMOTE_SSH_DEST" "$remote_cmd" 2>/dev/null || true
+}
+
+detect_remote_docker_gid() {
+  local detect_gid_cmd=""
+
+  detect_gid_cmd="stat -c '%g' /var/run/docker.sock 2>/dev/null || "
+  detect_gid_cmd="${detect_gid_cmd}stat -f '%g' /var/run/docker.sock "
+  detect_gid_cmd="${detect_gid_cmd}2>/dev/null"
+  run_remote_ssh "$detect_gid_cmd"
+}
+
+detect_remote_home_dir() {
+  run_remote_ssh "printf '%s/.capsule-home' \"\$HOME\""
+}
+
+configure_private_home() {
+  local err_msg=""
+
+  if [[ -z "${CAPSULE_HOME_HOST_DIR:-}" ]]; then
+    if [[ -n "$REMOTE_HOST" ]]; then
+      CAPSULE_HOME_HOST_DIR="$(detect_remote_home_dir)"
+      if [[ -z "$CAPSULE_HOME_HOST_DIR" ]]; then
+        printf '%s\n' \
+          'capsule: error: failed to resolve remote private home path' >&2
+        exit 1
+      fi
+    elif [[ "$IN_NESTED_CAPSULE" -eq 1 ]]; then
+      err_msg='capsule: error: --private-home inside Capsule requires '
+      err_msg="${err_msg}CAPSULE_HOME_HOST_DIR or an outer Capsule "
+      err_msg="${err_msg}started with --private-home"
+      printf '%s\n' "$err_msg" >&2
+      exit 1
+    else
+      CAPSULE_HOME_HOST_DIR="${HOME}/.capsule-home"
+    fi
+  fi
+
+  if [[ "$CAPSULE_HOME_HOST_DIR" != /* ]]; then
+    printf 'capsule: error: private home path must be absolute: %s\n' \
+      "$CAPSULE_HOME_HOST_DIR" >&2
+    exit 1
+  fi
+
+  if [[ -z "$REMOTE_HOST" ]] && [[ "$IN_NESTED_CAPSULE" -eq 0 ]]; then
+    mkdir -p "$CAPSULE_HOME_HOST_DIR"
+  fi
+
+  export CAPSULE_HOME_HOST_DIR
+  export CAPSULE_HOME_MOUNT="${CAPSULE_HOME_HOST_DIR}:/home/user"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -b|--build)
@@ -178,6 +358,24 @@ while [[ $# -gt 0 ]]; do
       ;;
     --build-custom)
       set_build_mode "custom" "$1"
+      shift
+      ;;
+    -p|--private-home)
+      PRIVATE_HOME=1
+      shift
+      ;;
+    -r|--remote)
+      if [[ $# -lt 2 ]] || [[ "${2:-}" == -* ]]; then
+        printf '%s\n' \
+          'capsule: error: --remote requires HOST[:PORT]:/absolute/workdir' \
+          >&2
+        exit 1
+      fi
+      parse_remote_target "$2"
+      shift 2
+      ;;
+    --remote=*)
+      parse_remote_target "${1#--remote=}"
       shift
       ;;
     --no-cache)
@@ -235,75 +433,81 @@ fi
 # Require explicit approval before mounting a host path into the container.
 CAPSULE_CONFIG=${CAPSULE_CONFIG:-"${HOME}/.config/capsule"}
 mkdir -p "$(dirname "${CAPSULE_CONFIG}")"
-if ! grep -Fxqs "${CAPSULE_WORKDIR}" "${CAPSULE_CONFIG}"; then
-    if [[ ! -t 0 ]]; then
-        printf 'capsule: error: %s not in allowlist; ' \
-            "${CAPSULE_WORKDIR}" >&2
-        printf 'pre-approve in %s\n' "${CAPSULE_CONFIG}" >&2
-        exit 1
-    fi
-    read -rs -n 1 -p "Allow capsule to run in ${CAPSULE_WORKDIR} (y/N)? " key
-    if [[ $key == 'y' || $key == 'Y' ]]; then
-        printf 'y\n' >&2
-        printf '%s\n' "${CAPSULE_WORKDIR}" >>"${CAPSULE_CONFIG}"
-    else
-        printf 'n\n' >&2
-        exit 1
-    fi
+
+if [[ -z "$REMOTE_HOST" ]]; then
+  require_local_approval
+else
+  require_remote_approval
+  export DOCKER_HOST="ssh://$REMOTE_HOST"
+  export CAPSULE_HOST_WORKDIR="$REMOTE_WORKDIR"
+fi
+
+if [[ "$PRIVATE_HOME" -eq 1 ]]; then
+  configure_private_home
 fi
 
 if [[ -z "${DOCKER_GID:-}" ]]; then
-  DOCKER_SOCK_PATH=""
-  DOCKER_HOST_SOCK_PATH=""
-
-  # Prefer the active Docker socket so the container user can access the
-  # daemon through the mounted socket without running as root.
-  if [[ -n "${DOCKER_HOST:-}" ]] && [[ "${DOCKER_HOST}" == unix://* ]]; then
-    DOCKER_HOST_SOCK_PATH="${DOCKER_HOST#unix://}"
-    if [[ -e "${DOCKER_HOST_SOCK_PATH}" ]]; then
-      DOCKER_SOCK_PATH="${DOCKER_HOST_SOCK_PATH}"
-    fi
-  fi
-
-  if [[ -z "${DOCKER_SOCK_PATH}" ]] && [[ -e /var/run/docker.sock ]]; then
-    DOCKER_SOCK_PATH="/var/run/docker.sock"
-  elif [[ -z "${DOCKER_SOCK_PATH}" ]] && command -v docker >/dev/null 2>&1; then
-    CONTEXT_HOST="$(docker context inspect \
-      --format '{{(index .Endpoints "docker").Host}}' 2>/dev/null || true)"
-    if [[ "${CONTEXT_HOST}" == unix://* ]]; then
-      DOCKER_SOCK_PATH="${CONTEXT_HOST#unix://}"
-    fi
-  fi
-
-  if [[ -n "${DOCKER_SOCK_PATH}" ]] && [[ -e "${DOCKER_SOCK_PATH}" ]]; then
-    if DOCKER_GID_VALUE="$(
-      stat -c '%g' "${DOCKER_SOCK_PATH}" 2>/dev/null
-    )"; then
-      export DOCKER_GID="${DOCKER_GID_VALUE}"
-    elif DOCKER_GID_VALUE="$(
-      stat -f '%g' "${DOCKER_SOCK_PATH}" 2>/dev/null
-    )"; then
-      export DOCKER_GID="${DOCKER_GID_VALUE}"
+  if [[ -n "$REMOTE_HOST" ]]; then
+    DOCKER_GID_VALUE="$(detect_remote_docker_gid)"
+    if [[ -n "$DOCKER_GID_VALUE" ]]; then
+      export DOCKER_GID="$DOCKER_GID_VALUE"
     else
-      if DOCKER_GID_VALUE="$(stat -c '%g' "${DOCKER_SOCK_PATH}")"; then
-        if [[ -n "${DOCKER_GID_VALUE}" ]]; then
-          export DOCKER_GID="${DOCKER_GID_VALUE}"
+      export DOCKER_GID="999"
+    fi
+  else
+    DOCKER_SOCK_PATH=""
+    DOCKER_HOST_SOCK_PATH=""
+
+   # Prefer the active Docker socket so the container user can access the
+   # daemon through the mounted socket without running as root.
+    if [[ -n "${DOCKER_HOST:-}" ]] && [[ "${DOCKER_HOST}" == unix://* ]]; then
+      DOCKER_HOST_SOCK_PATH="${DOCKER_HOST#unix://}"
+      if [[ -e "${DOCKER_HOST_SOCK_PATH}" ]]; then
+        DOCKER_SOCK_PATH="${DOCKER_HOST_SOCK_PATH}"
+      fi
+    fi
+
+    if [[ -z "${DOCKER_SOCK_PATH}" ]] && [[ -e /var/run/docker.sock ]]; then
+      DOCKER_SOCK_PATH="/var/run/docker.sock"
+    elif [[ -z "${DOCKER_SOCK_PATH}" ]] && \
+      command -v docker >/dev/null 2>&1; then
+      CONTEXT_HOST="$(docker context inspect \
+        --format '{{(index .Endpoints "docker").Host}}' 2>/dev/null || true)"
+      if [[ "${CONTEXT_HOST}" == unix://* ]]; then
+        DOCKER_SOCK_PATH="${CONTEXT_HOST#unix://}"
+      fi
+    fi
+
+    if [[ -n "${DOCKER_SOCK_PATH}" ]] && [[ -e "${DOCKER_SOCK_PATH}" ]]; then
+      if DOCKER_GID_VALUE="$(
+        stat -c '%g' "${DOCKER_SOCK_PATH}" 2>/dev/null
+      )"; then
+        export DOCKER_GID="${DOCKER_GID_VALUE}"
+      elif DOCKER_GID_VALUE="$(
+        stat -f '%g' "${DOCKER_SOCK_PATH}" 2>/dev/null
+      )"; then
+        export DOCKER_GID="${DOCKER_GID_VALUE}"
+      else
+        if DOCKER_GID_VALUE="$(stat -c '%g' "${DOCKER_SOCK_PATH}")"; then
+          if [[ -n "${DOCKER_GID_VALUE}" ]]; then
+            export DOCKER_GID="${DOCKER_GID_VALUE}"
+          fi
         fi
       fi
     fi
-  fi
 
-  # macOS Docker Desktop exposes a socket owned by staff, but the in-container
-  # socket group that works for access is conventionally 991.
-  if [[ "$(uname -s)" == "Darwin" ]] && [[ "${DOCKER_GID:-}" == "20" ]]; then
-    export DOCKER_GID="991"
-  fi
-
-  if [[ -z "${DOCKER_GID:-}" ]]; then
-    if [[ "$(uname -s)" == "Darwin" ]]; then
+    # macOS Docker Desktop exposes a socket owned by staff, but the
+    # in-container socket group that works for access is conventionally 991.
+    if [[ "$(uname -s)" == "Darwin" ]] && [[ "${DOCKER_GID:-}" == "20" ]]; then
       export DOCKER_GID="991"
-    else
-      export DOCKER_GID="999"
+    fi
+
+    if [[ -z "${DOCKER_GID:-}" ]]; then
+      if [[ "$(uname -s)" == "Darwin" ]]; then
+        export DOCKER_GID="991"
+      else
+        export DOCKER_GID="999"
+      fi
     fi
   fi
 fi

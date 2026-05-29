@@ -84,7 +84,7 @@ if [ -s "$_GH_SECRET" ]; then
         --reuid="$(id -u user)" \
         --regid="$(id -g user)" \
         --init-groups \
-        -- gh auth login --with-token < "$_GH_SECRET" \
+        -- "$(mise which gh)" auth login --with-token < "$_GH_SECRET" \
         || printf 'capsule: warning: gh auth login failed\n' >&2
 fi
 
