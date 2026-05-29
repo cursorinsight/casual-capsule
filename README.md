@@ -5,7 +5,7 @@
 [![Base image](https://img.shields.io/badge/base-debian%3Atrixie--slim-informational?logo=debian)](Dockerfile)
 [![Shell](https://img.shields.io/badge/shell-bash-green?logo=gnu-bash)](capsule.sh)
 [![Shellcheck](https://img.shields.io/badge/lint-shellcheck-yellow)](https://www.shellcheck.net)
-[![Tooling](https://img.shields.io/badge/tools-mise-orange)](https://mise.jdx.dev)
+[![Tooling](https://img.shields.io/badge/tools-mise-orange)](https://mise.en.dev)
 [![Tooling](https://img.shields.io/badge/tools-uv-orange)](https://docs.astral.sh/uv/)
 
 Containerized CLI workspace for AI coding agents (Copilot CLI, Codex CLI) with
