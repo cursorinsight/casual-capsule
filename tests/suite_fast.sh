@@ -329,7 +329,7 @@ test_entrypoint_contract() {
     '/run/secrets/github_api_token' \
     "entrypoint reads github token from compose secret mount"
   assert_file_contains "$ENTRYPOINT_PATH" \
-    'mise which gh' \
+    'mise --cd /root which gh' \
     "entrypoint resolves gh via mise before runtime auth refresh"
   assert_file_contains "$ENTRYPOINT_PATH" \
     'auth login --with-token' \
