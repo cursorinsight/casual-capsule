@@ -424,7 +424,7 @@ initialize_capsule_config() {
 # Prompt once before writing a new allowlist entry.
 ensure_allowlist_entry() {
   local approval_key="$1"
-  local prompt="$2"
+  local prompt="$2 (y/N)? "
   local key=""
 
   if grep -Fxqs "$approval_key" "$CAPSULE_CONFIG"; then
@@ -455,15 +455,14 @@ remote_approval_key() {
 require_local_approval() {
   ensure_allowlist_entry \
     "$LOCAL_APPROVAL_PATH" \
-    "Allow capsule to run in ${LOCAL_APPROVAL_PATH} (y/N)? "
+    "Allow capsule to run in ${LOCAL_APPROVAL_PATH}"
 }
 
 # Require allowlist approval for a remote daemon-host workspace path.
 require_remote_approval() {
   ensure_allowlist_entry \
     "$(remote_approval_key)" \
-    "Allow capsule to run on ${REMOTE_HOST} with workspace ${REMOTE_WORKDIR}"\
-    " (y/N)? "
+    "Allow capsule to run on ${REMOTE_HOST} with workspace ${REMOTE_WORKDIR}"
 }
 
 # Run a helper command over SSH against the configured remote host.
