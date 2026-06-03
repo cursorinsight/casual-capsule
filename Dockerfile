@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.10
 # Disabled hadolint checkers:
 #  - DL3002: Last user should not be root.
 #  - DL3008: Pin versions in `apt-get install`.

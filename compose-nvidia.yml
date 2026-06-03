@@ -1,0 +1,9 @@
+name: ${CAPSULE_COMPOSE_PROJECT_NAME:-casual-capsule-nvidia}
+
+services:
+  cli:
+    image: casual-capsule-cli:latest
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    privileged: true
+    runtime: nvidia
