@@ -65,6 +65,9 @@ if [ "$CHANGED" = "1" ] || \
   chown -Rh user: "$TARGET_HOME" 2>/dev/null || true
 fi
 
+# Get `gh` path before rewriting HOME
+GH="$(mise --cd /root which gh)"
+
 # Set user environment before dropping privileges.
 # setpriv does not update env vars, so HOME, USER, and
 # LOGNAME would otherwise stay as root's values.
@@ -84,7 +87,7 @@ if [ -s "$_GH_SECRET" ]; then
         --reuid="$(id -u user)" \
         --regid="$(id -g user)" \
         --init-groups \
-        -- gh auth login --with-token < "$_GH_SECRET" \
+        -- "$GH" auth login --with-token < "$_GH_SECRET" \
         || printf 'capsule: warning: gh auth login failed\n' >&2
 fi
 

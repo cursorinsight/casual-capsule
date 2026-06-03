@@ -5,7 +5,7 @@
 [![Base image](https://img.shields.io/badge/base-debian%3Atrixie--slim-informational?logo=debian)](Dockerfile)
 [![Shell](https://img.shields.io/badge/shell-bash-green?logo=gnu-bash)](capsule.sh)
 [![Shellcheck](https://img.shields.io/badge/lint-shellcheck-yellow)](https://www.shellcheck.net)
-[![Tooling](https://img.shields.io/badge/tools-mise-orange)](https://mise.jdx.dev)
+[![Tooling](https://img.shields.io/badge/tools-mise-orange)](https://mise.en.dev)
 [![Tooling](https://img.shields.io/badge/tools-uv-orange)](https://docs.astral.sh/uv/)
 
 Containerized CLI workspace for AI coding agents (Copilot CLI, Codex CLI) with
@@ -26,9 +26,11 @@ common developer tools.
 - [Additional features](#-additional-features)
   - [UID and GID detection](#uid-and-gid-detection)
   - [Directory approval list](#directory-approval-list)
+  - [Private home bind mount](#private-home-bind-mount)
   - [Custom Capsule images](#custom-capsule-images)
   - [Updating your GitHub token](#updating-your-github-token)
   - [Bind mounts in containers started in a Capsule](#bind-mounts-in-containers-started-in-a-capsule)
+  - [Remote Docker host](#remote-docker-host)
 - [Configuration reference](#-configuration-reference)
   - [Command line options](#command-line-options)
   - [Environment variables](#environment-variables)
@@ -190,7 +192,8 @@ easier.
 
     The Docker daemon created a `casual-capsule_home` Docker volume when it
     started the container. This volume is mounted to `/home/user`. This volume
-    is persistent and shared between Capsule instances.
+    is persistent and shared between Capsule instances. Use `-p` or
+    `--private-home` to bind-mount `~/.capsule-home` instead.
 
     The `/home/user/.config/gh/hosts.yml` file should contain your GitHub API
     token.
@@ -360,6 +363,28 @@ On the first run in a new directory, `capsule.sh` prompts for explicit approval
 and records the approved path in `~/.config/capsule` (overridable via
 `CAPSULE_CONFIG`).
 
+When `--remote` is active, Capsule checks only the remote target in that same
+allowlist. Remote targets approved via `--remote` are stored as
+`ssh://HOST[:PORT]/path`.
+
+### Private home bind mount
+
+Use `-p` or `--private-home` to replace the shared Docker volume for
+`/home/user` with a bind mount from `~/.capsule-home` on the Docker daemon
+host.
+
+```bash
+capsule --private-home
+capsule -p --build
+capsule -p -r buildbox:/srv/casual-capsule
+```
+
+This keeps Capsule state per user instead of per Docker Compose project.
+When `--remote` is active, Capsule resolves `~/.capsule-home` on the remote
+host. When `CAPSULE_HOST_PATH_MAP` is active inside another container, Capsule
+resolves `~/.capsule-home` through that map; if the map does not cover `$HOME`,
+set `CAPSULE_HOME_HOST_DIR` explicitly.
+
 ### Custom Capsule images
 
 If you want to extend the Docker image or Compose configuration provided by
@@ -444,14 +469,33 @@ container (for example, `/home/workspace/mydir`) back to the original host path
 (for example, `/home/myuser/myproject/mydir`) before asking the Docker server
 (which runs on the host machine) to create the workspace bind mount.
 
-For this mechanism to work, you need to set the environment variable
-`CAPSULE_HOST_WORKDIR` when starting the container.
+For this mechanism to work, you can either pass the workspace root explicitly as
+`CAPSULE_HOST_WORKDIR`, or define `CAPSULE_HOST_PATH_MAP` when the inner
+container sees the same files under a different absolute path.
 
 ```bash
 CAPSULE_HOST_WORKDIR=$(pwd) capsule
+CAPSULE_HOST_PATH_MAP=/workspace=/home/myuser/myproject capsule
+CAPSULE_HOST_PATH_MAP=/workspace=/src/project:/tmp/cache=/var/cache capsule
 ```
 
-See more information about it in `capsule.sh`.
+`CAPSULE_HOST_PATH_MAP` is a colon-separated list of
+`container_prefix=host_prefix` pairs. The first matching prefix wins.
+
+### Remote Docker host
+
+Use `--remote HOST[:PORT]:/abs/path` to build and run on a remote Docker daemon
+over SSH. Capsule sets `DOCKER_HOST=ssh://HOST[:PORT]` for Compose and mounts
+`/abs/path` as `/home/workspace` on the remote daemon host.
+
+```bash
+capsule --remote buildbox:/srv/casual-capsule
+capsule --remote buildbox:2222:/srv/casual-capsule
+capsule --remote buildbox:/srv/casual-capsule --build
+```
+
+The remote target must be approved first. Use an SSH config host alias when you
+need extra SSH options beyond the optional port in `HOST[:PORT]`.
 
 ## 🔧 Configuration reference
 
@@ -468,8 +512,15 @@ Options:
 
 *   `-b`, `--build`: Run `docker compose build cli` before `run`.
 
+*   `-p`, `--private-home`: Bind-mount `~/.capsule-home` from the Docker daemon
+    host to `/home/user` in the container.
+
 *   `--build-custom`: Run `docker compose build cli` only for the merged custom
     compose configuration before `run`. Requires `CAPSULE_CUSTOM_COMPOSE`.
+
+*   `-r HOST[:PORT]:/abs/path`, `--remote HOST[:PORT]:/abs/path`: Run
+    `docker compose` against `ssh://HOST[:PORT]` and
+    mount `/abs/path` as `/home/workspace` on that remote host.
 
 *   `--no-cache`: Pass `--no-cache` to the build commands triggered by
     `--build` or `--build-custom`.
@@ -497,6 +548,23 @@ Options:
 
     Default: Auto-detected from the host.
 
+*   `DOCKER_HOST`: Docker daemon endpoint for `docker compose`.
+
+    Default: Docker CLI default. `--remote` sets `ssh://HOST[:PORT]`.
+
+*   `CAPSULE_HOME_HOST_DIR`: Host path bound to `/home/user` when
+    `--private-home` is active.
+
+    Default: empty. `--private-home` resolves it to `~/.capsule-home` on the
+    Docker daemon host, using `CAPSULE_HOST_PATH_MAP` when needed.
+
+*   `CAPSULE_HOST_PATH_MAP`: Colon-separated
+    `container_prefix=host_prefix` mappings for resolving daemon-host paths
+    from inside non-Capsule containers.
+
+    Default: empty. The first matching prefix wins, and the mapped host path is
+    used for allowlist checks.
+
 *   `CAPSULE_WORKDIR`: Workspace directory.
 
     Default: current working directory.
@@ -509,9 +577,10 @@ Options:
 
     Default: `~/.config/capsule`.
 
-*   `CAPSULE_HOST_WORKDIR`: host-visible path for `/home/workspace`.
+*   `CAPSULE_HOST_WORKDIR`: daemon-host-visible path for `/home/workspace`.
 
-    Default: empty.
+    Default: derived from `CAPSULE_WORKDIR`. `--remote` overrides it with the
+    remote workspace path.
 
 *   `GITHUB_API_TOKEN`: Passed as a build secret for `gh` auth and Copilot CLI.
 

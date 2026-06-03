@@ -18,6 +18,17 @@ DOCKERFILE_PATH="$ROOT_DIR/Dockerfile"
 ENTRYPOINT_PATH="$ROOT_DIR/docker/entrypoint.sh"
 EXAMPLE_PROJECT_DIR="$ROOT_DIR/tests/fixtures/example-project"
 
+unset CAPSULE_CUSTOM_COMPOSE
+unset CAPSULE_EXTRA_APPROVALS
+unset CAPSULE_GID
+unset CAPSULE_HOME_HOST_DIR
+unset CAPSULE_HOST_PATH_MAP
+unset CAPSULE_HOST_WORKDIR
+unset CAPSULE_UID
+unset CAPSULE_WORKDIR
+unset DOCKER_GID
+unset DOCKER_HOST
+
 TEST_TMPDIR="$(mktemp -d)"
 # Resolve symlinks so paths match what capsule.sh produces via pwd -P.
 # On macOS mktemp -d returns /var/folders/… which resolves to
@@ -95,6 +106,9 @@ fi
 if [[ "${1:-}" == "compose" ]]; then
   {
     printf 'ENV_DOCKER_GID=%s\n' "${DOCKER_GID:-}"
+    printf 'ENV_DOCKER_HOST=%s\n' "${DOCKER_HOST:-}"
+    printf 'ENV_CAPSULE_HOME_HOST_DIR=%s\n' "${CAPSULE_HOME_HOST_DIR:-}"
+    printf 'ENV_CAPSULE_HOME_MOUNT=%s\n' "${CAPSULE_HOME_MOUNT:-}"
     printf 'ENV_CAPSULE_WORKDIR=%s\n' "${CAPSULE_WORKDIR:-}"
     printf 'ENV_CAPSULE_HOST_WORKDIR=%s\n' "${CAPSULE_HOST_WORKDIR:-}"
     printf 'ENV_CAPSULE_CUSTOM_DIR=%s\n' "${CAPSULE_CUSTOM_DIR:-}"
@@ -107,6 +121,22 @@ fi
 
 printf 'unexpected docker call: %s\n' "$*" >&2
 exit 1
+EOF
+
+  cat >"$dir/ssh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+{
+  printf 'SSH_ARGS=%s\n' "$*"
+} >>"${MOCK_LOG:?MOCK_LOG is required}"
+if [[ -n "${MOCK_SSH_FAIL:-}" ]]; then
+  exit 1
+fi
+if [[ "$*" == *'.capsule-home'* ]]; then
+  printf '%s\n' "${MOCK_SSH_HOME_DIR:-${MOCK_SSH_OUTPUT:-}}"
+else
+  printf '%s\n' "${MOCK_SSH_OUTPUT:-}"
+fi
 EOF
 
   cat >"$dir/stat" <<'EOF'
@@ -152,7 +182,7 @@ printf '2024.1.0\n'
 EOF
 
   chmod +x "$dir/docker" "$dir/stat" "$dir/uname" "$dir/ls" \
-    "$dir/id" "$dir/curl"
+    "$dir/id" "$dir/curl" "$dir/ssh"
 }
 
 run_capsule() {
@@ -160,8 +190,15 @@ run_capsule() {
   local log_file="$2"
   local cfg_file="${TEST_TMPDIR}/config"
   shift 2
-  echo "${CAPSULE_WORKDIR:-$(pwd -P)}" >"${cfg_file}"
+  printf '%s\n' "${CAPSULE_WORKDIR:-$(pwd -P)}" >"${cfg_file}"
+  if [[ -n "${CAPSULE_EXTRA_APPROVALS:-}" ]]; then
+    printf '%s\n' "${CAPSULE_EXTRA_APPROVALS}" >>"${cfg_file}"
+  fi
   PATH="$mock_bin:$PATH" MOCK_LOG="$log_file" CAPSULE_CONFIG="$cfg_file" \
+    CAPSULE_HOST_PATH_MAP="${CAPSULE_HOST_PATH_MAP-}" \
+    CAPSULE_HOST_WORKDIR="${CAPSULE_HOST_WORKDIR-}" \
+    CAPSULE_HOME_HOST_DIR="${CAPSULE_HOME_HOST_DIR-}" \
+    DOCKER_HOST="${DOCKER_HOST-}" \
     "$SCRIPT_PATH" "$@"
 }
 
@@ -198,6 +235,12 @@ test_compose_contract() {
   assert_file_contains "$COMPOSE_PATH" \
     '${CAPSULE_HOST_WORKDIR:-${CAPSULE_WORKDIR:-${PWD}}}:/home/workspace' \
     "compose mounts the host-visible capsule workdir"
+  assert_file_contains "$COMPOSE_PATH" \
+    '${CAPSULE_HOME_MOUNT:-home:/home/user}' \
+    "compose allows the home mount to be overridden"
+  assert_file_contains "$COMPOSE_PATH" \
+    'CAPSULE_HOME_HOST_DIR=${CAPSULE_HOME_HOST_DIR:-}' \
+    "compose passes host home mount info to nested capsules"
   assert_file_contains "$COMPOSE_PATH" \
     'CAPSULE_HOST_WORKDIR=${CAPSULE_HOST_WORKDIR:-}' \
     "compose passes host workdir to nested capsule"
@@ -286,7 +329,10 @@ test_entrypoint_contract() {
     '/run/secrets/github_api_token' \
     "entrypoint reads github token from compose secret mount"
   assert_file_contains "$ENTRYPOINT_PATH" \
-    'gh auth login --with-token' \
+    'mise --cd /root which gh' \
+    "entrypoint resolves gh via mise before runtime auth refresh"
+  assert_file_contains "$ENTRYPOINT_PATH" \
+    'auth login --with-token' \
     "entrypoint refreshes gh credentials from runtime secret"
 }
 
@@ -475,6 +521,293 @@ test_build_and_build_custom_flags_conflict() {
   assert_file_contains "$err_file" \
     "--build-custom cannot be combined with --build" \
     "build flag conflict reports a clear error"
+}
+
+test_private_home_flag_uses_user_home_bind_mount() {
+  local tdir="$TEST_TMPDIR/private-home"
+  local home_dir="$tdir/home"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  mkdir -p "$home_dir"
+  make_mock_bin "$mock_bin"
+
+  HOME="$home_dir" DOCKER_GID=1111 \
+    run_capsule "$mock_bin" "$log_file" --private-home true
+
+  assert_equals "$home_dir/.capsule-home" \
+    "$(value_from_log ENV_CAPSULE_HOME_HOST_DIR "$log_file")" \
+    "private-home flag exports the host home bind path"
+  assert_equals "$home_dir/.capsule-home:/home/user" \
+    "$(value_from_log ENV_CAPSULE_HOME_MOUNT "$log_file")" \
+    "private-home flag overrides the home mount"
+  if [[ -d "$home_dir/.capsule-home" ]]; then
+    pass "private-home flag creates the local home bind directory"
+  else
+    fail "private-home flag creates the local home bind directory"
+  fi
+}
+
+test_private_home_uses_host_path_map_for_home_dir() {
+  local tdir="$TEST_TMPDIR/private-home-path-map"
+  local home_dir="$tdir/container-home"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local cfg_file="$tdir/config"
+  local host_path_map=""
+  mkdir -p "$home_dir"
+  make_mock_bin "$mock_bin"
+  printf '%s\n' "/host/workspace/project" >"$cfg_file"
+  host_path_map="/workspace=/host/workspace"
+  host_path_map="${host_path_map}:${home_dir}=/host/home/alice"
+
+  if HOME="$home_dir" DOCKER_GID=1111 \
+    CAPSULE_WORKDIR="/workspace/project" \
+    CAPSULE_HOST_PATH_MAP="$host_path_map" \
+    PATH="$mock_bin:$PATH" \
+    MOCK_LOG="$log_file" \
+    CAPSULE_CONFIG="$cfg_file" \
+    CAPSULE_HOST_WORKDIR="${CAPSULE_HOST_WORKDIR-}" \
+    CAPSULE_HOME_HOST_DIR="${CAPSULE_HOME_HOST_DIR-}" \
+    DOCKER_HOST="${DOCKER_HOST-}" \
+    "$SCRIPT_PATH" --private-home true </dev/null; then
+    pass "private-home uses host path map for home dir"
+  else
+    fail "private-home uses host path map for home dir"
+  fi
+
+  assert_equals "/host/home/alice/.capsule-home" \
+    "$(value_from_log ENV_CAPSULE_HOME_HOST_DIR "$log_file")" \
+    "private-home resolves mapped host home path"
+  assert_equals "/host/home/alice/.capsule-home:/home/user" \
+    "$(value_from_log ENV_CAPSULE_HOME_MOUNT "$log_file")" \
+    "private-home mount uses mapped host home path"
+  if [[ -e "$home_dir/.capsule-home" ]]; then
+    fail "private-home does not create a container-local home dir"
+  else
+    pass "private-home does not create a container-local home dir"
+  fi
+}
+
+test_private_home_requires_home_mapping_with_host_path_map() {
+  local tdir="$TEST_TMPDIR/private-home-path-map-missing"
+  local home_dir="$tdir/container-home"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local err_file="$tdir/err"
+  local cfg_file="$tdir/config"
+  mkdir -p "$home_dir"
+  make_mock_bin "$mock_bin"
+  printf '%s\n' "/host/workspace/project" >"$cfg_file"
+
+  if HOME="$home_dir" DOCKER_GID=1111 \
+    CAPSULE_WORKDIR="/workspace/project" \
+    CAPSULE_HOST_PATH_MAP="/workspace=/host/workspace" \
+    PATH="$mock_bin:$PATH" \
+    MOCK_LOG="$log_file" \
+    CAPSULE_CONFIG="$cfg_file" \
+    CAPSULE_HOST_WORKDIR="${CAPSULE_HOST_WORKDIR-}" \
+    CAPSULE_HOME_HOST_DIR="${CAPSULE_HOME_HOST_DIR-}" \
+    DOCKER_HOST="${DOCKER_HOST-}" \
+    "$SCRIPT_PATH" --private-home true </dev/null 2>"$err_file"; then
+    fail "private-home requires a home mapping with host path map"
+  else
+    pass "private-home requires a home mapping with host path map"
+  fi
+
+  assert_file_contains "$err_file" \
+    "CAPSULE_HOST_PATH_MAP requires a mapping for" \
+    "private-home reports a clear missing home mapping error"
+}
+
+test_remote_flag_requires_target() {
+  local tdir="$TEST_TMPDIR/remote-missing-target"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local err_file="$tdir/err"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  if DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" \
+    --remote --build true 2>"$err_file"; then
+    fail "remote flag requires a target"
+  else
+    pass "remote flag requires a target"
+  fi
+
+  assert_file_contains "$err_file" \
+    "--remote requires HOST[:PORT]:/absolute/workdir" \
+    "remote flag reports a clear missing target error"
+}
+
+test_remote_flag_requires_absolute_workdir_syntax() {
+  local tdir="$TEST_TMPDIR/remote-relative-workdir"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local err_file="$tdir/err"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  if DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" \
+    --remote builder:workspace true 2>"$err_file"; then
+    fail "remote flag requires an absolute workdir"
+  else
+    pass "remote flag requires an absolute workdir"
+  fi
+
+  assert_file_contains "$err_file" \
+    "--remote requires HOST[:PORT]:/absolute/workdir" \
+    "remote flag reports a clear syntax error for non-absolute targets"
+}
+
+test_remote_flag_requires_authorization() {
+  local tdir="$TEST_TMPDIR/remote-approval"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local err_file="$tdir/err"
+  local cfg_file="$tdir/config"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+  printf '%s\n' "${CAPSULE_WORKDIR:-$(pwd -P)}" >"$cfg_file"
+
+  if DOCKER_GID=1111 PATH="$mock_bin:$PATH" MOCK_LOG="$log_file" \
+    CAPSULE_CONFIG="$cfg_file" "$SCRIPT_PATH" \
+    --remote builder:/srv/work true </dev/null 2>"$err_file"; then
+    fail "remote target requires allowlist approval"
+  else
+    pass "remote target requires allowlist approval"
+  fi
+
+  assert_file_contains "$err_file" \
+    "ssh://builder/srv/work not in allowlist" \
+    "remote target reports a clear allowlist error"
+}
+
+test_remote_flag_skips_local_workdir_approval() {
+  local tdir="$TEST_TMPDIR/remote-no-local-approval"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local cfg_file="$tdir/config"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+  printf '%s\n' "ssh://builder/srv/work" >"$cfg_file"
+
+  if DOCKER_GID=1111 PATH="$mock_bin:$PATH" MOCK_LOG="$log_file" \
+    CAPSULE_CONFIG="$cfg_file" "$SCRIPT_PATH" \
+    --remote builder:/srv/work true </dev/null; then
+    pass "remote flag skips local workdir approval"
+  else
+    fail "remote flag skips local workdir approval"
+  fi
+
+  assert_equals "ssh://builder" \
+    "$(value_from_log ENV_DOCKER_HOST "$log_file")" \
+    "remote mode still exports DOCKER_HOST without local approval"
+}
+
+test_remote_flag_builds_and_runs_over_ssh() {
+  local tdir="$TEST_TMPDIR/remote-build"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local expected_build=""
+  local expected_run=""
+  local mise_ver="2024.1.0"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  DOCKER_GID=2222 CAPSULE_EXTRA_APPROVALS="ssh://builder/srv/work" \
+    run_capsule "$mock_bin" "$log_file" \
+    -r builder:/srv/work --build true
+
+  expected_build="ARGS=compose -f $COMPOSE_PATH"
+  expected_build="$expected_build build --build-arg MISE_VERSION=${mise_ver}"
+  expected_build="$expected_build cli"
+  expected_run="ARGS=compose -f $COMPOSE_PATH"
+  expected_run="$expected_run run --rm cli true"
+
+  assert_equals "ssh://builder" \
+    "$(value_from_log ENV_DOCKER_HOST "$log_file")" \
+    "remote flag exports DOCKER_HOST over ssh"
+  assert_equals "/srv/work" \
+    "$(value_from_log ENV_CAPSULE_HOST_WORKDIR "$log_file")" \
+    "remote flag exports remote CAPSULE_HOST_WORKDIR"
+  assert_equals \
+    "$expected_build" \
+    "$(entry_from_log ARGS 1 "$log_file")" \
+    "remote build still runs compose build first"
+  assert_equals \
+    "$expected_run" \
+    "$(entry_from_log ARGS 2 "$log_file")" \
+    "remote build still runs compose runtime"
+}
+
+test_remote_flag_accepts_host_port_syntax() {
+  local tdir="$TEST_TMPDIR/remote-port"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  DOCKER_GID="" CAPSULE_EXTRA_APPROVALS="ssh://builder:2222/srv/work" \
+    MOCK_SSH_OUTPUT=7654 run_capsule "$mock_bin" "$log_file" \
+    --remote builder:2222:/srv/work true
+
+  assert_equals "ssh://builder:2222" \
+    "$(value_from_log ENV_DOCKER_HOST "$log_file")" \
+    "remote flag keeps the port in DOCKER_HOST"
+  assert_equals "/srv/work" \
+    "$(value_from_log ENV_CAPSULE_HOST_WORKDIR "$log_file")" \
+    "remote port syntax still exports the remote workdir"
+  assert_equals "7654" \
+    "$(value_from_log ENV_DOCKER_GID "$log_file")" \
+    "remote port syntax still auto-detects DOCKER_GID"
+  assert_file_contains "$log_file" \
+    "SSH_ARGS=-p 2222 builder" \
+    "remote port syntax passes the ssh port to helper commands"
+}
+
+test_remote_flag_autodetects_docker_gid_over_ssh() {
+  local tdir="$TEST_TMPDIR/remote-gid"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  DOCKER_GID="" CAPSULE_EXTRA_APPROVALS="ssh://builder/srv/work" \
+    MOCK_SSH_OUTPUT=7654 run_capsule "$mock_bin" "$log_file" \
+    --remote builder:/srv/work true
+
+  assert_equals "7654" \
+    "$(value_from_log ENV_DOCKER_GID "$log_file")" \
+    "remote flag auto-detects DOCKER_GID over ssh"
+  assert_file_contains "$log_file" \
+    "SSH_ARGS=builder" \
+    "remote gid detection queries the remote host"
+  assert_file_contains "$log_file" \
+    "/var/run/docker.sock" \
+    "remote gid detection inspects the remote Docker socket"
+}
+
+test_remote_private_home_uses_remote_user_home() {
+  local tdir="$TEST_TMPDIR/remote-private-home"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  DOCKER_GID=2222 CAPSULE_EXTRA_APPROVALS="ssh://builder/srv/work" \
+    MOCK_SSH_HOME_DIR="/srv/home/alice/.capsule-home" \
+    run_capsule "$mock_bin" "$log_file" \
+    -r builder:/srv/work --private-home true
+
+  assert_equals "/srv/home/alice/.capsule-home" \
+    "$(value_from_log ENV_CAPSULE_HOME_HOST_DIR "$log_file")" \
+    "remote private-home resolves the remote user home path"
+  assert_equals "/srv/home/alice/.capsule-home:/home/user" \
+    "$(value_from_log ENV_CAPSULE_HOME_MOUNT "$log_file")" \
+    "remote private-home overrides the home mount"
+  assert_file_contains "$log_file" \
+    ".capsule-home" \
+    "remote private-home queries the remote home path over ssh"
 }
 
 test_plain_runtime_without_args() {
@@ -921,6 +1254,96 @@ test_host_workdir_defaults_to_current_workdir() {
     "host capsule uses current workdir as host workdir"
 }
 
+test_host_path_map_remaps_container_workdir() {
+  local tdir="$TEST_TMPDIR/host-path-map"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local cfg_file="$tdir/config"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+  printf '%s\n' "/host/workspace/project/subdir" >"$cfg_file"
+
+  if DOCKER_GID=1111 \
+    CAPSULE_WORKDIR="/workspace/project/subdir" \
+    CAPSULE_HOST_PATH_MAP="/workspace=/host/workspace:/src=/host/src" \
+    PATH="$mock_bin:$PATH" \
+    MOCK_LOG="$log_file" \
+    CAPSULE_CONFIG="$cfg_file" \
+    CAPSULE_HOST_WORKDIR="${CAPSULE_HOST_WORKDIR-}" \
+    CAPSULE_HOME_HOST_DIR="${CAPSULE_HOME_HOST_DIR-}" \
+    DOCKER_HOST="${DOCKER_HOST-}" \
+    "$SCRIPT_PATH" true </dev/null; then
+    pass "host path map remaps container workdir"
+  else
+    fail "host path map remaps container workdir"
+  fi
+
+  assert_equals "/host/workspace/project/subdir" \
+    "$(value_from_log ENV_CAPSULE_HOST_WORKDIR "$log_file")" \
+    "host path map remaps container workdir to daemon-host path"
+}
+
+test_host_path_map_uses_first_match() {
+  local tdir="$TEST_TMPDIR/host-path-map-first-match"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local cfg_file="$tdir/config"
+  local host_path_map=""
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+  printf '%s\n' "/host/first/project" >"$cfg_file"
+  host_path_map="/workspace=/host/first"
+  host_path_map="${host_path_map}:/workspace/project=/host/second"
+
+  if DOCKER_GID=1111 \
+    CAPSULE_WORKDIR="/workspace/project" \
+    CAPSULE_HOST_PATH_MAP="$host_path_map" \
+    PATH="$mock_bin:$PATH" \
+    MOCK_LOG="$log_file" \
+    CAPSULE_CONFIG="$cfg_file" \
+    CAPSULE_HOST_WORKDIR="${CAPSULE_HOST_WORKDIR-}" \
+    CAPSULE_HOME_HOST_DIR="${CAPSULE_HOME_HOST_DIR-}" \
+    DOCKER_HOST="${DOCKER_HOST-}" \
+    "$SCRIPT_PATH" true </dev/null; then
+    pass "host path map uses first match"
+  else
+    fail "host path map uses first match"
+  fi
+
+  assert_equals "/host/first/project" \
+    "$(value_from_log ENV_CAPSULE_HOST_WORKDIR "$log_file")" \
+    "host path map uses the first matching prefix"
+}
+
+test_host_path_map_uses_mapped_allowlist_entry() {
+  local tdir="$TEST_TMPDIR/host-path-map-approval"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local cfg_file="$tdir/config"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+  printf '%s\n' "/host/workspace/project" >"$cfg_file"
+
+  if DOCKER_GID=1111 \
+    CAPSULE_WORKDIR="/workspace/project" \
+    CAPSULE_HOST_PATH_MAP="/workspace=/host/workspace" \
+    PATH="$mock_bin:$PATH" \
+    MOCK_LOG="$log_file" \
+    CAPSULE_CONFIG="$cfg_file" \
+    CAPSULE_HOST_WORKDIR="${CAPSULE_HOST_WORKDIR-}" \
+    CAPSULE_HOME_HOST_DIR="${CAPSULE_HOME_HOST_DIR-}" \
+    DOCKER_HOST="${DOCKER_HOST-}" \
+    "$SCRIPT_PATH" true </dev/null; then
+    pass "host path map uses mapped allowlist entry"
+  else
+    fail "host path map uses mapped allowlist entry"
+  fi
+
+  assert_equals "/host/workspace/project" \
+    "$(value_from_log ENV_CAPSULE_HOST_WORKDIR "$log_file")" \
+    "host path map keeps using the mapped daemon-host path"
+}
+
 test_nested_capsule_uses_host_workdir() {
   local tdir="$TEST_TMPDIR/nested-workdir"
   local mock_bin="$tdir/bin"
@@ -939,6 +1362,49 @@ test_nested_capsule_uses_host_workdir() {
   assert_equals "/host/workspace/project/subdir" \
     "$(value_from_log ENV_CAPSULE_HOST_WORKDIR "$log_file")" \
     "nested capsule forwards host-visible nested workdir"
+}
+
+test_nested_private_home_uses_host_visible_home_dir() {
+  local tdir="$TEST_TMPDIR/nested-private-home"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  make_mock_bin "$mock_bin"
+
+  DOCKER_GID=1111 \
+    CAPSULE_WORKDIR="/home/workspace/project" \
+    CAPSULE_HOST_WORKDIR="/host/workspace" \
+    CAPSULE_HOME_HOST_DIR="/host/home/alice/.capsule-home" \
+    run_capsule "$mock_bin" "$log_file" --private-home true
+
+  assert_equals "/host/home/alice/.capsule-home" \
+    "$(value_from_log ENV_CAPSULE_HOME_HOST_DIR "$log_file")" \
+    "nested private-home reuses the host-visible home path"
+  assert_equals "/host/home/alice/.capsule-home:/home/user" \
+    "$(value_from_log ENV_CAPSULE_HOME_MOUNT "$log_file")" \
+    "nested private-home keeps the host-visible home mount"
+}
+
+test_nested_private_home_requires_host_visible_home_dir() {
+  local tdir="$TEST_TMPDIR/nested-private-home-missing"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local err_file="$tdir/err"
+  make_mock_bin "$mock_bin"
+
+  if DOCKER_GID=1111 \
+    CAPSULE_WORKDIR="/home/workspace/project" \
+    CAPSULE_HOST_WORKDIR="/host/workspace" \
+    HOME="/home/user" \
+    run_capsule "$mock_bin" "$log_file" --private-home true \
+    2>"$err_file"; then
+    fail "nested private-home requires a host-visible home path"
+  else
+    pass "nested private-home requires a host-visible home path"
+  fi
+
+  assert_file_contains "$err_file" \
+    "--private-home inside Capsule requires CAPSULE_HOME_HOST_DIR" \
+    "nested private-home reports a clear host-path error"
 }
 
 test_linux_gid_autodetect_from_docker_host() {
@@ -1038,6 +1504,17 @@ main() {
   test_build_flag_without_runtime_args
   test_build_custom_flag_requires_custom_compose
   test_build_and_build_custom_flags_conflict
+  test_private_home_flag_uses_user_home_bind_mount
+  test_private_home_uses_host_path_map_for_home_dir
+  test_private_home_requires_home_mapping_with_host_path_map
+  test_remote_flag_requires_target
+  test_remote_flag_requires_absolute_workdir_syntax
+  test_remote_flag_requires_authorization
+  test_remote_flag_skips_local_workdir_approval
+  test_remote_flag_builds_and_runs_over_ssh
+  test_remote_flag_accepts_host_port_syntax
+  test_remote_flag_autodetects_docker_gid_over_ssh
+  test_remote_private_home_uses_remote_user_home
   test_plain_runtime_without_args
   test_custom_compose_runtime_uses_merged_config
   test_custom_compose_builds_base_then_custom_then_runs
@@ -1055,7 +1532,12 @@ main() {
   test_explicit_uid_gid_passthrough
   test_workdir_precedence
   test_host_workdir_defaults_to_current_workdir
+  test_host_path_map_remaps_container_workdir
+  test_host_path_map_uses_first_match
+  test_host_path_map_uses_mapped_allowlist_entry
   test_nested_capsule_uses_host_workdir
+  test_nested_private_home_uses_host_visible_home_dir
+  test_nested_private_home_requires_host_visible_home_dir
   test_linux_gid_autodetect_from_docker_host
   test_bad_docker_host_falls_back_to_context_socket
   test_macos_staff_gid_override
