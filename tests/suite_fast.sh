@@ -24,7 +24,9 @@ unset CAPSULE_GID
 unset CAPSULE_HOME_HOST_DIR
 unset CAPSULE_HOST_PATH_MAP
 unset CAPSULE_HOST_WORKDIR
+unset CAPSULE_PUBLISH
 unset CAPSULE_UID
+unset CAPSULE_VOLUME
 unset CAPSULE_WORKDIR
 unset DOCKER_GID
 unset DOCKER_HOST
@@ -198,6 +200,8 @@ run_capsule() {
     CAPSULE_HOST_PATH_MAP="${CAPSULE_HOST_PATH_MAP-}" \
     CAPSULE_HOST_WORKDIR="${CAPSULE_HOST_WORKDIR-}" \
     CAPSULE_HOME_HOST_DIR="${CAPSULE_HOME_HOST_DIR-}" \
+    CAPSULE_PUBLISH="${CAPSULE_PUBLISH-}" \
+    CAPSULE_VOLUME="${CAPSULE_VOLUME-}" \
     DOCKER_HOST="${DOCKER_HOST-}" \
     "$SCRIPT_PATH" "$@"
 }
@@ -456,6 +460,62 @@ test_double_dash_keeps_runtime_flags() {
     "$expected_args" \
     "$(value_from_log ARGS "$log_file")" \
     "double dash passes build-like flags to runtime command"
+}
+
+test_publish_and_volume_flags_forward_to_runtime() {
+  local tdir="$TEST_TMPDIR/runtime-options"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local expected_args=""
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" \
+    --publish 8080:80 --publish 8443:443 \
+    --volume /host/data:/data --volume /host/cache:/cache true
+
+  expected_args="compose -f $COMPOSE_PATH"
+  expected_args="$expected_args run --rm"
+  expected_args="$expected_args --publish 8080:80"
+  expected_args="$expected_args --publish 8443:443"
+  expected_args="$expected_args --volume /host/data:/data"
+  expected_args="$expected_args --volume /host/cache:/cache"
+  expected_args="$expected_args cli true"
+
+  assert_equals \
+    "$expected_args" \
+    "$(value_from_log ARGS "$log_file")" \
+    "publish and volume flags forward to compose run"
+}
+
+test_publish_and_volume_env_forward_to_runtime() {
+  local tdir="$TEST_TMPDIR/runtime-options-env"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local publish_specs=""
+  local volume_specs=""
+  local expected_args=""
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  publish_specs="8080:80;;8443:443;"
+  volume_specs="/host/data:/data;;/host/cache:/cache;"
+
+  CAPSULE_PUBLISH="$publish_specs" CAPSULE_VOLUME="$volume_specs" \
+    DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" true
+
+  expected_args="compose -f $COMPOSE_PATH"
+  expected_args="$expected_args run --rm"
+  expected_args="$expected_args --publish 8080:80"
+  expected_args="$expected_args --publish 8443:443"
+  expected_args="$expected_args --volume /host/data:/data"
+  expected_args="$expected_args --volume /host/cache:/cache"
+  expected_args="$expected_args cli true"
+
+  assert_equals \
+    "$expected_args" \
+    "$(value_from_log ARGS "$log_file")" \
+    "publish and volume env vars forward to compose run"
 }
 
 test_build_flag_without_runtime_args() {
@@ -1503,6 +1563,8 @@ main() {
   test_build_flag_runs_build_then_runtime
   test_no_cache_flag_applies_to_build_only
   test_double_dash_keeps_runtime_flags
+  test_publish_and_volume_flags_forward_to_runtime
+  test_publish_and_volume_env_forward_to_runtime
   test_build_custom_flag_keeps_runtime_flags
   test_build_flag_without_runtime_args
   test_build_custom_flag_requires_custom_compose

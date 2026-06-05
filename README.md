@@ -522,6 +522,12 @@ Options:
     `docker compose` against `ssh://HOST[:PORT]` and
     mount `/abs/path` as `/home/workspace` on that remote host.
 
+*   `--publish HOST[:CONTAINER]`: Publish a container port on the host when
+    running the container. May be passed multiple times.
+
+*   `-v HOST:CONTAINER`, `--volume HOST:CONTAINER`: Bind-mount a host path into
+    the runtime container. May be passed multiple times.
+
 *   `--no-cache`: Pass `--no-cache` to the build commands triggered by
     `--build` or `--build-custom`.
 
@@ -564,6 +570,16 @@ Options:
 
     Default: empty. The first matching prefix wins, and the mapped host path is
     used for allowlist checks.
+
+*   `CAPSULE_PUBLISH`: Semicolon-separated list of `--publish` specs.
+
+    Default: empty. Each non-empty entry is passed before command-line
+    `--publish` options.
+
+*   `CAPSULE_VOLUME`: Semicolon-separated list of `--volume` specs.
+
+    Default: empty. Each non-empty entry is passed before command-line
+    `--volume` options.
 
 *   `CAPSULE_WORKDIR`: Workspace directory.
 
