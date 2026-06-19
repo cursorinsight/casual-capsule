@@ -250,6 +250,9 @@ test_compose_contract() {
   assert_file_contains "$COMPOSE_PATH" \
     '- github_api_token' \
     "compose mounts github token as a runtime secret"
+  assert_file_contains "$COMPOSE_PATH" \
+    '- MISE_SYSTEM_TOOLS' \
+    "compose passes MISE_SYSTEM_TOOLS from the build environment"
 }
 
 test_dockerfile_tooling_contract() {
