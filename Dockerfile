@@ -44,12 +44,12 @@ ENV MISE_INSTALL_PATH="/usr/local/bin/mise"
 RUN curl -fsSL https://mise.run | sh
 
 # Install system AI agents and tools with mise
-ARG MISE_SYSTEM_TOOLS="bat codex copilot eza fd gemini-cli \
+# Add the following before `mise install` if a tool uses the npm: backend:
+#   mise install --system node && PATH="$(mise where node)/bin:$PATH"
+ARG MISE_SYSTEM_TOOLS="antigravity-cli bat codex copilot eza fd \
         gh jq node ripgrep usage uv"
 RUN --mount=type=secret,id=github_api_token,env=GITHUB_API_TOKEN,required=true \
-    mise install --system node && \
-    PATH="$(mise where node)/bin:$PATH" \
-      mise install --system ${MISE_SYSTEM_TOOLS} && \
+    mise install --system ${MISE_SYSTEM_TOOLS} && \
     mise use --path /etc/mise/config.toml --pin ${MISE_SYSTEM_TOOLS}
 
 # Activate mise in interactive shells
