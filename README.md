@@ -623,7 +623,13 @@ When one of these tools is missing, it prints a warning and skips that linter.
 ## 🤖 Included agent tooling
 
 The image includes utilities commonly used by coding agents, installed via
-`mise` (configured in the `MISE_SYSTEM_TOOLS` Dockerfile ARG):
+`mise` (configured by the `MISE_SYSTEM_TOOLS` Dockerfile ARG). Set
+`MISE_SYSTEM_TOOLS` in the build environment to override the default tool list
+when building through Compose:
+
+```bash
+MISE_SYSTEM_TOOLS="bat fd jq ripgrep uv" docker compose build cli
+```
 
 - `bat`: Syntax-highlighted file viewing.
 - `eza`: Enhanced directory listing.

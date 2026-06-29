@@ -5,8 +5,9 @@ services:
     build:
       context: .
       args:
-        CAPSULE_UID: "${CAPSULE_UID:-1000}"
-        CAPSULE_GID: "${CAPSULE_GID:-100}"
+        - CAPSULE_UID=${CAPSULE_UID:-1000}
+        - CAPSULE_GID=${CAPSULE_GID:-100}
+        - MISE_SYSTEM_TOOLS
       secrets:
         - github_api_token
     volumes:

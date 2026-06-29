@@ -1,0 +1,10 @@
+{
+  "rules": {
+    "service-image-require-explicit-tag": [
+      1,
+      {
+        "prohibitedTags": []
+      }
+    ]
+  }
+}

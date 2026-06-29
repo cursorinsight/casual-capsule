@@ -21,9 +21,10 @@
 
 1. Format: `<type>(<scope>): <Headline>`.
 2. Capitalize headline.
-3. Keep headline at 72 chars max.
-4. Use bullet-list body.
+3. Keep headline at 72 chars max, other lines at 80 chars max.
+4. Use bullet-list body, start items with `*`.
 5. Each bullet must be full sentence: what changed and why.
+6. Use imperative style.
 
 ### Attribution
 
