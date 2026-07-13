@@ -19,24 +19,24 @@
 
 ### Commit messages
 
-1. Format: `<type>(<scope>): <Headline>`.
+1. Headline format: `<type>(<scope>): <Headline>`.
 2. Capitalize headline.
-3. Keep headline at 72 chars max, other lines at 80 chars max.
-4. Use bullet-list body, start items with `*`.
-5. Each bullet must be full sentence: what changed and why.
-6. Use imperative style.
+3. Keep headline at 68 chars max.
+4. Keep all commit message lines at 72 chars max.
+5. Use bullet-list body, start items with `*`.
+6. Each bullet must be full sentence explaining what changed and why.
+7. Use imperative style.
 
 ### Attribution
 
 Every AI-assisted commit needs:
 
 ```text
-Assisted-by: AGENT_NAME:MODEL_VERSION [TOOL1] [TOOL2]
+Assisted-by: AGENT_NAME:MODEL_VERSION
 ```
 
 - `AGENT_NAME`: AI tool or framework
 - `MODEL_VERSION`: exact model identifier
-- `[TOOL1] [TOOL2]`: optional specialised analysis tools; omit basics
 
 Example:
 
