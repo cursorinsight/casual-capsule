@@ -65,8 +65,12 @@ if [ "$CHANGED" = "1" ] || \
   chown -Rh user: "$TARGET_HOME" 2>/dev/null || true
 fi
 
-# Get `gh` path before rewriting HOME
-GH="$(mise --cd /root which gh)"
+# Resolve the gh binary for the runtime auth refresh below. Prefer the pinned
+# system binary symlinked into /usr/local/bin by the image build -- it is always
+# present, even when the workspace ignores /etc/mise/config.toml (which would
+# make `mise which` fail). Fall back to mise, and never let resolution abort.
+GH=/usr/local/bin/gh
+[ -x "$GH" ] || GH="$(mise --cd /root which gh 2>/dev/null || true)"
 
 # Set user environment before dropping privileges.
 # setpriv does not update env vars, so HOME, USER, and

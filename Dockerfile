@@ -50,6 +50,20 @@ RUN --mount=type=secret,id=github_api_token,env=GITHUB_API_TOKEN,required=true \
     mise x node -- mise install --system ${MISE_SYSTEM_TOOLS} && \
     mise use --path /etc/mise/config.toml --pin ${MISE_SYSTEM_TOOLS}
 
+# Expose system tools on PATH independently of mise's per-directory config
+# resolution. A project may set `ignored_config_paths` in its mise config to
+# ignore /etc/mise/config.toml (mise's hermetic-tooling feature); without these
+# symlinks every capsule-provided tool -- including the agent CLIs -- would
+# vanish inside such a project. `mise activate` still prepends a project's own
+# mise.toml tools, so those continue to override these baseline symlinks.
+RUN for dir in $(mise bin-paths); do \
+      for bin in "$dir"/*; do \
+        if [ -f "$bin" ] && [ -x "$bin" ]; then \
+          ln -sf "$bin" "/usr/local/bin/$(basename "$bin")"; \
+        fi; \
+      done; \
+    done
+
 # Activate mise in interactive shells
 COPY --chmod=644 docker/mise.sh /etc/profile.d/
 
