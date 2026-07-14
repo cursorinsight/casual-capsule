@@ -68,7 +68,7 @@ Assisted-by: Copilot:claude-sonnet-4.6
 ## Structure
 
 - `Dockerfile`: Debian-based image with dev tools, `mise`,
-  Docker CLI/Compose, Copilot/Codex CLIs, Python, `ruff`, and `ty`.
+  Docker CLI/Compose, Claude/Codex CLIs, Python, `ruff`, and `ty`.
 - `compose.yml`: Local `cli` service; mounts workspace, Docker socket,
   and home volume; provides build and runtime `github_api_token` secret.
 - `capsule.sh`: Launcher; handles allowlist, UID/GID, build flags,

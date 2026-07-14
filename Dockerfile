@@ -44,8 +44,8 @@ ENV MISE_INSTALL_PATH="/usr/local/bin/mise"
 RUN curl -fsSL https://mise.run | sh
 
 # Install system AI agents and tools with mise
-ARG MISE_SYSTEM_TOOLS="antigravity-cli bat codex copilot eza fd \
-        gh jq node ripgrep usage uv"
+ARG MISE_SYSTEM_TOOLS="antigravity-cli bat codex claude eza fd \
+        gh jq node ripgrep usage uv rtk"
 RUN --mount=type=secret,id=github_api_token,env=GITHUB_API_TOKEN,required=true \
     mise x node -- mise install --system ${MISE_SYSTEM_TOOLS} && \
     mise use --path /etc/mise/config.toml --pin ${MISE_SYSTEM_TOOLS}
