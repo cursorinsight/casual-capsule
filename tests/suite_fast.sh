@@ -518,6 +518,22 @@ test_publish_and_volume_env_forward_to_runtime() {
     "publish and volume env vars forward to compose run"
 }
 
+# shellcheck disable=SC2016
+test_empty_optional_arrays_use_nounset_safe_expansion() {
+  assert_file_contains "$SCRIPT_PATH" \
+    '${RUNTIME_OPTS[@]+${RUNTIME_OPTS[@]}}' \
+    "runtime options expansion is safe under bash 4.3 nounset"
+  assert_file_contains "$SCRIPT_PATH" \
+    '${RUNTIME_ARGS[@]+${RUNTIME_ARGS[@]}}' \
+    "runtime args expansion is safe under bash 4.3 nounset"
+  assert_file_contains "$SCRIPT_PATH" \
+    '${ssh_args[@]+${ssh_args[@]}}' \
+    "remote ssh args expansion is safe under bash 4.3 nounset"
+  assert_file_contains "$SCRIPT_PATH" \
+    '${build_no_cache_args[@]+"${build_no_cache_args[@]}"}' \
+    "build no-cache args expansion is safe under bash 4.3 nounset"
+}
+
 test_build_flag_without_runtime_args() {
   local tdir="$TEST_TMPDIR/build-no-args"
   local mock_bin="$tdir/bin"
@@ -1565,6 +1581,7 @@ main() {
   test_double_dash_keeps_runtime_flags
   test_publish_and_volume_flags_forward_to_runtime
   test_publish_and_volume_env_forward_to_runtime
+  test_empty_optional_arrays_use_nounset_safe_expansion
   test_build_custom_flag_keeps_runtime_flags
   test_build_flag_without_runtime_args
   test_build_custom_flag_requires_custom_compose

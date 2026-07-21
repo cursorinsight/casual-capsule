@@ -525,7 +525,8 @@ run_remote_ssh() {
   fi
 
   # shellcheck disable=SC2029
-  ssh "${ssh_args[@]}" "$REMOTE_SSH_DEST" "$remote_cmd" 2>/dev/null || true
+  ssh "${ssh_args[@]+${ssh_args[@]}}" \
+    "$REMOTE_SSH_DEST" "$remote_cmd" 2>/dev/null || true
 }
 
 # Detect the Docker socket GID on the remote host.
@@ -786,12 +787,9 @@ run_requested_builds() {
 
 # Exec the runtime container, preserving any user-supplied command.
 run_capsule_runtime() {
-  if [[ "${#RUNTIME_ARGS[@]}" -gt 0 ]]; then
-    exec "${COMPOSE_CMD[@]}" run --rm "${RUNTIME_OPTS[@]}" \
-      cli "${RUNTIME_ARGS[@]}"
-  fi
-
-  exec "${COMPOSE_CMD[@]}" run --rm "${RUNTIME_OPTS[@]}" cli
+  exec "${COMPOSE_CMD[@]}" run --rm \
+    "${RUNTIME_OPTS[@]+${RUNTIME_OPTS[@]}}" \
+    cli "${RUNTIME_ARGS[@]+${RUNTIME_ARGS[@]}}"
 }
 
 main() {
