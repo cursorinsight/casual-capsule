@@ -13,6 +13,7 @@ set -euo pipefail
 
 ROOT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
 SCRIPT_PATH="$ROOT_DIR/capsule.sh"
+CHECK_ALL_PATH="$ROOT_DIR/tests/check_all.sh"
 COMPOSE_PATH="$ROOT_DIR/compose.yml"
 DOCKERFILE_PATH="$ROOT_DIR/Dockerfile"
 ENTRYPOINT_PATH="$ROOT_DIR/docker/entrypoint.sh"
@@ -532,6 +533,34 @@ test_empty_optional_arrays_use_nounset_safe_expansion() {
   assert_file_contains "$SCRIPT_PATH" \
     '${build_no_cache_args[@]+"${build_no_cache_args[@]}"}' \
     "build no-cache args expansion is safe under bash 4.3 nounset"
+}
+
+test_check_all_docker_linters_use_capsule_host_workdir() {
+  local tdir="$TEST_TMPDIR/check-all-host-workdir"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  mkdir -p "$mock_bin"
+  ln -s "$(command -v bash)" "$mock_bin/bash"
+  ln -s "$(command -v dirname)" "$mock_bin/dirname"
+
+  cat >"$mock_bin/docker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'DOCKER_ARGS=%s\n' "$*" >>"${MOCK_LOG:?MOCK_LOG is required}"
+EOF
+  chmod +x "$mock_bin/docker"
+
+  PATH="$mock_bin" MOCK_LOG="$log_file" \
+    CAPSULE_WORKDIR="$ROOT_DIR" \
+    CAPSULE_HOST_WORKDIR=/host/workspace \
+    "$CHECK_ALL_PATH"
+
+  assert_file_contains "$log_file" \
+    "-v /host/workspace:/mnt" \
+    "check_all docker linters mount host-visible capsule workdir"
+  assert_file_not_contains "$log_file" \
+    "-v $ROOT_DIR:/mnt" \
+    "check_all docker linters avoid container-only workdir mounts"
 }
 
 test_build_flag_without_runtime_args() {
@@ -1582,6 +1611,7 @@ main() {
   test_publish_and_volume_flags_forward_to_runtime
   test_publish_and_volume_env_forward_to_runtime
   test_empty_optional_arrays_use_nounset_safe_expansion
+  test_check_all_docker_linters_use_capsule_host_workdir
   test_build_custom_flag_keeps_runtime_flags
   test_build_flag_without_runtime_args
   test_build_custom_flag_requires_custom_compose
