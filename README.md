@@ -8,7 +8,7 @@
 [![Tooling](https://img.shields.io/badge/tools-mise-orange)](https://mise.en.dev)
 [![Tooling](https://img.shields.io/badge/tools-uv-orange)](https://docs.astral.sh/uv/)
 
-Containerized CLI workspace for AI coding agents (Copilot CLI, Codex CLI) with
+Containerized CLI workspace for AI coding agents (Claude Code, Codex CLI) with
 common developer tools.
 
 ## Table of contents
@@ -19,7 +19,7 @@ common developer tools.
   - [Phase 2: Start Capsule](#phase-2-start-capsule)
   - [Phase 3: Verify the container](#phase-3-verify-the-container)
   - [Phase 4: Verify GitHub auth](#phase-4-verify-github-auth)
-  - [Phase 5: Verify Copilot (optional)](#phase-5-verify-copilot-optional)
+  - [Phase 5: Verify Claude (optional)](#phase-5-verify-claude-optional)
   - [Phase 6: Verify Codex (optional)](#phase-6-verify-codex-optional)
 - [Usage](#-usage)
 - [Capsule command examples](#%EF%B8%8F-capsule-command-examples)
@@ -44,14 +44,14 @@ common developer tools.
 ## 📋 Prerequisites
 
 - Docker Engine 24+ and Docker Compose v2
-- Access to GitHub Copilot or Codex.
+- Access to Claude or Codex.
 
 ## 🚀 Initial setup
 
 There is no true quick start for the first run. Capsule persists GitHub auth
 state in the home volume, so it is worth doing setup in this order: prepare the
 token first, then start Capsule, then verify the workspace and `gh` auth before
-opening Copilot or Codex. These checkpoints make later troubleshooting much
+opening Claude or Codex. These checkpoints make later troubleshooting much
 easier.
 
 | Phase | What it proves |
@@ -60,11 +60,11 @@ easier.
 | Start Capsule | The image builds and the container starts successfully. |
 | Verify the container | The workspace mount and persistent home volume work. |
 | Verify GitHub auth | `gh` is already logged in before agent startup. |
-| Verify your agent | Copilot or Codex can read the workspace. |
+| Verify your agent | Claude or Codex can read the workspace. |
 
 ### Phase 1: Prepare credentials
 
-1.  Decide if you want to use GitHub Copilot, Codex, or both.
+1.  Decide if you want to use Claude, Codex, or both.
 
 2.  Generate a GitHub access token.
 
@@ -83,29 +83,17 @@ easier.
         *   Fill in the other fields as you see fit. It's ok to leave them on
             the default values.
 
-    6.  If you want to use Copilot, add the necessary permissions.
+    6.  Click on the "Generate token" button below the form.
 
-        1.  Click on the "Add permission" button.
+    7.  Click on the "Generate token" button in the popup window.
 
-        2.  Choose the following permissions:
+    8.  Copy the token and save it somewhere safe.
 
-            *   Copilot Chat
+    9.  You may close the GitHub website.
 
-            *   Copilot Editor Context
-
-            *   Copilot Requests
-
-            *   Models
-
-            *   Plan
-
-    7.  Click on the "Generate token" button below the form.
-
-    8.  Click on the "Generate token" button in the popup window.
-
-    9.  Copy the token and save it somewhere safe.
-
-    10. You may close the GitHub website.
+    The token only needs to cover `gh` and repository access. Capsule uses
+    it for `gh` auth and as a build secret when `mise` downloads tools from
+    GitHub. Claude and Codex authenticate separately, in Phases 5 and 6.
 
 3.  Create a project directory that we can use as a test.
 
@@ -216,7 +204,7 @@ easier.
       - Token: [GITHUB_API_TOKEN]
     ```
 
-    **Checkpoint:** `gh` is ready before you open Copilot or Codex.
+    **Checkpoint:** `gh` is ready before you open Claude or Codex.
 
     If `gh auth status` says that you are not logged in, add your GitHub token
     to `github_api_token.txt` (inside the container) and log in manually:
@@ -227,24 +215,32 @@ easier.
 
     You can do the same when your token expires in the future.
 
-### Phase 5: Verify Copilot (optional)
+### Phase 5: Verify Claude (optional)
 
-1.  Start Copilot:
-
-    ```
-    $ copilot
-    ```
-
-2.  Copilot asks if you trust `/home/workspace`.
-
-    Choose the following response: "Yes, and remember this folder for future
-    sessions."
-
-3.  Test the connection and that Copilot can read `AGENTS.md`:
+1.  Start Claude Code:
 
     ```
-    ❯ What is my favorite color?
-    ● Your favorite color is purple! 💜
+    $ claude
+    ```
+
+2.  Claude asks if you trust the files in `/home/workspace`.
+
+    Choose the response that proceeds in this folder.
+
+3.  Log in when Claude prompts you to.
+
+    Claude prints a URL to open in your browser. Open it on the host,
+    complete the login, and paste the resulting code back into the
+    container.
+
+    Credentials are written to `/home/user`, so the persistent home volume
+    keeps you logged in across Capsule sessions.
+
+4.  Test the connection and that Claude can read `AGENTS.md`:
+
+    ```
+    > What is my favorite color?
+    ● Your favorite color is purple.
     ```
 
 ### Phase 6: Verify Codex (optional)
@@ -295,11 +291,11 @@ easier.
 ## 💡 Usage
 
 Once you set up Capsule, you can start it in any project directory. You can even
-start Copilot or Codex directly:
+start Claude or Codex directly:
 
 ```
 $ cd /home/myuser/myproject
-$ capsule copilot
+$ capsule claude
 $ capsule codex
 ```
 
@@ -308,7 +304,7 @@ $ capsule codex
 Pass a command instead of the default shell:
 
 ```bash
-capsule copilot
+capsule claude
 capsule bash -lc "node -v && python --version"
 capsule docker ps
 ```
@@ -317,7 +313,7 @@ Build the image before starting:
 
 ```bash
 capsule --build
-capsule -b copilot
+capsule -b claude
 ```
 
 Build only the custom image before starting:
@@ -629,7 +625,8 @@ Options:
     Default: derived from `CAPSULE_WORKDIR`. `--remote` overrides it with the
     remote workspace path.
 
-*   `GITHUB_API_TOKEN`: Passed as a build secret for `gh` auth and Copilot CLI.
+*   `GITHUB_API_TOKEN`: Passed as a build secret for `gh` auth and for `mise`
+    tool downloads from GitHub.
 
 ## 🧪 Run checks and tests
 
@@ -678,6 +675,8 @@ when building through Compose:
 MISE_SYSTEM_TOOLS="bat fd jq ripgrep uv" docker compose build cli
 ```
 
+- `claude`: Claude Code agent CLI.
+- `codex`: Codex agent CLI.
 - `bat`: Syntax-highlighted file viewing.
 - `eza`: Enhanced directory listing.
 - `fd`: Fast file discovery.
