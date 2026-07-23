@@ -29,6 +29,8 @@ common developer tools.
   - [Private home bind mount](#private-home-bind-mount)
   - [Custom Capsule images](#custom-capsule-images)
   - [Updating your GitHub token](#updating-your-github-token)
+  - [Port publishing](#port-publishing)
+  - [Runtime volume mounts](#runtime-volume-mounts)
   - [Bind mounts in containers started in a Capsule](#bind-mounts-in-containers-started-in-a-capsule)
   - [Remote Docker host](#remote-docker-host)
 - [Configuration reference](#-configuration-reference)
@@ -381,9 +383,9 @@ capsule -p -r buildbox:/srv/casual-capsule
 
 This keeps Capsule state per user instead of per Docker Compose project.
 When `--remote` is active, Capsule resolves `~/.capsule-home` on the remote
-host. When `CAPSULE_HOST_PATH_MAP` is active inside another container, Capsule
-resolves `~/.capsule-home` through that map; if the map does not cover `$HOME`,
-set `CAPSULE_HOME_HOST_DIR` explicitly.
+host. When `CAPSULE_HOST_PATH_MAP` is active inside a non-Capsule container,
+Capsule resolves `~/.capsule-home` through that map; if the map does not cover
+`$HOME`, set `CAPSULE_HOME_HOST_DIR` explicitly.
 
 ### Custom Capsule images
 
@@ -458,23 +460,52 @@ your token:
 The updated credentials are written to the persistent home volume and
 survive subsequent restarts.  No rebuild is required.
 
+### Port publishing
+
+Use `--publish` to expose a port from the Capsule container on the Docker
+daemon host.
+
+```bash
+capsule --publish 8080:8080
+capsule --publish 8080:8080 --publish 127.0.0.1:9229:9229
+```
+
+Use `CAPSULE_PUBLISH` for repeatable port mappings in environment-based
+launchers. Separate mappings with semicolons.
+
+```bash
+CAPSULE_PUBLISH="8080:8080;127.0.0.1:9229:9229" capsule
+```
+
+### Runtime volume mounts
+
+Use `--volume` or `-v` to add extra bind mounts to the Capsule container.
+
+```bash
+capsule --volume /host/cache:/cache
+capsule -v /host/data:/data -v /host/cache:/cache
+```
+
+Use `CAPSULE_VOLUME` for repeatable mounts in environment-based launchers.
+Separate mount specs with semicolons.
+
+```bash
+CAPSULE_VOLUME="/host/data:/data;/host/cache:/cache" capsule
+```
+
 ### Bind mounts in containers started in a Capsule
 
-When you start a Docker container inside a Capsule Docker container, sometimes
-you want to mount directories to that container that are in the workspace
-(`/home/workspace`). For example `tests/suite_e2e.sh` does this.
+When `capsule.sh` runs inside an existing container, the path it sees may not
+be a path the Docker daemon can mount. Capsule translates the current container
+path back to the daemon-host path before asking Docker to create the
+`/home/workspace` bind mount.
 
-So when you do this, `capsule.sh` translates directory paths as seen on the
-container (for example, `/home/workspace/mydir`) back to the original host path
-(for example, `/home/myuser/myproject/mydir`) before asking the Docker server
-(which runs on the host machine) to create the workspace bind mount.
-
-For this mechanism to work, you can either pass the workspace root explicitly as
-`CAPSULE_HOST_WORKDIR`, or define `CAPSULE_HOST_PATH_MAP` when the inner
+Inside a Capsule, do not reset `CAPSULE_HOST_WORKDIR`. The outer Capsule sets
+it to the daemon-host workspace root, and nested launches reuse it
+automatically. Use `CAPSULE_HOST_PATH_MAP` only when the current non-Capsule
 container sees the same files under a different absolute path.
 
 ```bash
-CAPSULE_HOST_WORKDIR=$(pwd) capsule
 CAPSULE_HOST_PATH_MAP=/workspace=/home/myuser/myproject capsule
 CAPSULE_HOST_PATH_MAP=/workspace=/src/project:/tmp/cache=/var/cache capsule
 ```
@@ -522,6 +553,12 @@ Options:
     `docker compose` against `ssh://HOST[:PORT]` and
     mount `/abs/path` as `/home/workspace` on that remote host.
 
+*   `--publish HOST[:CONTAINER]`: Publish a container port on the host when
+    running the container. May be passed multiple times.
+
+*   `-v HOST:CONTAINER`, `--volume HOST:CONTAINER`: Bind-mount a host path into
+    the runtime container. May be passed multiple times.
+
 *   `--no-cache`: Pass `--no-cache` to the build commands triggered by
     `--build` or `--build-custom`.
 
@@ -565,6 +602,16 @@ Options:
     Default: empty. The first matching prefix wins, and the mapped host path is
     used for allowlist checks.
 
+*   `CAPSULE_PUBLISH`: Semicolon-separated list of `--publish` specs.
+
+    Default: empty. Each non-empty entry is passed before command-line
+    `--publish` options.
+
+*   `CAPSULE_VOLUME`: Semicolon-separated list of `--volume` specs.
+
+    Default: empty. Each non-empty entry is passed before command-line
+    `--volume` options.
+
 *   `CAPSULE_WORKDIR`: Workspace directory.
 
     Default: current working directory.
@@ -601,8 +648,8 @@ $ tests/test_all.sh
 Run checks and tests inside a Capsule:
 
 ```bash
-$ CAPSULE_HOST_WORKDIR=$(pwd) capsule tests/check_all.sh
-$ CAPSULE_HOST_WORKDIR=$(pwd) capsule tests/test_all.sh
+$ capsule tests/check_all.sh
+$ capsule tests/test_all.sh
 ```
 
 `check_all.sh` runs `dclint`, `hadolint`, and `shellcheck` on discovered files.

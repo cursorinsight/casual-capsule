@@ -10,6 +10,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
+readonly CAPSULE_CONTAINER_WORKDIR="/home/workspace"
 cd "$ROOT_DIR"
 
 shopt -s nullglob
@@ -29,12 +30,38 @@ shellcheck_files=(
   tests/fixtures/*/*.sh
 )
 
+resolve_docker_mount_root() {
+  local root_dir="$1"
+  local container_workdir="${CAPSULE_WORKDIR:-$CAPSULE_CONTAINER_WORKDIR}"
+  local host_workdir="${CAPSULE_HOST_WORKDIR:-}"
+
+  if [[ -z "$host_workdir" ]]; then
+    printf '%s\n' "$root_dir"
+    return
+  fi
+
+  if [[ "$root_dir" == "$container_workdir" ]]; then
+    printf '%s\n' "$host_workdir"
+    return
+  fi
+
+  if [[ "$root_dir" == "$container_workdir"/* ]]; then
+    printf '%s%s\n' \
+      "$host_workdir" \
+      "${root_dir#"$container_workdir"}"
+    return
+  fi
+
+  printf '%s\n' "$root_dir"
+}
+
 run_docker_linter() {
   local image="$1"
   local entrypoint="$2"  # leave "" to use the image default
   local category="$3"
   shift 3
   local files=("$@")
+  local docker_mount_root=""
 
   local ep_args=()
   if [[ -n "$entrypoint" ]]; then
@@ -49,8 +76,9 @@ run_docker_linter() {
 
   printf '%s (docker): checking %d %s files\n' \
     "$image" "${#files[@]}" "$category"
+  docker_mount_root="$(resolve_docker_mount_root "$ROOT_DIR")"
   if docker run --rm \
-       -v "$ROOT_DIR:/mnt" \
+       -v "$docker_mount_root:/mnt" \
        ${ep_args[@]+"${ep_args[@]}"} \
        "$image" \
        "${abs_files[@]}"; then

@@ -13,6 +13,7 @@ set -euo pipefail
 
 ROOT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
 SCRIPT_PATH="$ROOT_DIR/capsule.sh"
+CHECK_ALL_PATH="$ROOT_DIR/tests/check_all.sh"
 COMPOSE_PATH="$ROOT_DIR/compose.yml"
 DOCKERFILE_PATH="$ROOT_DIR/Dockerfile"
 ENTRYPOINT_PATH="$ROOT_DIR/docker/entrypoint.sh"
@@ -24,7 +25,9 @@ unset CAPSULE_GID
 unset CAPSULE_HOME_HOST_DIR
 unset CAPSULE_HOST_PATH_MAP
 unset CAPSULE_HOST_WORKDIR
+unset CAPSULE_PUBLISH
 unset CAPSULE_UID
+unset CAPSULE_VOLUME
 unset CAPSULE_WORKDIR
 unset DOCKER_GID
 unset DOCKER_HOST
@@ -198,6 +201,8 @@ run_capsule() {
     CAPSULE_HOST_PATH_MAP="${CAPSULE_HOST_PATH_MAP-}" \
     CAPSULE_HOST_WORKDIR="${CAPSULE_HOST_WORKDIR-}" \
     CAPSULE_HOME_HOST_DIR="${CAPSULE_HOME_HOST_DIR-}" \
+    CAPSULE_PUBLISH="${CAPSULE_PUBLISH-}" \
+    CAPSULE_VOLUME="${CAPSULE_VOLUME-}" \
     DOCKER_HOST="${DOCKER_HOST-}" \
     "$SCRIPT_PATH" "$@"
 }
@@ -456,6 +461,106 @@ test_double_dash_keeps_runtime_flags() {
     "$expected_args" \
     "$(value_from_log ARGS "$log_file")" \
     "double dash passes build-like flags to runtime command"
+}
+
+test_publish_and_volume_flags_forward_to_runtime() {
+  local tdir="$TEST_TMPDIR/runtime-options"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local expected_args=""
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" \
+    --publish 8080:80 --publish 8443:443 \
+    --volume /host/data:/data --volume /host/cache:/cache true
+
+  expected_args="compose -f $COMPOSE_PATH"
+  expected_args="$expected_args run --rm"
+  expected_args="$expected_args --publish 8080:80"
+  expected_args="$expected_args --publish 8443:443"
+  expected_args="$expected_args --volume /host/data:/data"
+  expected_args="$expected_args --volume /host/cache:/cache"
+  expected_args="$expected_args cli true"
+
+  assert_equals \
+    "$expected_args" \
+    "$(value_from_log ARGS "$log_file")" \
+    "publish and volume flags forward to compose run"
+}
+
+test_publish_and_volume_env_forward_to_runtime() {
+  local tdir="$TEST_TMPDIR/runtime-options-env"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local publish_specs=""
+  local volume_specs=""
+  local expected_args=""
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  publish_specs="8080:80;;8443:443;"
+  volume_specs="/host/data:/data;;/host/cache:/cache;"
+
+  CAPSULE_PUBLISH="$publish_specs" CAPSULE_VOLUME="$volume_specs" \
+    DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" true
+
+  expected_args="compose -f $COMPOSE_PATH"
+  expected_args="$expected_args run --rm"
+  expected_args="$expected_args --publish 8080:80"
+  expected_args="$expected_args --publish 8443:443"
+  expected_args="$expected_args --volume /host/data:/data"
+  expected_args="$expected_args --volume /host/cache:/cache"
+  expected_args="$expected_args cli true"
+
+  assert_equals \
+    "$expected_args" \
+    "$(value_from_log ARGS "$log_file")" \
+    "publish and volume env vars forward to compose run"
+}
+
+# shellcheck disable=SC2016
+test_empty_optional_arrays_use_nounset_safe_expansion() {
+  assert_file_contains "$SCRIPT_PATH" \
+    '${RUNTIME_OPTS[@]+${RUNTIME_OPTS[@]}}' \
+    "runtime options expansion is safe under bash 4.3 nounset"
+  assert_file_contains "$SCRIPT_PATH" \
+    '${RUNTIME_ARGS[@]+${RUNTIME_ARGS[@]}}' \
+    "runtime args expansion is safe under bash 4.3 nounset"
+  assert_file_contains "$SCRIPT_PATH" \
+    '${ssh_args[@]+${ssh_args[@]}}' \
+    "remote ssh args expansion is safe under bash 4.3 nounset"
+  assert_file_contains "$SCRIPT_PATH" \
+    '${build_no_cache_args[@]+"${build_no_cache_args[@]}"}' \
+    "build no-cache args expansion is safe under bash 4.3 nounset"
+}
+
+test_check_all_docker_linters_use_capsule_host_workdir() {
+  local tdir="$TEST_TMPDIR/check-all-host-workdir"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  mkdir -p "$mock_bin"
+  ln -s "$(command -v bash)" "$mock_bin/bash"
+  ln -s "$(command -v dirname)" "$mock_bin/dirname"
+
+  cat >"$mock_bin/docker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'DOCKER_ARGS=%s\n' "$*" >>"${MOCK_LOG:?MOCK_LOG is required}"
+EOF
+  chmod +x "$mock_bin/docker"
+
+  PATH="$mock_bin" MOCK_LOG="$log_file" \
+    CAPSULE_WORKDIR="$ROOT_DIR" \
+    CAPSULE_HOST_WORKDIR=/host/workspace \
+    "$CHECK_ALL_PATH"
+
+  assert_file_contains "$log_file" \
+    "-v /host/workspace:/mnt" \
+    "check_all docker linters mount host-visible capsule workdir"
+  assert_file_not_contains "$log_file" \
+    "-v $ROOT_DIR:/mnt" \
+    "check_all docker linters avoid container-only workdir mounts"
 }
 
 test_build_flag_without_runtime_args() {
@@ -1503,6 +1608,10 @@ main() {
   test_build_flag_runs_build_then_runtime
   test_no_cache_flag_applies_to_build_only
   test_double_dash_keeps_runtime_flags
+  test_publish_and_volume_flags_forward_to_runtime
+  test_publish_and_volume_env_forward_to_runtime
+  test_empty_optional_arrays_use_nounset_safe_expansion
+  test_check_all_docker_linters_use_capsule_host_workdir
   test_build_custom_flag_keeps_runtime_flags
   test_build_flag_without_runtime_args
   test_build_custom_flag_requires_custom_compose

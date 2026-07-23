@@ -19,6 +19,7 @@ BUILD_MODE_FLAG=""
 NO_CACHE=0
 PRIVATE_HOME=0
 RUNTIME_ARGS=()
+RUNTIME_OPTS=()
 CAPSULE_CUSTOM_COMPOSE="${CAPSULE_CUSTOM_COMPOSE:-}"
 CAPSULE_CUSTOM_DIR=""
 REMOTE_HOST=""
@@ -214,6 +215,7 @@ initialize_runtime_state() {
   NO_CACHE=0
   PRIVATE_HOME=0
   RUNTIME_ARGS=()
+  RUNTIME_OPTS=()
   CAPSULE_CUSTOM_COMPOSE="${CAPSULE_CUSTOM_COMPOSE:-}"
   CAPSULE_CUSTOM_DIR=""
   REMOTE_HOST=""
@@ -232,7 +234,9 @@ Usage: capsule.sh [options] [--] [command...]
 Options:
   -b, --build  Run "docker compose build cli" before runtime.
   -p, --private-home  Bind-mount a per-user home directory.
+      --publish HOST[:CONTAINER]  Publish port on host machine. Repeatable.
   -r, --remote HOST[:PORT]:/abs/path  Run on a remote Docker host over SSH.
+  -v, --volume HOST:CONTAINER  Bind-mount a volume. Repeatable.
       --build-custom  Run the custom compose build before runtime.
       --no-cache  Pass --no-cache to build commands run by this script.
   -h, --help   Show this help message.
@@ -245,6 +249,8 @@ Environment:
   DOCKER_HOST      Docker daemon endpoint. --remote sets ssh://HOST[:PORT].
   CAPSULE_HOME_HOST_DIR  Host path used by --private-home.
   CAPSULE_HOST_PATH_MAP  Colon-separated container=host path prefixes.
+  CAPSULE_PUBLISH  Semicolon-separated --publish specs.
+  CAPSULE_VOLUME   Semicolon-separated --volume specs.
   CAPSULE_WORKDIR  Workspace directory (default: cwd).
   CAPSULE_CUSTOM_COMPOSE  Optional override compose file.
 EOF
@@ -331,6 +337,36 @@ parse_remote_target() {
   fi
 }
 
+# Append non-empty semicolon-separated specs from one runtime option env var.
+append_runtime_option_specs() {
+  local option="$1"
+  local specs="$2"
+  local spec=""
+
+  while [[ "$specs" == *";"* ]]; do
+    spec="${specs%%;*}"
+    if [[ -n "$spec" ]]; then
+      RUNTIME_OPTS+=("$option" "$spec")
+    fi
+    specs="${specs#*;}"
+  done
+
+  if [[ -n "$specs" ]]; then
+    RUNTIME_OPTS+=("$option" "$specs")
+  fi
+}
+
+# Apply runtime options supplied by environment variables.
+append_runtime_option_env() {
+  if [[ -n "${CAPSULE_PUBLISH:-}" ]]; then
+    append_runtime_option_specs "--publish" "$CAPSULE_PUBLISH"
+  fi
+
+  if [[ -n "${CAPSULE_VOLUME:-}" ]]; then
+    append_runtime_option_specs "--volume" "$CAPSULE_VOLUME"
+  fi
+}
+
 # Parse CLI flags and collect runtime arguments.
 parse_args() {
   while [[ $# -gt 0 ]]; do
@@ -351,6 +387,13 @@ parse_args() {
         PRIVATE_HOME=1
         shift
         ;;
+      --publish)
+        if [[ $# -lt 2 ]] || [[ "${2:-}" == -* ]]; then
+          die '--publish requires HOST[:CONTAINER] port parameter'
+        fi
+        RUNTIME_OPTS+=(--publish "$2")
+        shift 2
+        ;;
       -r|--remote)
         if [[ $# -lt 2 ]] || [[ "${2:-}" == -* ]]; then
           die '--remote requires HOST[:PORT]:/absolute/workdir'
@@ -361,6 +404,13 @@ parse_args() {
       --remote=*)
         parse_remote_target "${1#--remote=}"
         shift
+        ;;
+      -v|--volume)
+        if [[ $# -lt 2 ]] || [[ "${2:-}" == -* ]]; then
+          die '--volume requires HOST:CONTAINER mount volume spec'
+        fi
+        RUNTIME_OPTS+=(--volume "$2")
+        shift 2
         ;;
       -h|--help)
         usage
@@ -475,7 +525,8 @@ run_remote_ssh() {
   fi
 
   # shellcheck disable=SC2029
-  ssh "${ssh_args[@]}" "$REMOTE_SSH_DEST" "$remote_cmd" 2>/dev/null || true
+  ssh "${ssh_args[@]+${ssh_args[@]}}" \
+    "$REMOTE_SSH_DEST" "$remote_cmd" 2>/dev/null || true
 }
 
 # Detect the Docker socket GID on the remote host.
@@ -736,11 +787,9 @@ run_requested_builds() {
 
 # Exec the runtime container, preserving any user-supplied command.
 run_capsule_runtime() {
-  if [[ "${#RUNTIME_ARGS[@]}" -gt 0 ]]; then
-    exec "${COMPOSE_CMD[@]}" run --rm cli "${RUNTIME_ARGS[@]}"
-  fi
-
-  exec "${COMPOSE_CMD[@]}" run --rm cli
+  exec "${COMPOSE_CMD[@]}" run --rm \
+    "${RUNTIME_OPTS[@]+${RUNTIME_OPTS[@]}}" \
+    cli "${RUNTIME_ARGS[@]+${RUNTIME_ARGS[@]}}"
 }
 
 main() {
@@ -749,6 +798,7 @@ main() {
   initialize_workdir_state
   initialize_user_ids
   initialize_runtime_state
+  append_runtime_option_env
   parse_args "$@"
   configure_custom_compose
   validate_build_mode
