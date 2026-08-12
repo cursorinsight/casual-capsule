@@ -23,6 +23,9 @@ services:
       - CAPSULE_GID=${CAPSULE_GID:-}
       - CAPSULE_HOME_HOST_DIR=${CAPSULE_HOME_HOST_DIR:-}
       - CAPSULE_HOST_WORKDIR=${CAPSULE_HOST_WORKDIR:-}
+      # support proper ANSI coloring in apps:
+      - TERM=${TERM}
+      - TERM_PROGRAM=${TERM_PROGRAM:-}
     working_dir: /home/workspace
     restart: "no"
     hostname: capsule

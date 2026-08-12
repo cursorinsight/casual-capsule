@@ -2,7 +2,8 @@
 # Disabled hadolint checkers:
 #  - DL3002: Last user should not be root.
 #  - DL3008: Pin versions in `apt-get install`.
-# hadolint global ignore=DL3002,DL3008
+#  - DL3066: Non-numeric user-id may not be resolvable by host system.
+# hadolint global ignore=DL3002,DL3008,DL3066
 
 ARG DEBIAN_VERSION=trixie
 
