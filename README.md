@@ -101,6 +101,7 @@ easier.
     $ mkdir /home/myuser/myproject
     $ cd /home/myuser/myproject
     $ echo "My favorite color is purple." > AGENTS.md
+    $ echo "My favorite color is purple." > CLAUDE.md
     ```
 
 4.  Create an alias:
@@ -159,6 +160,8 @@ easier.
 
     ```
     user@capsule:/home/workspace$ cat AGENTS.md
+    My favorite color is purple.
+    user@capsule:/home/workspace$ cat CLAUDE.md
     My favorite color is purple.
     ```
 
@@ -236,7 +239,7 @@ easier.
     Credentials are written to `/home/user`, so the persistent home volume
     keeps you logged in across Capsule sessions.
 
-4.  Test the connection and that Claude can read `AGENTS.md`:
+4.  Test the connection and that Claude can read `CLAUDE.md`:
 
     ```
     > What is my favorite color?
