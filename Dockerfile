@@ -48,7 +48,7 @@ RUN curl -fsSL https://mise.run | sh
 ARG MISE_SYSTEM_TOOLS="antigravity-cli bat codex claude eza fd \
         gh jq node ripgrep usage uv rtk"
 RUN --mount=type=secret,id=github_api_token,env=GITHUB_API_TOKEN,required=true \
-    mise x node -- mise install --system ${MISE_SYSTEM_TOOLS} && \
+    mise install --system ${MISE_SYSTEM_TOOLS} && \
     mise use --path /etc/mise/config.toml --pin ${MISE_SYSTEM_TOOLS}
 
 # Expose system tools on PATH independently of mise's per-directory config
