@@ -273,10 +273,9 @@ test_dockerfile_tooling_contract() {
   assert_file_contains "$DOCKERFILE_PATH" \
     "mise use --path /etc/mise/config.toml --pin \${MISE_SYSTEM_TOOLS}" \
     "image pins system tools in the global mise config"
-  # shellcheck disable=SC2016
   assert_file_contains "$DOCKERFILE_PATH" \
-    'ln -sf "$bin" "/usr/local/bin/$(basename "$bin")"' \
-    "image symlinks system tools onto PATH for config-independent access"
+    '/usr/local/share/mise/shims:' \
+    "image adds shims path to system PATH for config-independent access"
   assert_file_not_contains "$DOCKERFILE_PATH" \
     "mise use --global \${MISE_SYSTEM_TOOLS}" \
     "image no longer activates system tools in the user home"
