@@ -731,7 +731,7 @@ initialize_capsule_config() {
 # Prompt once before writing a new allowlist entry.
 ensure_allowlist_entry() {
   local approval_key="$1"
-  local prompt="$2 (y/N)? "
+  local prompt="$2 ([y]es/[N]no/[o]nly once)? "
   local key=""
 
   if grep -Fxqs "$approval_key" "$CAPSULE_CONFIG"; then
@@ -742,10 +742,15 @@ ensure_allowlist_entry() {
     die "$approval_key not in allowlist; pre-approve in $CAPSULE_CONFIG"
   fi
 
-  read -rs -n 1 -p "$prompt" key
+  read -rs -n 1 -p "$prompt" key || true
   if [[ $key == 'y' || $key == 'Y' ]]; then
     printf 'y\n' >&2
     printf '%s\n' "$approval_key" >>"$CAPSULE_CONFIG"
+    return
+  fi
+
+  if [[ $key == 'o' || $key == 'O' ]]; then
+    printf 'o\n' >&2
     return
   fi
 
