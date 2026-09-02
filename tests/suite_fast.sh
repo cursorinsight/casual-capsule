@@ -30,6 +30,7 @@ unset CAPSULE_HOME_HOST_DIR
 unset CAPSULE_HOST_PATH_MAP
 unset CAPSULE_HOST_WORKDIR
 unset CAPSULE_PUBLISH
+unset CAPSULE_RUNTIME
 unset CAPSULE_UID
 unset CAPSULE_VOLUME
 unset CAPSULE_WORKDIR
@@ -1144,6 +1145,81 @@ test_remote_flag_requires_authorization() {
   assert_file_contains "$err_file" \
     "ssh://builder/srv/work not in allowlist" \
     "remote target reports a clear allowlist error"
+}
+
+test_run_confirmation_supports_only_once() {
+  local tdir="$TEST_TMPDIR/run-confirmation"
+  local mock_bin="$tdir/bin"
+  local yes_log="$tdir/yes-log"
+  local yes_cfg="$tdir/yes-config"
+  local once_log="$tdir/once-log"
+  local once_cfg="$tdir/once-config"
+  local no_log="$tdir/no-log"
+  local no_cfg="$tdir/no-config"
+  local pty_log="$tdir/pty-log"
+  local script_status=0
+  local run_cmd=""
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  if ! command -v script >/dev/null 2>&1; then
+    skip "script not installed; skipping run confirmation TTY test"
+    return
+  fi
+  if ! script -q -e -c true /dev/null >/dev/null 2>&1; then
+    skip "script lacks -e support; skipping run confirmation TTY test"
+    return
+  fi
+  script -q -e -c 'exit 7' /dev/null >/dev/null 2>&1 || script_status=$?
+  if [[ "$script_status" -ne 7 ]]; then
+    skip "script does not preserve exits; skipping run confirmation TTY test"
+    return
+  fi
+
+  run_cmd="$(printf 'PATH=%q MOCK_LOG=%q CAPSULE_CONFIG=%q ' \
+    "$mock_bin:$PATH" "$yes_log" "$yes_cfg")"
+  run_cmd="${run_cmd}$(printf \
+    'DOCKER_GID=1111 CAPSULE_RUNTIME=docker %q true' "$SCRIPT_PATH")"
+  if printf 'y' | script -q -e -c "$run_cmd" /dev/null \
+    >"$pty_log" 2>&1; then
+    pass "run confirmation accepts yes"
+  else
+    fail "run confirmation accepts yes"
+  fi
+  assert_file_contains "$yes_cfg" "$ROOT_DIR" \
+    "run confirmation yes saves approval"
+  assert_file_contains "$yes_log" "run --rm cli true" \
+    "run confirmation yes allows run"
+
+  run_cmd="$(printf 'PATH=%q MOCK_LOG=%q CAPSULE_CONFIG=%q ' \
+    "$mock_bin:$PATH" "$once_log" "$once_cfg")"
+  run_cmd="${run_cmd}$(printf \
+    'DOCKER_GID=1111 CAPSULE_RUNTIME=docker %q true' "$SCRIPT_PATH")"
+  if printf 'o' | script -q -e -c "$run_cmd" /dev/null \
+    >"$pty_log" 2>&1; then
+    pass "run confirmation accepts only once"
+  else
+    fail "run confirmation accepts only once"
+  fi
+  if [[ -e "$once_cfg" ]]; then
+    assert_file_not_contains "$once_cfg" "$ROOT_DIR" \
+      "run confirmation only once skips approval file"
+  else
+    pass "run confirmation only once skips approval file"
+  fi
+  assert_file_contains "$once_log" "run --rm cli true" \
+    "run confirmation only once allows run"
+
+  run_cmd="$(printf 'PATH=%q MOCK_LOG=%q CAPSULE_CONFIG=%q ' \
+    "$mock_bin:$PATH" "$no_log" "$no_cfg")"
+  run_cmd="${run_cmd}$(printf \
+    'DOCKER_GID=1111 CAPSULE_RUNTIME=docker %q true' "$SCRIPT_PATH")"
+  if printf '\n' | script -q -e -c "$run_cmd" /dev/null \
+    >"$pty_log" 2>&1; then
+    fail "run confirmation default rejects run"
+  else
+    pass "run confirmation default rejects run"
+  fi
 }
 
 test_remote_flag_skips_local_workdir_approval() {
@@ -2658,6 +2734,7 @@ main() {
   test_list_queries_remote_docker_without_workdir_or_approval
   test_list_rejects_launch_commands
   test_remote_flag_requires_authorization
+  test_run_confirmation_supports_only_once
   test_remote_flag_skips_local_workdir_approval
   test_remote_flag_builds_and_runs_over_ssh
   test_remote_flag_accepts_host_port_syntax
