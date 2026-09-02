@@ -140,10 +140,10 @@ easier.
     $ capsule --build
     ```
 
-2.  When Capsule asks the following, type "y".
+2.  When Capsule asks the following, type `y`.
 
     ```
-    Allow capsule to run in /home/myuser/myproject (y/N)?
+    Allow capsule to run in /home/myuser/myproject ([y]es/[N]no/[o]nly once)?
     ```
 
 3.  You should see that Docker builds the Capsule image, creates a container and
@@ -151,7 +151,7 @@ easier.
 
     ```
     $ capsule --build
-    Allow capsule to run in /home/myuser/myproject (y/N)? y
+    Allow capsule to run in /home/myuser/myproject ([y]es/[N]no/[o]nly once)? y
     [...]
     [+] build 1/1
      ✔ Image hcs-capsule:local Built
@@ -623,7 +623,8 @@ CAPSULE_UID=2000 CAPSULE_GID=2000 capsule --build
 
 On the first run in a new directory, `capsule.sh` prompts for explicit approval
 and records the approved path in `~/.config/capsule` (overridable via
-`CAPSULE_CONFIG`).
+`CAPSULE_CONFIG`) when you answer `y`. Answer `o` to allow only the current run
+without updating the approval file. The default answer is `N`.
 
 When `--remote` is active, Capsule checks only the remote target in that same
 allowlist. Remote targets approved via `--remote` are stored as
