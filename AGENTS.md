@@ -65,6 +65,23 @@ Assisted-by: Copilot:claude-sonnet-4.6
    `gh`, `tree`.
 10. When Dockerfile tool packages change, update README docs and tests.
 
+## Graphify
+
+1. `docker/graphify-version` is the pinned release and the only thing that
+   changes the installed version. Bump it with
+   `./capsule.sh --update-graphify`, review the diff, then `--build`.
+2. Never resolve the Graphify version at build time. The vendor skill is
+   agent-facing text; an unreviewed bump changes agent behavior silently.
+3. Graphify indexes files by extension only, so **extensionless files are
+   absent from the graph** -- including `Dockerfile`, `LICENSE`, `NOTICE`,
+   and every dotfile such as `.dockerignore`. Read those directly and do
+   not trust graph answers about the image build.
+4. Rebuild the graph after any rebase or history rewrite. The graph records
+   `built_at_commit`, which a rewrite turns into an unreachable hash.
+   `graphify-doctor.sh` warns at startup; fix with `graphify . --update`.
+5. Skills live in the persistent home volume, the binary in the image. When
+   they disagree, trust the binary and rerun `sync-skills.sh`.
+
 ## Structure
 
 - `Dockerfile`: Debian-based image with dev tools, `mise`,
@@ -75,6 +92,10 @@ Assisted-by: Copilot:claude-sonnet-4.6
   and Compose invocations.
 - `docker/entrypoint.sh`: Root entrypoint; syncs UID/GID, Docker group,
   and home ownership, then execs as `user`.
+- `docker/sync-skills.sh`: Refreshes bundled Graphify skills in agent homes.
+- `docker/graphify-doctor.sh`: Reports Graphify version and graph drift.
+- `docker/graphify-version`: Committed Graphify pin used by image builds.
+- `skills/maintain-graphify/`: Lifecycle guidance for graph-aware work.
 - `docker/setup-docker.sh`: Installs Docker APT repo, CLI, Compose,
   and buildx.
 - `docker/mise.sh`: Activates `mise` and Bash completions for

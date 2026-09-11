@@ -1,0 +1,4 @@
+# Extra excludes for Graphify, using gitignore syntax.
+_build/
+tests/fixtures/
+.claude/

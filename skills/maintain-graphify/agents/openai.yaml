@@ -1,0 +1,4 @@
+interface:
+  display_name: "Maintain Graphify"
+  short_description: "Keep repository knowledge graphs current"
+  default_prompt: "Use $maintain-graphify to update this project's graph."

@@ -8,6 +8,7 @@ services:
         - CAPSULE_UID=${CAPSULE_UID:-1000}
         - CAPSULE_GID=${CAPSULE_GID:-100}
         - MISE_SYSTEM_TOOLS
+        - GRAPHIFY_VERSION
       secrets:
         - github_api_token
     volumes:
@@ -23,6 +24,7 @@ services:
       - CAPSULE_GID=${CAPSULE_GID:-}
       - CAPSULE_HOME_HOST_DIR=${CAPSULE_HOME_HOST_DIR:-}
       - CAPSULE_HOST_WORKDIR=${CAPSULE_HOST_WORKDIR:-}
+      - CAPSULE_SKIP_SKILL_SYNC=${CAPSULE_SKIP_SKILL_SYNC:-}
       # support proper ANSI coloring in apps:
       - TERM=${TERM}
       - TERM_PROGRAM=${TERM_PROGRAM:-}

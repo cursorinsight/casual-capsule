@@ -29,6 +29,11 @@ common developer tools.
   - [Private home bind mount](#private-home-bind-mount)
   - [Custom Capsule images](#custom-capsule-images)
   - [Updating your GitHub token](#updating-your-github-token)
+  - [Graphify knowledge graphs](#graphify-knowledge-graphs)
+    - [Running without an API key](#running-without-an-api-key)
+    - [Pinned version](#pinned-version)
+    - [What the graph does not contain](#what-the-graph-does-not-contain)
+    - [Keeping the graph honest](#keeping-the-graph-honest)
   - [Port publishing](#port-publishing)
   - [Runtime volume mounts](#runtime-volume-mounts)
   - [Bind mounts in containers started in a Capsule](#bind-mounts-in-containers-started-in-a-capsule)
@@ -459,6 +464,120 @@ your token:
 The updated credentials are written to the persistent home volume and
 survive subsequent restarts.  No rebuild is required.
 
+### Graphify knowledge graphs
+
+The image includes
+[Graphify](https://github.com/Graphify-Labs/graphify), a local
+knowledge-graph CLI and agent skill. On container start, Capsule refreshes
+Graphify's vendor skill for Claude, Codex, and Antigravity in the persistent
+home volume. Set `CAPSULE_SKIP_SKILL_SYNC=1` to skip this step.
+
+Capsule also provides a `maintain-graphify` lifecycle skill. It uses an
+existing graph before broad code inspection, refreshes structural data after
+changes, and keeps forced rebuilds or hook installation explicit. Its content
+is included in the same version stamp, so rebuilding the image refreshes both
+skills without rewriting project-level agent instructions.
+
+Use `$graphify .` in Codex or `/graphify .` in Claude and Antigravity. The CLI
+is also available directly. For a local, code-only graph that needs no LLM
+credentials, run:
+
+```bash
+capsule bash -lc "graphify extract . --code-only"
+```
+
+Generated data is stored under `graphify-out/`, which Capsule git-ignores.
+Project-specific exclusions belong in `.graphifyignore` using gitignore
+syntax.
+
+#### Running without an API key
+
+Structural work needs no model at all: `extract --code-only`, `update`, and
+every query command are deterministic. Only the semantic pass and community
+labelling call an LLM.
+
+When one is needed, Graphify can route through the `claude` CLI the image
+already ships instead of a provisioned key:
+
+```bash
+capsule bash -lc "graphify cluster-only . --backend claude-cli"
+```
+
+This authenticates with the Claude subscription stored in the persistent home
+volume, so the work is billed to that plan rather than to pay-as-you-go API
+credit. No `ANTHROPIC_API_KEY` is involved.
+
+Graphify never selects this backend on its own -- it is left out of backend
+auto-detection deliberately, so pass `--backend claude-cli` on every
+invocation. It is also missing from `graphify extract --help`, which lists
+only the API backends.
+
+The backend defaults to Opus, which is oversized for structured extraction.
+Pick a cheaper model with `GRAPHIFY_CLAUDE_CLI_MODEL`:
+
+```bash
+capsule bash -lc "GRAPHIFY_CLAUDE_CLI_MODEL=haiku \
+  graphify cluster-only . --backend claude-cli"
+```
+
+Each chunk becomes its own `claude -p` subprocess, so this is markedly slower
+than an API backend on a large corpus and consumes plan quota. It suits
+incremental refreshes better than a large first build.
+
+There is no equivalent backend for the Codex CLI. Custom providers
+(`~/.graphify/providers.json`) only accept `http`/`https` endpoints, so
+reaching `codex exec` would require a local OpenAI-compatible shim.
+
+#### Pinned version
+
+`docker/graphify-version` holds the Graphify release the image installs. It
+is committed, so the version only ever moves in a reviewable diff:
+
+```bash
+capsule --update-graphify        # rewrite the pin with the newest release
+git diff docker/graphify-version # review
+capsule --build                  # install it
+```
+
+Builds never resolve the version themselves. Graphify's vendor skill is
+agent-facing text that tells agents when and how to use the tool, so an
+unreviewed upgrade changes agent behavior with no diff to inspect. Because
+the pin is a file the image copies, Docker reuses the Graphify layer until
+the pin changes, and offline builds stay reproducible.
+
+Set `GRAPHIFY_VERSION` to override the pin for a single throwaway build:
+
+```bash
+GRAPHIFY_VERSION=0.9.55 capsule --build
+```
+
+After the version changes, the next container start refreshes the installed
+agent skills automatically.
+
+#### What the graph does not contain
+
+Graphify collects files by extension, so **extensionless files never enter
+the graph**. In this repository that means `Dockerfile`, `LICENSE`, `NOTICE`,
+and every dotfile such as `.dockerignore` and `.graphifyignore`. There is no
+option to add them. Read those files directly; do not rely on graph answers
+about the image build.
+
+#### Keeping the graph honest
+
+A graph records the commit it was built from. Rebases and other history
+rewrites turn that into an unreachable hash while queries keep answering from
+the stale graph, so rebuild it after rewriting history:
+
+```bash
+capsule bash -lc "graphify . --update"
+```
+
+Capsule checks this for you. `docker/graphify-doctor.sh` runs at container
+start and warns when Graphify is missing from the image, when an installed
+skill was built for a different release, or when the graph's commit is no
+longer reachable from `HEAD`. It only reports, never blocks; set
+`CAPSULE_SKIP_GRAPHIFY_DOCTOR=1` to silence it.
+
 ### Port publishing
 
 Use `--publish` to expose a port from the Capsule container on the Docker
@@ -564,6 +683,11 @@ Options:
 *   `--no-cache`: Pass `--no-cache` to the build commands triggered by
     `--build` or `--build-custom`.
 
+*   `--update-graphify`: Rewrite `docker/graphify-version` with the newest
+    release from PyPI, then exit without starting a container. Review and
+    commit the diff, then rebuild with `--build`. Cannot be combined with
+    `--build` or `--build-custom`, and takes no command.
+
 *   `-h`, `--help`: Show usage message.
 
 *   `--`: Stop launcher option parsing; pass remaining arguments to
@@ -623,6 +747,13 @@ Options:
 
     Default: empty.
 
+*   `CAPSULE_SKIP_SKILL_SYNC`: Skip Graphify's agent-skill refresh.
+
+*   `CAPSULE_SKIP_GRAPHIFY_DOCTOR`: Skip the Graphify drift check at
+    container start.
+
+    Default: empty. Set to `1` to skip the refresh.
+
 *   `CAPSULE_CONFIG`: Path to the file that contains the approved directories.
 
     Default: `~/.config/capsule`.
@@ -634,6 +765,14 @@ Options:
 
 *   `GITHUB_API_TOKEN`: Passed as a build secret for `gh` auth and for `mise`
     tool downloads from GitHub.
+
+*   `GRAPHIFY_VERSION`: Override the committed Graphify pin for one build.
+
+*   `GRAPHIFY_CLAUDE_CLI_MODEL`: Model used by `--backend claude-cli`
+    (for example `haiku`). Defaults to Opus.
+
+    Default: latest stable release for `capsule --build`; otherwise the
+    version pinned in the Dockerfile.
 
 ## 🧪 Run checks and tests
 
@@ -704,13 +843,16 @@ Python tooling (installed via `uv`; binaries available on `PATH` via
   `3.14`).
 - `ruff`: Fast Python linter and formatter.
 - `ty`: Python type checker.
+- `graphify`: Local knowledge-graph CLI and agent skill (version pinned in
+  `docker/graphify-version`).
 
 Verify inside capsule:
 
 ```bash
 capsule bash -lc "rg --version && fd --version && jq --version && \
   bat --version && eza --version && shellcheck --version && \
-  gh --version && tree --version && python --version"
+  gh --version && tree --version && graphify --version && \
+  python --version"
 ```
 
 ## 🔐 Security Note

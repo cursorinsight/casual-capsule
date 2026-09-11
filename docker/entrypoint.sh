@@ -95,6 +95,27 @@ if [ -s "$_GH_SECRET" ]; then
         || printf 'capsule: warning: gh auth login failed\n' >&2
 fi
 
+# Install Graphify's skills as the runtime user into the persistent home.
+if [ -x /usr/local/bin/sync-skills.sh ]; then
+  setpriv \
+    --reuid="$(id -u user)" \
+    --regid="$(id -g user)" \
+    --init-groups \
+    -- /usr/local/bin/sync-skills.sh \
+    || printf 'capsule: warning: Graphify skill sync failed\n' >&2
+fi
+
+# Report leftover Graphify drift the sync cannot repair by itself: a missing
+# binary, a skill built for another release, or a graph whose commit is gone.
+if [ -x /usr/local/bin/graphify-doctor.sh ]; then
+  setpriv \
+    --reuid="$(id -u user)" \
+    --regid="$(id -g user)" \
+    --init-groups \
+    -- /usr/local/bin/graphify-doctor.sh /home/workspace \
+    || true
+fi
+
 exec setpriv \
   --reuid="$(id -u user)" \
   --regid="$(id -g user)" \
