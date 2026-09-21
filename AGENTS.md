@@ -69,7 +69,8 @@ Assisted-by: Copilot:claude-sonnet-4.6
 
 - `Dockerfile`: Debian-based image with dev tools, `mise`,
   Docker CLI/Compose, `podman`, Claude/Codex CLIs, Python, `ruff`, and
-  `ty`. `CAPSULE_WITH_DOCKERD=1` adds a real Docker Engine.
+  `ty`; wraps Codex for unrestricted use. `CAPSULE_WITH_DOCKERD=1` adds a
+  real Docker Engine.
 - `compose.yml`: Local privileged `cli` service; mounts workspace, Docker
   socket, and home volume; permits nested Podman tests; provides the build
   and runtime `github_api_token` secret.
@@ -84,7 +85,6 @@ Assisted-by: Copilot:claude-sonnet-4.6
 - `docker/capsule-docker.sh`: The Capsule's `docker` router and the
   `capsule-docker` engine switch; starts the podman API socket or a
   rootless `dockerd` on first use.
-- `docker/codex.sh`: Starts Codex with approvals and sandboxing disabled.
 - `docker/containers.conf`, `docker/registries.conf`,
   `docker/storage.conf`: Configuration for the Capsule's inner engine,
   including the per-workspace storage path.
