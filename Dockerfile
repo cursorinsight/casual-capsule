@@ -6,6 +6,9 @@
 # hadolint global ignore=DL3002,DL3008,DL3066
 
 ARG DEBIAN_VERSION=trixie
+ARG MISE_VERSION=latest
+
+FROM ghcr.io/jdx/mise:${MISE_VERSION} AS mise
 
 #------------------------------------------------------------------------------
 # Runtime
@@ -85,14 +88,13 @@ RUN sub_start=3000; \
 
 WORKDIR /home/workspace
 
-# Install mise
-ARG MISE_VERSION=""
-ENV MISE_INSTALL_PATH="/usr/local/bin/mise"
-RUN curl -fsSL https://mise.run | sh
+# Install mise from image
+COPY --from=mise /usr/local/bin/mise /usr/local/bin/mise
 
 # Install system AI agents and tools with mise
+ARG PYTHON_VERSION=3.14
 ARG MISE_SYSTEM_TOOLS="antigravity-cli bat codex claude eza fd \
-        gh jq node ripgrep usage uv rtk"
+        gh jq node python@${PYTHON_VERSION} ripgrep rtk ruff ty usage uv"
 # Read the token from the secret file rather than an injected variable. The
 # file form is what podman's build understands, and BuildKit serves it the
 # same way, so one Dockerfile builds on either backend and the token still
@@ -103,16 +105,14 @@ RUN --mount=type=secret,id=github_api_token,required=true \
     mise install --system ${MISE_SYSTEM_TOOLS} && \
     mise use --path /etc/mise/config.toml --pin ${MISE_SYSTEM_TOOLS}
 
-# Keep Codex unrestricted inside the Capsule regardless of whether mise's
-# direct install path or its system symlink resolves the command.
-COPY --chmod=755 docker/codex.sh /usr/local/libexec/capsule/codex
-RUN codex_path="$(mise which codex 2>/dev/null)"; \
-    if [ -n "$codex_path" ] && [ -x "$codex_path" ]; then \
-      mv "$codex_path" "${codex_path}-real"; \
-      install -m 755 /usr/local/libexec/capsule/codex "$codex_path"; \
-      ln -sf "$codex_path" /usr/local/bin/codex; \
-      ln -sf "${codex_path}-real" /usr/local/bin/codex-real; \
-    fi
+# Keep Codex unrestricted through mise's native command wrapper.
+RUN printf '\n[wrappers.codex]\ncommand = "%s"\n%s\n' \
+      "$(mise which codex)" \
+      'args = ["--dangerously-bypass-approvals-and-sandbox"]' \
+      >>/etc/mise/config.toml
+
+# Add mise shims to path
+ENV PATH="/usr/local/share/mise/shims:$PATH"
 
 # Activate mise in interactive shells
 COPY --chmod=644 docker/mise.sh /etc/profile.d/
@@ -125,19 +125,6 @@ COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/
 COPY --chmod=755 docker/capsule-docker.sh /usr/local/bin/capsule-docker
 RUN ln -s /usr/local/bin/capsule-docker /usr/local/bin/docker
 
-# Switch user
-USER user
-
-# Install python and uv tools
-ARG PYTHON_VERSION=3.14
-RUN mise x -- uv python install --default ${PYTHON_VERSION} && \
-    mise x -- uv tool install ruff && \
-    mise x -- uv tool install ty
-
-# Add mise shims to path
-ENV PATH="/usr/local/share/mise/shims:$PATH"
-
 # Entrypoint runs as root, adjusts UID/GID, drops privileges
-USER root
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["/bin/bash", "-il"]

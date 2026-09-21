@@ -17,9 +17,9 @@ CHECK_ALL_PATH="$ROOT_DIR/tests/check_all.sh"
 DOCTOR_PATH="$ROOT_DIR/capsule-doctor.sh"
 COMPOSE_PATH="$ROOT_DIR/compose.yml"
 DOCKERFILE_PATH="$ROOT_DIR/Dockerfile"
+README_PATH="$ROOT_DIR/README.md"
 ENTRYPOINT_PATH="$ROOT_DIR/docker/entrypoint.sh"
 ROUTER_PATH="$ROOT_DIR/docker/capsule-docker.sh"
-CODEX_WRAPPER_PATH="$ROOT_DIR/docker/codex.sh"
 STORAGE_CONF_PATH="$ROOT_DIR/docker/storage.conf"
 EXAMPLE_PROJECT_DIR="$ROOT_DIR/tests/fixtures/example-project"
 
@@ -294,6 +294,12 @@ test_compose_contract() {
   assert_file_contains "$COMPOSE_PATH" \
     '- MISE_SYSTEM_TOOLS' \
     "compose passes MISE_SYSTEM_TOOLS from the build environment"
+  assert_file_contains "$README_PATH" \
+    'This replaces the entire default list.' \
+    "docs say MISE_SYSTEM_TOOLS replaces the defaults"
+  assert_file_contains "$README_PATH" \
+    'python@3.14 ripgrep ruff ty uv' \
+    "custom tool example retains Python tooling"
 }
 
 test_dockerfile_tooling_contract() {
@@ -301,8 +307,16 @@ test_dockerfile_tooling_contract() {
     "image installs shellcheck for shell linting"
   assert_file_contains "$DOCKERFILE_PATH" 'tree' \
     "image installs tree for directory visualization"
-  assert_file_contains "$DOCKERFILE_PATH" 'https://mise.run' \
-    "image installs mise"
+  assert_file_contains "$DOCKERFILE_PATH" \
+    'ARG MISE_VERSION=latest' \
+    "image provides a default mise version"
+  # shellcheck disable=SC2016
+  assert_file_contains "$DOCKERFILE_PATH" \
+    'FROM ghcr.io/jdx/mise:${MISE_VERSION} AS mise' \
+    "image selects the mise source through a versioned stage"
+  assert_file_contains "$DOCKERFILE_PATH" \
+    'COPY --from=mise /usr/local/bin/mise /usr/local/bin/mise' \
+    "image copies mise from the named source stage"
   assert_file_contains "$DOCKERFILE_PATH" \
     "mise install --system \${MISE_SYSTEM_TOOLS} &&" \
     "image installs system tools with mise"
@@ -315,41 +329,19 @@ test_dockerfile_tooling_contract() {
   assert_file_not_contains "$DOCKERFILE_PATH" \
     "mise use --global \${MISE_SYSTEM_TOOLS}" \
     "image no longer activates system tools in the user home"
+  assert_file_contains "$DOCKERFILE_PATH" \
+    '[wrappers.codex]' \
+    "image defines a mise wrapper for Codex"
   # shellcheck disable=SC2016
   assert_file_contains "$DOCKERFILE_PATH" \
-    'mv "$codex_path" "${codex_path}-real"' \
-    "image preserves the mise-managed Codex binary behind its wrapper"
-  # shellcheck disable=SC2016
+    '"$(mise which codex)"' \
+    "Codex wrapper resolves the installed binary through mise"
   assert_file_contains "$DOCKERFILE_PATH" \
-    'codex_path="$(mise which codex 2>/dev/null)"' \
-    "image resolves Codex through mise before installing its wrapper"
-  assert_file_contains "$DOCKERFILE_PATH" \
-    'docker/codex.sh /usr/local/libexec/capsule/codex' \
-    "image installs the Capsule Codex wrapper"
-}
-
-# Verify that the Codex wrapper forces unrestricted mode and preserves args.
-test_codex_wrapper_forces_unrestricted_mode() {
-  local tdir="$TEST_TMPDIR/codex-wrapper"
-  local log_file="$tdir/log"
-  local expected=""
-  mkdir -p "$tdir"
-  cp "$CODEX_WRAPPER_PATH" "$tdir/codex"
-  cat >"$tdir/codex-real" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n' "$@" >"${MOCK_LOG:?MOCK_LOG is required}"
-EOF
-  chmod +x "$tdir/codex" "$tdir/codex-real"
-
-  MOCK_LOG="$log_file" "$tdir/codex" --model gpt-test 'hello world'
-
-  expected='--dangerously-bypass-approvals-and-sandbox
---model
-gpt-test
-hello world'
-  assert_equals "$expected" "$(cat "$log_file")" \
-    "Codex wrapper prepends unrestricted mode and forwards every argument"
+    'args = ["--dangerously-bypass-approvals-and-sandbox"]' \
+    "Codex wrapper disables approvals and sandboxing"
+  assert_file_not_contains "$DOCKERFILE_PATH" \
+    'RUN cat <<EOF' \
+    "Codex wrapper avoids Buildah-incompatible Dockerfile heredocs"
 }
 
 test_dockerfile_uid_gid_contract() {
@@ -393,9 +385,11 @@ test_entrypoint_contract() {
   assert_file_contains "$ENTRYPOINT_PATH" \
     'SUBORDINATE_ID_COUNT=65536' \
     "entrypoint grants nested podman a complete subordinate ID range"
+  # shellcheck disable=SC2016
   assert_file_contains "$ENTRYPOINT_PATH" \
     '"$SUBORDINATE_UID_START" "$SUBORDINATE_ID_COUNT" >/etc/subuid' \
     "entrypoint installs the runtime subordinate UID range"
+  # shellcheck disable=SC2016
   assert_file_contains "$ENTRYPOINT_PATH" \
     '"$SUBORDINATE_GID_START" "$SUBORDINATE_ID_COUNT" >/etc/subgid' \
     "entrypoint installs the runtime subordinate GID range"
@@ -2434,10 +2428,16 @@ test_router_stop_releases_the_engines() {
 
 test_entrypoint_non_root_path_execs_the_command() {
   local dir="$TEST_TMPDIR/entrypoint-nonroot"
-  mkdir -p "$dir"
+  mkdir -p "$dir/bin"
+  cat >"$dir/bin/getent" <<'EOF'
+#!/usr/bin/env bash
+exit 2
+EOF
+  chmod +x "$dir/bin/getent"
 
   # shellcheck disable=SC2016
   if env -u HOME -u USER -u LOGNAME \
+    PATH="$dir/bin:$PATH" \
     "$ENTRYPOINT_PATH" bash -c \
     'printf "ENTRYPOINT_EXEC_OK %s %s %s\n" "$HOME" "$USER" "$LOGNAME"' \
     >"$dir/out" 2>"$dir/err"; then
@@ -2512,7 +2512,6 @@ main() {
 
   test_compose_contract
   test_dockerfile_tooling_contract
-  test_codex_wrapper_forces_unrestricted_mode
   test_dockerfile_uid_gid_contract
   test_entrypoint_contract
   test_build_flag_runs_build_then_runtime

@@ -987,10 +987,14 @@ When one of these tools is missing, it prints a warning and skips that linter.
 The image includes utilities commonly used by coding agents, installed via
 `mise` (configured by the `MISE_SYSTEM_TOOLS` Dockerfile ARG). Set
 `MISE_SYSTEM_TOOLS` in the build environment to override the default tool list
-when building through Compose:
+when building through Compose. This replaces the entire default list. Existing
+overrides must add `python@<version>`, `ruff`, and `ty` to retain the Python
+tooling now included in that list. Include `codex`; its wrapper is configured
+during the build.
 
 ```bash
-MISE_SYSTEM_TOOLS="bat fd jq ripgrep uv" docker compose build cli
+MISE_SYSTEM_TOOLS="bat codex fd jq python@3.14 ripgrep ruff ty uv" \
+  docker compose build cli
 ```
 
 - `claude`: Claude Code agent CLI.
@@ -1017,8 +1021,9 @@ Installed via `apt`:
 - `shellcheck`: Shell script linting.
 - `tree`: Directory structure visualization.
 
-Python tooling (installed via `uv`; binaries available on `PATH` via
-`~/.local/bin`):
+Python tooling (installed as system `mise` tools and available on `PATH` via
+`/usr/local/share/mise/shims`; include these tools in any
+`MISE_SYSTEM_TOOLS` override):
 
 - `python`: Python runtime (version set by `PYTHON_VERSION` ARG, default
   `3.14`).
