@@ -110,6 +110,21 @@ if [[ "${1:-}" == "context" ]] && [[ "${2:-}" == "inspect" ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == "ps" ]]; then
+  printf 'DOCKER_PS_ARGS=%s\n' "$*" \
+    >>"${MOCK_LOG:?MOCK_LOG is required}"
+  printf 'DOCKER_PS_HOST=%s\n' "${DOCKER_HOST:-}" >>"$MOCK_LOG"
+  printf '%s\n' "${MOCK_DOCKER_PS:-}"
+  exit "${MOCK_DOCKER_PS_EXIT:-0}"
+fi
+
+if [[ "${1:-}" == "inspect" ]]; then
+  printf 'DOCKER_INSPECT_ARGS=%s\n' "$*" \
+    >>"${MOCK_LOG:?MOCK_LOG is required}"
+  printf '%s\n' "${MOCK_DOCKER_INSPECT:-}"
+  exit 0
+fi
+
 if [[ "${1:-}" == "compose" ]]; then
   {
     printf 'ENV_DOCKER_GID=%s\n' "${DOCKER_GID:-}"
@@ -179,6 +194,7 @@ fi
 case "${1:-}" in
   -u) printf '%s\n' "${MOCK_ID_UID:-1000}" ;;
   -g) printf '%s\n' "${MOCK_ID_GID:-100}" ;;
+  -nu) printf '%s\n' "${MOCK_ID_USER:-user}" ;;
   *) /usr/bin/id "$@" ;;
 esac
 EOF
@@ -194,6 +210,20 @@ if [[ "${1:-}" == "info" ]]; then
     exit 1
   fi
   printf '%s\n' "${MOCK_PODMAN_INFO:-true 2}"
+  exit 0
+fi
+
+if [[ "${1:-}" == "ps" ]]; then
+  printf 'PODMAN_PS_ARGS=%s\n' "$*" \
+    >>"${MOCK_LOG:?MOCK_LOG is required}"
+  printf '%s\n' "${MOCK_PODMAN_PS:-}"
+  exit "${MOCK_PODMAN_PS_EXIT:-0}"
+fi
+
+if [[ "${1:-}" == "inspect" ]]; then
+  printf 'PODMAN_INSPECT_ARGS=%s\n' "$*" \
+    >>"${MOCK_LOG:?MOCK_LOG is required}"
+  printf '%s\n' "${MOCK_PODMAN_INSPECT:-}"
   exit 0
 fi
 
@@ -1003,6 +1033,94 @@ test_remote_flag_requires_absolute_workdir_syntax() {
   assert_file_contains "$err_file" \
     "--remote requires HOST[:PORT]:/absolute/workdir" \
     "remote flag reports a clear syntax error for non-absolute targets"
+}
+
+test_list_finds_docker_and_podman_capsules() {
+  local tdir="$TEST_TMPDIR/list-local"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local out_file="$tdir/out"
+  local header_name_column=""
+  local row_name_column=""
+  local docker_inspect=$'CAPSULE_HOST_WORKDIR=/srv/docker\n'
+  local docker_ps=$'docker-id\tdocker-capsule\t2 hours\timage:d\t'
+  local podman_ps=$'podman-id\tpodman-capsule\t5 minutes\timage:p\t'
+  docker_inspect+='CAPSULE_UID=1000'
+  docker_ps+=$'Up 2 hours\t'
+  podman_ps+=$'Up 5 minutes\t8080/tcp'
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  CAPSULE_RUNTIME=auto \
+    MOCK_DOCKER_PS="$docker_ps" \
+    MOCK_DOCKER_INSPECT="$docker_inspect" \
+    MOCK_PODMAN_PS="$podman_ps" \
+    MOCK_PODMAN_INSPECT=$'CAPSULE_HOST_WORKDIR=/srv/podman\nCAPSULE_UID=1000' \
+    MOCK_ID_USER=bob \
+    run_capsule "$mock_bin" "$log_file" --list >"$out_file"
+
+  assert_file_contains "$out_file" 'HOST_DIR' \
+    "list prints a stable header"
+  assert_file_contains "$out_file" 'bob' \
+    "list resolves the creator from CAPSULE_UID"
+  assert_file_contains "$out_file" '/srv/docker' \
+    "list reports the Docker host workdir"
+  assert_file_contains "$out_file" '/srv/podman' \
+    "list reports the podman host workdir"
+  header_name_column="$(awk 'NR == 1 { print index($0, "NAME") }' \
+    "$out_file")"
+  row_name_column="$(awk 'NR == 2 { print index($0, "docker-capsule") }' \
+    "$out_file")"
+  assert_equals "$header_name_column" "$row_name_column" \
+    "list aligns table columns"
+  assert_file_not_contains "$log_file" 'ARGS=compose' \
+    "list does not start a Capsule"
+}
+
+test_list_queries_remote_docker_without_workdir_or_approval() {
+  local tdir="$TEST_TMPDIR/list-remote"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local out_file="$tdir/out"
+  local docker_inspect=$'CAPSULE_HOST_WORKDIR=/remote/project\n'
+  docker_inspect+='CAPSULE_UID=2000'
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  CAPSULE_RUNTIME=auto \
+    MOCK_DOCKER_PS=$'remote-id\tremote-capsule\t3 days\timage:r\tUp 3 days\t' \
+    MOCK_DOCKER_INSPECT="$docker_inspect" \
+    MOCK_SSH_OUTPUT=remote-user \
+    run_capsule "$mock_bin" "$log_file" \
+    --list --remote builder:2222 >"$out_file"
+
+  assert_file_contains "$out_file" 'remote-user' \
+    "remote list resolves a Capsule creator through SSH"
+  assert_file_contains "$out_file" '/remote/project' \
+    "remote list reports the remote host workdir"
+  assert_file_contains "$log_file" \
+    'DOCKER_PS_HOST=ssh://builder:2222' \
+    "remote list queries Docker through its SSH endpoint"
+  assert_file_not_contains "$log_file" 'PODMAN_PS_ARGS=' \
+    "remote list does not query local podman"
+}
+
+test_list_rejects_launch_commands() {
+  local tdir="$TEST_TMPDIR/list-command"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local err_file="$tdir/err"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  if run_capsule "$mock_bin" "$log_file" --list true 2>"$err_file"; then
+    fail "list rejects launch commands"
+  else
+    pass "list rejects launch commands"
+  fi
+  assert_file_contains "$err_file" \
+    '--list cannot be combined with launch options or commands' \
+    "list reports its launch-command conflict"
 }
 
 test_remote_flag_requires_authorization() {
@@ -1897,6 +2015,9 @@ test_podman_backend_runs_container_with_keep_id() {
     '--env CAPSULE_RUNTIME=podman' \
     "podman backend tells the entrypoint which backend it is under"
   assert_podman_args_contain "$CASE_LOG" \
+    '--env CAPSULE_UID=1000' \
+    "podman backend records the host UID for Capsule queries"
+  assert_podman_args_contain "$CASE_LOG" \
     'casual-capsule:local claude' \
     "podman backend passes the command after the image"
 }
@@ -2533,6 +2654,9 @@ main() {
   test_private_home_requires_home_mapping_with_host_path_map
   test_remote_flag_requires_target
   test_remote_flag_requires_absolute_workdir_syntax
+  test_list_finds_docker_and_podman_capsules
+  test_list_queries_remote_docker_without_workdir_or_approval
+  test_list_rejects_launch_commands
   test_remote_flag_requires_authorization
   test_remote_flag_skips_local_workdir_approval
   test_remote_flag_builds_and_runs_over_ssh

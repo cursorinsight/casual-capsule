@@ -36,10 +36,13 @@ IN_NESTED_CAPSULE=0
 RUNTIME_SELECTION=""
 RUNTIME_BACKEND=""
 HOST_DOCKER=0
+LIST_CAPSULES=0
+LAUNCH_OPTION_SEEN=0
 PODMAN_RUN_ARGS=()
 PODMAN_CONTAINER_NAME=""
 PODMAN_SECRET_FILE=""
 PODMAN_INFO_OUTPUT=""
+CAPSULE_LIST_ROWS=()
 BASE_COMPOSE_CMD=()
 COMPOSE_CMD=()
 
@@ -237,10 +240,13 @@ initialize_runtime_state() {
   set_runtime_selection "${CAPSULE_RUNTIME:-auto}"
   RUNTIME_BACKEND=""
   HOST_DOCKER=0
+  LIST_CAPSULES=0
+  LAUNCH_OPTION_SEEN=0
   PODMAN_RUN_ARGS=()
   PODMAN_CONTAINER_NAME=""
   PODMAN_SECRET_FILE=""
   PODMAN_INFO_OUTPUT=""
+  CAPSULE_LIST_ROWS=()
   BASE_COMPOSE_CMD=()
   COMPOSE_CMD=()
   unset CAPSULE_HOME_MOUNT 2>/dev/null || true
@@ -252,9 +258,11 @@ Usage: capsule.sh [options] [--] [command...]
 
 Options:
   -b, --build  Run "docker compose build cli" before runtime.
+  -l, --list  List running Capsules and exit.
   -p, --private-home  Bind-mount a per-user home directory.
       --publish HOST[:CONTAINER]  Publish port on host machine. Repeatable.
   -r, --remote HOST[:PORT]:/abs/path  Run on a remote Docker host over SSH.
+      With --list, the workdir suffix is optional.
       --runtime podman|docker|auto  Backend to run in (default: auto).
       --host-docker  Bind the host Docker socket into the Capsule.
   -v, --volume HOST:CONTAINER[:OPTIONS]  Bind-mount a host path. Repeatable.
@@ -337,14 +345,19 @@ parse_remote_target() {
     die '--remote cannot be specified more than once'
   fi
 
-  if [[ ! "$remote_target" =~ ^(.+):(/.*)$ ]]; then
+  if [[ "$remote_target" =~ ^(.+):(/.*)$ ]]; then
+    REMOTE_HOST="${BASH_REMATCH[1]}"
+    REMOTE_WORKDIR="${BASH_REMATCH[2]}"
+  elif [[ "$remote_target" =~ ^[^:]+$ ]] || \
+       [[ "$remote_target" =~ ^[^:]+:[0-9]+$ ]] || \
+       [[ "$remote_target" =~ ^\[[^]]+\](:[0-9]+)?$ ]]; then
+    REMOTE_HOST="$remote_target"
+    REMOTE_WORKDIR=""
+  else
     die "$remote_err"
   fi
 
-  REMOTE_HOST="${BASH_REMATCH[1]}"
-  REMOTE_WORKDIR="${BASH_REMATCH[2]}"
-
-  if [[ -z "$REMOTE_HOST" || -z "$REMOTE_WORKDIR" ]]; then
+  if [[ -z "$REMOTE_HOST" ]]; then
     die "$remote_err"
   fi
 
@@ -356,9 +369,11 @@ parse_remote_target() {
   elif [[ "$REMOTE_HOST" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
     REMOTE_SSH_DEST="${BASH_REMATCH[1]}"
     REMOTE_SSH_PORT="${BASH_REMATCH[2]}"
+  elif [[ "$REMOTE_HOST" =~ ^\[([^]]+)\]$ ]]; then
+    REMOTE_SSH_DEST="${BASH_REMATCH[1]}"
   fi
 
-  if [[ "$REMOTE_WORKDIR" != /* ]]; then
+  if [[ -n "$REMOTE_WORKDIR" ]] && [[ "$REMOTE_WORKDIR" != /* ]]; then
     die "--remote workdir must be absolute: $REMOTE_WORKDIR"
   fi
 }
@@ -412,18 +427,26 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -b|--build)
+        LAUNCH_OPTION_SEEN=1
         set_build_mode "all" "$1"
         shift
         ;;
       --build-custom)
+        LAUNCH_OPTION_SEEN=1
         set_build_mode "custom" "$1"
         shift
         ;;
       --no-cache)
+        LAUNCH_OPTION_SEEN=1
         NO_CACHE=1
         shift
         ;;
+      -l|--list)
+        LIST_CAPSULES=1
+        shift
+        ;;
       -p|--private-home)
+        LAUNCH_OPTION_SEEN=1
         PRIVATE_HOME=1
         shift
         ;;
@@ -431,6 +454,7 @@ parse_args() {
         if [[ $# -lt 2 ]] || [[ "${2:-}" == -* ]]; then
           die '--publish requires HOST[:CONTAINER] port parameter'
         fi
+        LAUNCH_OPTION_SEEN=1
         RUNTIME_OPTS+=(--publish "$2")
         shift 2
         ;;
@@ -449,6 +473,7 @@ parse_args() {
         if [[ $# -lt 2 ]] || [[ "${2:-}" == -* ]]; then
           die '--volume requires HOST:CONTAINER mount volume spec'
         fi
+        LAUNCH_OPTION_SEEN=1
         RUNTIME_OPTS+=(--volume "$2")
         shift 2
         ;;
@@ -464,6 +489,7 @@ parse_args() {
         shift
         ;;
       --host-docker)
+        LAUNCH_OPTION_SEEN=1
         HOST_DOCKER=1
         shift
         ;;
@@ -473,15 +499,191 @@ parse_args() {
         ;;
       --)
         shift
+        if [[ $# -gt 0 ]]; then
+          LAUNCH_OPTION_SEEN=1
+        fi
         RUNTIME_ARGS+=("$@")
         break
         ;;
       *)
+        LAUNCH_OPTION_SEEN=1
         RUNTIME_ARGS+=("$1")
         shift
         ;;
     esac
   done
+}
+
+# Reject launch-only arguments in list mode and require a workdir for runs.
+validate_operation() {
+  local remote_err='--remote requires HOST[:PORT]:/absolute/workdir'
+
+  if [[ "$LIST_CAPSULES" -eq 1 ]]; then
+    if [[ "$LAUNCH_OPTION_SEEN" -eq 1 ]]; then
+      die '--list cannot be combined with launch options or commands'
+    fi
+    return
+  fi
+
+  if [[ -n "$REMOTE_HOST" ]] && [[ -z "$REMOTE_WORKDIR" ]]; then
+    die "$remote_err"
+  fi
+}
+
+# Read one value from the container's configured environment.
+container_env_value() {
+  local engine="$1"
+  local container_id="$2"
+  local variable="$3"
+  local container_env=""
+
+  container_env="$("$engine" inspect --format \
+    '{{range .Config.Env}}{{println .}}{{end}}' \
+    "$container_id" 2>/dev/null)" || return 1
+
+  printf '%s\n' "$container_env" | awk -v prefix="${variable}=" '
+    index($0, prefix) == 1 {
+      print substr($0, length(prefix) + 1)
+      exit
+    }
+  '
+}
+
+# Resolve a numeric host user locally or through the configured SSH target.
+resolve_host_user() {
+  local host_uid="$1"
+  local resolved_user=""
+
+  if [[ ! "$host_uid" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$host_uid"
+    return
+  fi
+
+  if [[ -n "$REMOTE_HOST" ]]; then
+    resolved_user="$(run_remote_ssh \
+      "id -nu $host_uid 2>/dev/null || true")"
+  else
+    resolved_user="$(id -nu "$host_uid" 2>/dev/null || true)"
+  fi
+
+  printf '%s\n' "${resolved_user:-$host_uid}"
+}
+
+# Print the collected tab-separated rows as an aligned table.
+print_capsule_list() {
+  {
+    printf 'TARGET\tRUNTIME\tUSER\tID\tNAME\tUPTIME'
+    printf '\tIMAGE\tSTATUS\tPORTS\tHOST_DIR\n'
+    if [[ "${#CAPSULE_LIST_ROWS[@]}" -gt 0 ]]; then
+      printf '%s\n' \
+        ${CAPSULE_LIST_ROWS[@]+"${CAPSULE_LIST_ROWS[@]}"}
+    fi
+  } | awk -F '\t' '
+    {
+      rows = NR
+      if (NF > columns) columns = NF
+      for (column = 1; column <= NF; column++) {
+        value[NR, column] = $column
+        if (length($column) > width[column]) width[column] = length($column)
+      }
+    }
+    END {
+      for (row = 1; row <= rows; row++) {
+        for (column = 1; column < columns; column++) {
+          printf "%-*s  ", width[column], value[row, column]
+        }
+        print value[row, columns]
+      }
+    }
+  '
+}
+
+# Print running Capsules visible to one container engine.
+list_engine_capsules() {
+  local engine="$1"
+  local target="$2"
+  local ps_format=""
+  local ps_output=""
+  local row=""
+  local container_id=""
+  local host_workdir=""
+  local host_user=""
+  local host_uid=""
+  local list_row=""
+
+  ps_format='{{.ID}}{{"\t"}}{{.Names}}{{"\t"}}{{.RunningFor}}'
+  ps_format="${ps_format}"'{{"\t"}}{{.Image}}{{"\t"}}{{.Status}}'
+  ps_format="${ps_format}"'{{"\t"}}{{.Ports}}'
+
+  if ! ps_output="$(
+    "$engine" ps --format "$ps_format" 2>&1
+  )"; then
+    warn "cannot query $engine containers: $ps_output"
+    return 1
+  fi
+
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    container_id="${row%%$'\t'*}"
+    if ! host_workdir="$(container_env_value \
+      "$engine" "$container_id" CAPSULE_HOST_WORKDIR)"; then
+      continue
+    fi
+    [[ -n "$host_workdir" ]] || continue
+    host_uid="$(container_env_value \
+      "$engine" "$container_id" CAPSULE_UID || true)"
+    host_user="$(resolve_host_user "$host_uid")"
+    list_row="$target"$'\t'"$engine"$'\t'"${host_user:-unknown}"
+    list_row+=$'\t'"$row"$'\t'"$host_workdir"
+    CAPSULE_LIST_ROWS+=("$list_row")
+  done <<<"$ps_output"
+}
+
+# List local Capsules from selected engines, or Docker Capsules remotely.
+list_running_capsules() {
+  local queried=0
+  local engine=""
+  local engines=()
+
+  if [[ -n "$REMOTE_HOST" ]]; then
+    if [[ "$RUNTIME_SELECTION" == "podman" ]]; then
+      warn 'remote listing uses Docker; ignoring --runtime podman'
+    fi
+    if ! command -v docker >/dev/null 2>&1; then
+      die 'docker is required to query a remote host'
+    fi
+    export DOCKER_HOST="ssh://$REMOTE_HOST"
+    list_engine_capsules docker "$REMOTE_HOST" || \
+      die "failed to query running Capsules on $REMOTE_HOST"
+    print_capsule_list
+    return
+  fi
+
+  case "$RUNTIME_SELECTION" in
+    auto) engines=(docker podman) ;;
+    docker) engines=(docker) ;;
+    podman) engines=(podman) ;;
+  esac
+
+  for engine in "${engines[@]}"; do
+    if ! command -v "$engine" >/dev/null 2>&1; then
+      if [[ "$RUNTIME_SELECTION" != "auto" ]]; then
+        die "$engine is required by --runtime $RUNTIME_SELECTION"
+      fi
+      continue
+    fi
+    if list_engine_capsules "$engine" local; then
+      queried=1
+    elif [[ "$RUNTIME_SELECTION" != "auto" ]]; then
+      die "failed to query running Capsules with $engine"
+    fi
+  done
+
+  if [[ "$queried" -eq 0 ]]; then
+    die 'no usable container runtime found'
+  fi
+
+  print_capsule_list
 }
 
 # Validate and normalize CAPSULE_CUSTOM_COMPOSE when configured.
@@ -1115,6 +1317,7 @@ build_podman_run_args() {
     --volume "$home_mount"
     --volume "$(podman_inner_volume):${CAPSULE_INNER_DIR}"
     --env "CAPSULE_RUNTIME=podman"
+    --env "CAPSULE_UID=${CAPSULE_UID}"
     --env "CAPSULE_HOST_WORKDIR=${CAPSULE_HOST_WORKDIR}"
   )
 
@@ -1234,11 +1437,18 @@ run_capsule_runtime() {
 main() {
   local mise_version=""
 
-  initialize_workdir_state
-  initialize_user_ids
   initialize_runtime_state
   append_runtime_option_env
   parse_args "$@"
+  validate_operation
+
+  if [[ "$LIST_CAPSULES" -eq 1 ]]; then
+    list_running_capsules
+    return
+  fi
+
+  initialize_workdir_state
+  initialize_user_ids
   configure_custom_compose
   validate_build_mode
   initialize_capsule_config
