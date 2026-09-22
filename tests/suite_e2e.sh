@@ -25,6 +25,14 @@ LOG_FILE="$TEST_TMPDIR/suite_e2e.log"
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
+SKIP_REASONS=()
+PASS_MARK="."
+SKIP_MARK="s"
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  PASS_MARK=$'\033[32m.\033[0m'
+  SKIP_MARK=$'\033[33ms\033[0m'
+fi
 
 # Return the current UTC time in an ISO 8601-like format.
 timestamp() {
@@ -51,7 +59,7 @@ run_logged() {
 # Record a failed assertion and print it to stderr.
 fail() {
   log_message "FAIL: $1"
-  printf 'FAIL: %s\n' "$1" >&2
+  printf '\nFAIL: %s\n' "$1" >&2
   printf 'FAIL: see e2e log: %s\n' "$LOG_FILE" >&2
   if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
     printf '%s\n' \
@@ -63,15 +71,22 @@ fail() {
 # Record a passing assertion and print it to stdout.
 pass() {
   log_message "PASS: $1"
-  printf 'PASS: %s\n' "$1"
+  printf '%s' "$PASS_MARK"
   PASS_COUNT=$((PASS_COUNT + 1))
 }
 
 # Record a skipped assertion and print it to stdout.
 skip() {
+  local reason="$1"
+  local recorded=""
+
   log_message "SKIP: $1"
-  printf 'SKIP: %s\n' "$1"
+  printf '%s' "$SKIP_MARK"
   SKIP_COUNT=$((SKIP_COUNT + 1))
+  for recorded in ${SKIP_REASONS[@]+"${SKIP_REASONS[@]}"}; do
+    [[ "$recorded" == "$reason" ]] && return
+  done
+  SKIP_REASONS+=("$reason")
 }
 
 # Assert that a file contains a fixed string (the "needle").
@@ -317,7 +332,6 @@ test_custom_compose_build_custom_end_to_end() {
 
 # Run the suite, print the logfile path, and report the final summary.
 main() {
-  printf 'E2E log: %s\n' "$LOG_FILE"
   log_message "Suite started"
   test_example_project_end_to_end
   test_custom_compose_end_to_end
@@ -328,6 +342,11 @@ main() {
     "Summary: $PASS_COUNT passed, $FAIL_COUNT failed, $SKIP_COUNT skipped"
   printf '\nSummary: %d passed, %d failed, %d skipped\n' \
     "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT"
+  if [[ "${#SKIP_REASONS[@]}" -gt 0 ]]; then
+    printf 'Skipped:\n'
+    printf '  - %s\n' "${SKIP_REASONS[@]}"
+  fi
+  printf 'E2E log: %s\n' "$LOG_FILE"
   [[ "$FAIL_COUNT" -eq 0 ]]
 }
 

@@ -47,20 +47,35 @@ trap 'rm -rf "$TEST_TMPDIR"' EXIT
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
+SKIP_REASONS=()
+PASS_MARK="."
+SKIP_MARK="s"
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  PASS_MARK=$'\033[32m.\033[0m'
+  SKIP_MARK=$'\033[33ms\033[0m'
+fi
 
 fail() {
-  printf 'FAIL: %s\n' "$1" >&2
+  printf '\nFAIL: %s\n' "$1" >&2
   FAIL_COUNT=$((FAIL_COUNT + 1))
 }
 
 pass() {
-  printf 'PASS: %s\n' "$1"
+  printf '%s' "$PASS_MARK"
   PASS_COUNT=$((PASS_COUNT + 1))
 }
 
 skip() {
-  printf 'SKIP: %s\n' "$1"
+  local reason="$1"
+  local recorded=""
+
+  printf '%s' "$SKIP_MARK"
   SKIP_COUNT=$((SKIP_COUNT + 1))
+  for recorded in ${SKIP_REASONS[@]+"${SKIP_REASONS[@]}"}; do
+    [[ "$recorded" == "$reason" ]] && return
+  done
+  SKIP_REASONS+=("$reason")
 }
 
 assert_file_contains() {
@@ -651,6 +666,7 @@ test_check_all_docker_linters_use_capsule_host_workdir() {
   local tdir="$TEST_TMPDIR/check-all-host-workdir"
   local mock_bin="$tdir/bin"
   local log_file="$tdir/log"
+  local out_file="$tdir/out"
   mkdir -p "$mock_bin"
   ln -s "$(command -v bash)" "$mock_bin/bash"
   ln -s "$(command -v dirname)" "$mock_bin/dirname"
@@ -662,10 +678,14 @@ printf 'DOCKER_ARGS=%s\n' "$*" >>"${MOCK_LOG:?MOCK_LOG is required}"
 EOF
   chmod +x "$mock_bin/docker"
 
-  PATH="$mock_bin" MOCK_LOG="$log_file" \
+  if ! PATH="$mock_bin" MOCK_LOG="$log_file" \
     CAPSULE_WORKDIR="$ROOT_DIR" \
     CAPSULE_HOST_WORKDIR=/host/workspace \
-    "$CHECK_ALL_PATH"
+    "$CHECK_ALL_PATH" >"$out_file" 2>&1; then
+    fail "check_all accepts the host-visible workdir"
+    cat "$out_file" >&2
+    return
+  fi
 
   assert_file_contains "$log_file" \
     "-v /host/workspace:/mnt" \
@@ -709,6 +729,29 @@ EOF
   assert_file_contains "$log_file" \
     'koalaman/shellcheck' \
     "an unusable shellcheck falls through to the container image"
+}
+
+test_check_all_reports_skip_reasons() {
+  local tdir="$TEST_TMPDIR/check-all-skip-reasons"
+  local mock_bin="$tdir/bin"
+  local out_file="$tdir/out"
+  mkdir -p "$mock_bin"
+  ln -s "$(command -v bash)" "$mock_bin/bash"
+  ln -s "$(command -v dirname)" "$mock_bin/dirname"
+
+  if PATH="$mock_bin" "$CHECK_ALL_PATH" >"$out_file" 2>&1; then
+    pass "check_all accepts unavailable optional linters"
+  else
+    fail "check_all accepts unavailable optional linters"
+  fi
+  assert_file_contains "$out_file" 'Skipped:' \
+    "check_all prints a skip-reason section"
+  assert_file_contains "$out_file" \
+    'dclint unavailable; skipping Compose lint' \
+    "check_all names a missing Compose linter"
+  assert_file_contains "$out_file" \
+    'shellcheck unavailable; skipping shell lint' \
+    "check_all names a missing shell linter"
 }
 
 # Give the doctor a host of its own: a podman that answers rootless, a
@@ -1134,7 +1177,8 @@ test_remote_flag_requires_authorization() {
   make_mock_bin "$mock_bin"
   printf '%s\n' "${CAPSULE_WORKDIR:-$(pwd -P)}" >"$cfg_file"
 
-  if DOCKER_GID=1111 PATH="$mock_bin:$PATH" MOCK_LOG="$log_file" \
+  if DOCKER_GID=1111 CAPSULE_RUNTIME=docker \
+    PATH="$mock_bin:$PATH" MOCK_LOG="$log_file" \
     CAPSULE_CONFIG="$cfg_file" "$SCRIPT_PATH" \
     --remote builder:/srv/work true </dev/null 2>"$err_file"; then
     fail "remote target requires allowlist approval"
@@ -1231,7 +1275,8 @@ test_remote_flag_skips_local_workdir_approval() {
   make_mock_bin "$mock_bin"
   printf '%s\n' "ssh://builder/srv/work" >"$cfg_file"
 
-  if DOCKER_GID=1111 PATH="$mock_bin:$PATH" MOCK_LOG="$log_file" \
+  if DOCKER_GID=1111 CAPSULE_RUNTIME=docker \
+    PATH="$mock_bin:$PATH" MOCK_LOG="$log_file" \
     CAPSULE_CONFIG="$cfg_file" "$SCRIPT_PATH" \
     --remote builder:/srv/work true </dev/null; then
     pass "remote flag skips local workdir approval"
@@ -2719,6 +2764,7 @@ main() {
   test_empty_optional_arrays_use_nounset_safe_expansion
   test_check_all_docker_linters_use_capsule_host_workdir
   test_check_all_ignores_an_unusable_linter
+  test_check_all_reports_skip_reasons
   test_doctor_reports_each_backend_and_probes_by_running
   test_doctor_names_a_stale_session_bus
   test_build_custom_flag_keeps_runtime_flags
@@ -2797,6 +2843,10 @@ main() {
 
   printf '\nSummary: %d passed, %d failed, %d skipped\n' \
     "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT"
+  if [[ "${#SKIP_REASONS[@]}" -gt 0 ]]; then
+    printf 'Skipped:\n'
+    printf '  - %s\n' "${SKIP_REASONS[@]}"
+  fi
   [[ "$FAIL_COUNT" -eq 0 ]]
 }
 
