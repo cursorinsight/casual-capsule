@@ -46,19 +46,26 @@ trap 'rm -rf "$TEST_TMPDIR"' EXIT
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
+PASS_MARK="."
+SKIP_MARK="s"
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  PASS_MARK=$'\033[32m.\033[0m'
+  SKIP_MARK=$'\033[33ms\033[0m'
+fi
 
 fail() {
-  printf 'FAIL: %s\n' "$1" >&2
+  printf '\nFAIL: %s\n' "$1" >&2
   FAIL_COUNT=$((FAIL_COUNT + 1))
 }
 
 pass() {
-  printf 'PASS: %s\n' "$1"
+  printf '%s' "$PASS_MARK"
   PASS_COUNT=$((PASS_COUNT + 1))
 }
 
 skip() {
-  printf 'SKIP: %s\n' "$1"
+  printf '%s' "$SKIP_MARK"
   SKIP_COUNT=$((SKIP_COUNT + 1))
 }
 
@@ -641,6 +648,7 @@ test_check_all_docker_linters_use_capsule_host_workdir() {
   local tdir="$TEST_TMPDIR/check-all-host-workdir"
   local mock_bin="$tdir/bin"
   local log_file="$tdir/log"
+  local out_file="$tdir/out"
   mkdir -p "$mock_bin"
   ln -s "$(command -v bash)" "$mock_bin/bash"
   ln -s "$(command -v dirname)" "$mock_bin/dirname"
@@ -652,10 +660,14 @@ printf 'DOCKER_ARGS=%s\n' "$*" >>"${MOCK_LOG:?MOCK_LOG is required}"
 EOF
   chmod +x "$mock_bin/docker"
 
-  PATH="$mock_bin" MOCK_LOG="$log_file" \
+  if ! PATH="$mock_bin" MOCK_LOG="$log_file" \
     CAPSULE_WORKDIR="$ROOT_DIR" \
     CAPSULE_HOST_WORKDIR=/host/workspace \
-    "$CHECK_ALL_PATH"
+    "$CHECK_ALL_PATH" >"$out_file" 2>&1; then
+    fail "check_all accepts the host-visible workdir"
+    cat "$out_file" >&2
+    return
+  fi
 
   assert_file_contains "$log_file" \
     "-v /host/workspace:/mnt" \
@@ -1124,7 +1136,8 @@ test_remote_flag_requires_authorization() {
   make_mock_bin "$mock_bin"
   printf '%s\n' "${CAPSULE_WORKDIR:-$(pwd -P)}" >"$cfg_file"
 
-  if DOCKER_GID=1111 PATH="$mock_bin:$PATH" MOCK_LOG="$log_file" \
+  if DOCKER_GID=1111 CAPSULE_RUNTIME=docker \
+    PATH="$mock_bin:$PATH" MOCK_LOG="$log_file" \
     CAPSULE_CONFIG="$cfg_file" "$SCRIPT_PATH" \
     --remote builder:/srv/work true </dev/null 2>"$err_file"; then
     fail "remote target requires allowlist approval"
@@ -1221,7 +1234,8 @@ test_remote_flag_skips_local_workdir_approval() {
   make_mock_bin "$mock_bin"
   printf '%s\n' "ssh://builder/srv/work" >"$cfg_file"
 
-  if DOCKER_GID=1111 PATH="$mock_bin:$PATH" MOCK_LOG="$log_file" \
+  if DOCKER_GID=1111 CAPSULE_RUNTIME=docker \
+    PATH="$mock_bin:$PATH" MOCK_LOG="$log_file" \
     CAPSULE_CONFIG="$cfg_file" "$SCRIPT_PATH" \
     --remote builder:/srv/work true </dev/null; then
     pass "remote flag skips local workdir approval"

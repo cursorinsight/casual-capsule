@@ -30,6 +30,32 @@ shellcheck_files=(
   tests/fixtures/*/*.sh
 )
 
+PASS_MARK="."
+SKIP_MARK="s"
+PASS_COUNT=0
+FAIL_COUNT=0
+SKIP_COUNT=0
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  PASS_MARK=$'\033[32m.\033[0m'
+  SKIP_MARK=$'\033[33ms\033[0m'
+fi
+
+pass() {
+  printf '%s' "$PASS_MARK"
+  PASS_COUNT=$((PASS_COUNT + 1))
+}
+
+fail() {
+  printf '\nFAIL: %s\n' "$1" >&2
+  FAIL_COUNT=$((FAIL_COUNT + 1))
+}
+
+skip() {
+  printf '%s' "$SKIP_MARK"
+  SKIP_COUNT=$((SKIP_COUNT + 1))
+}
+
 resolve_docker_mount_root() {
   local root_dir="$1"
   local container_workdir="${CAPSULE_WORKDIR:-$CAPSULE_CONTAINER_WORKDIR}"
@@ -62,6 +88,7 @@ run_docker_linter() {
   shift 3
   local files=("$@")
   local docker_mount_root=""
+  local output=""
 
   local ep_args=()
   if [[ -n "$entrypoint" ]]; then
@@ -74,19 +101,22 @@ run_docker_linter() {
     abs_files+=("/mnt/$f")
   done
 
-  printf '%s (docker): checking %d %s files\n' \
-    "$image" "${#files[@]}" "$category"
   docker_mount_root="$(resolve_docker_mount_root "$ROOT_DIR")"
-  if docker run --rm \
-       -v "$docker_mount_root:/mnt" \
-       ${ep_args[@]+"${ep_args[@]}"} \
-       "$image" \
-       "${abs_files[@]}"; then
-    printf 'PASS: %s checks passed.\n' "$category"
+  if output="$(
+    docker run --rm \
+      -v "$docker_mount_root:/mnt" \
+      ${ep_args[@]+"${ep_args[@]}"} \
+      "$image" \
+      "${abs_files[@]}" 2>&1
+  )"; then
+    pass
     return 0
   fi
 
-  printf 'FAIL: %s checks failed.\n' "$category" >&2
+  fail "$category checks failed with $image."
+  if [[ -n "$output" ]]; then
+    printf '%s\n' "$output" >&2
+  fi
   return 1
 }
 
@@ -108,19 +138,22 @@ run_linter() {
   local category="$4"
   shift 4
   local files=("$@")
+  local output=""
 
   if [[ "${#files[@]}" -eq 0 ]]; then
-    printf 'INFO: no %s files; skipping %s.\n' "$category" "$tool"
+    skip
     return 0
   fi
 
   if tool_is_usable "$tool"; then
-    printf '%s: checking %d files\n' "$tool" "${#files[@]}"
-    if "$tool" "${files[@]}"; then
-      printf 'PASS: %s checks passed.\n' "$tool"
+    if output="$("$tool" "${files[@]}" 2>&1)"; then
+      pass
       return 0
     fi
-    printf 'FAIL: %s checks failed.\n' "$tool" >&2
+    fail "$tool checks failed."
+    if [[ -n "$output" ]]; then
+      printf '%s\n' "$output" >&2
+    fi
     return 1
   fi
 
@@ -131,13 +164,11 @@ run_linter() {
     return
   fi
 
-  printf 'WARNING: %s unavailable; skipping %s lint.\n' \
-    "$tool" "$category" >&2
+  skip
   return 0
 }
 
 status=0
-printf '%s\n' 'Running lint checks...'
 run_linter dclint zavoloklom/dclint "" \
   Compose "${dclint_files[@]}" || status=1
 run_linter hadolint hadolint/hadolint /bin/hadolint \
@@ -145,8 +176,7 @@ run_linter hadolint hadolint/hadolint /bin/hadolint \
 run_linter shellcheck koalaman/shellcheck:stable "" \
   shell "${shellcheck_files[@]}" || status=1
 
-if [[ "$status" -eq 0 ]]; then
-  printf '%s\n' 'All available lint checks passed.'
-fi
+printf '\nSummary: %d passed, %d failed, %d skipped\n' \
+  "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT"
 
 exit "$status"
