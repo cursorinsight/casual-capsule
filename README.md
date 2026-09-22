@@ -26,6 +26,7 @@ common developer tools.
 - [Additional features](#-additional-features)
   - [Checking your environment](#checking-your-environment)
   - [Runtime backends: podman and Docker](#runtime-backends-podman-and-docker)
+  - [Listing running Capsules](#listing-running-capsules)
   - [UID and GID detection](#uid-and-gid-detection)
   - [Directory approval list](#directory-approval-list)
   - [Private home bind mount](#private-home-bind-mount)
@@ -563,6 +564,37 @@ two; the router says so if it is missing.
 *   **`--remote` and custom compose files need a Docker daemon**, so those
     invocations use the Docker backend and say so.
 
+### Listing running Capsules
+
+Use `--list` to query running Capsules without starting one:
+
+```bash
+capsule --list
+capsule --list --runtime docker
+capsule --list --runtime podman
+```
+
+The default `auto` selection queries both local Docker and podman. The output
+includes the runtime, host user, container ID and name, uptime, image, status,
+published ports, and host workspace directory.
+
+Capsule recognizes containers through their `CAPSULE_HOST_WORKDIR`
+environment variable. It resolves the recorded `CAPSULE_UID` against the
+daemon host's account database. An unresolved UID is shown numerically;
+missing UID metadata is shown as `unknown`.
+
+Query a remote Docker host with the same SSH endpoint syntax used for runs,
+but without a workspace path or allowlist approval:
+
+```bash
+capsule --list --remote buildbox
+capsule --list --remote buildbox:2222
+```
+
+Remote listing uses Docker. A full run target such as
+`buildbox:/srv/project` is also accepted and still lists every running
+Capsule visible to that Docker daemon.
+
 ### UID and GID detection
 
 Capsule auto-detects the host user's UID/GID via `id -u`/`id -g` and
@@ -755,10 +787,12 @@ over SSH. Capsule sets `DOCKER_HOST=ssh://HOST[:PORT]` for Compose and mounts
 capsule --remote buildbox:/srv/casual-capsule
 capsule --remote buildbox:2222:/srv/casual-capsule
 capsule --remote buildbox:/srv/casual-capsule --build
+capsule --list --remote buildbox
 ```
 
-The remote target must be approved first. Use an SSH config host alias when you
-need extra SSH options beyond the optional port in `HOST[:PORT]`.
+Remote run targets must be approved first. Read-only `--list` queries do not
+need approval. Use an SSH config host alias when you need extra SSH options
+beyond the optional port in `HOST[:PORT]`.
 
 ## 🔧 Configuration reference
 
@@ -769,11 +803,16 @@ Usage:
 ```
 capsule.sh [OPTIONS]
 capsule.sh [OPTIONS] -- [ARGS]
+capsule.sh --list [--runtime RUNTIME] [--remote HOST[:PORT]]
 ```
 
 Options:
 
 *   `-b`, `--build`: Run `docker compose build cli` before `run`.
+
+*   `-l`, `--list`: List running Capsules and exit. By default, query both
+    local runtimes. Use `--runtime` to select one, or `--remote HOST[:PORT]`
+    to query a remote Docker daemon.
 
 *   `-p`, `--private-home`: Bind-mount `~/.capsule-home` from the Docker daemon
     host to `/home/user` in the container.
@@ -782,8 +821,9 @@ Options:
     compose configuration before `run`. Requires `CAPSULE_CUSTOM_COMPOSE`.
 
 *   `-r HOST[:PORT]:/abs/path`, `--remote HOST[:PORT]:/abs/path`: Run
-    `docker compose` against `ssh://HOST[:PORT]` and
-    mount `/abs/path` as `/home/workspace` on that remote host.
+    `docker compose` against `ssh://HOST[:PORT]` and mount `/abs/path` as
+    `/home/workspace` on that remote host. With `--list`, the workdir suffix
+    is optional.
 
 *   `--runtime podman|docker|auto`: Choose the backend that runs the Capsule.
     `auto`, the default, prefers podman and falls back to Docker with the
