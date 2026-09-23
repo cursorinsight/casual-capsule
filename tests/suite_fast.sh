@@ -1429,6 +1429,30 @@ test_list_finds_docker_and_podman_capsules() {
     "list does not start a Capsule"
 }
 
+test_list_debug_trace_hides_container_secrets() {
+  local tdir="$TEST_TMPDIR/list-debug-secrets"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local out_file="$tdir/out"
+  local err_file="$tdir/err"
+  local secret="container-secret-must-not-leak"
+  local docker_inspect="UNRELATED_SECRET=$secret"
+  docker_inspect+=$'\nCAPSULE_HOST_WORKDIR=/srv/debug\nCAPSULE_UID=1000'
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  CAPSULE_DEBUG=1 CAPSULE_RUNTIME=docker \
+    MOCK_DOCKER_PS=$'debug-id\tdebug-capsule\t1 minute\timage:d\tUp\t' \
+    MOCK_DOCKER_INSPECT="$docker_inspect" \
+    run_capsule "$mock_bin" "$log_file" list \
+    >"$out_file" 2>"$err_file"
+
+  assert_file_contains "$out_file" '/srv/debug' \
+    "debug list still reads the selected container environment value"
+  assert_file_not_contains "$err_file" "$secret" \
+    "debug list does not trace unrelated container secrets"
+}
+
 test_list_queries_remote_docker_without_workdir_or_approval() {
   local tdir="$TEST_TMPDIR/list-remote"
   local mock_bin="$tdir/bin"
@@ -3109,6 +3133,7 @@ main() {
   test_remote_flag_requires_target
   test_remote_flag_requires_absolute_workdir_syntax
   test_list_finds_docker_and_podman_capsules
+  test_list_debug_trace_hides_container_secrets
   test_list_queries_remote_docker_without_workdir_or_approval
   test_list_rejects_launch_commands
   test_remote_flag_requires_authorization
