@@ -57,7 +57,7 @@ Assisted-by: Copilot:claude-sonnet-4.6
 4. Never hardcode secrets.
 5. Interactive shells: no auto-restart.
 6. Handle Linux and macOS Docker socket GID differences.
-7. `capsule.sh` resolves UID/GID via `id -u` / `id -g`.
+7. Capsule resolves UID/GID via `id -u` / `id -g`.
    `CAPSULE_UID` / `CAPSULE_GID` override. Fallback: `1000:100`.
 8. `docker/entrypoint.sh` adjusts UID/GID, Docker socket group,
    and home ownership, then drops privileges.
@@ -74,10 +74,14 @@ Assisted-by: Copilot:claude-sonnet-4.6
 - `compose.yml`: Local privileged `cli` service; mounts workspace, Docker
   socket, and home volume; permits nested Podman tests; provides the build
   and runtime `github_api_token` secret.
-- `capsule.sh`: Launcher; selects the podman or Docker backend, and
-  handles allowlist, UID/GID, build flags, and runtime invocations.
-- `capsule-doctor.sh`: Host environment check; reports what each backend
-  needs and the command that repairs what is missing.
+- `Makefile`: Help, lint/check, and test entry points.
+- `bin/capsule`: User-facing command dispatcher. Omitting a subcommand keeps
+  the legacy run behavior.
+- `capsule.sh`: Backward-compatible wrapper for `bin/capsule`.
+- `lib/capsule/common.sh`: Shared run, build, list, backend, and host-path
+  logic.
+- `libexec/capsule/`: Implementations of the `run`, `build`, `list`, `doctor`,
+  and `completion` subcommands.
 - `docker/entrypoint.sh`: Root entrypoint; syncs UID/GID, Docker socket
   group, nested Podman ID ranges, and home ownership, then execs as `user`.
   Under podman the container already starts as `user`, so it only refreshes

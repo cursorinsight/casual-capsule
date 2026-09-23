@@ -25,7 +25,10 @@ hadolint_files=(
 )
 shellcheck_files=(
   *.sh
+  bin/*
   docker/*.sh
+  lib/capsule/*.sh
+  libexec/capsule/*
   tests/*.sh
   tests/fixtures/*/*.sh
 )
@@ -181,8 +184,10 @@ run_linter dclint zavoloklom/dclint "" \
   Compose "${dclint_files[@]}" || status=1
 run_linter hadolint hadolint/hadolint /bin/hadolint \
   Dockerfile "${hadolint_files[@]}" || status=1
-run_linter shellcheck koalaman/shellcheck:stable "" \
-  shell "${shellcheck_files[@]}" || status=1
+for shellcheck_file in "${shellcheck_files[@]}"; do
+  run_linter shellcheck koalaman/shellcheck:stable "" \
+    shell "$shellcheck_file" || status=1
+done
 
 printf '\nSummary: %d passed, %d failed, %d skipped\n' \
   "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT"
