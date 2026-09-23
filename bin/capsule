@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  capsule <command> [options]
+  capsule [run options] [--] [command...]
+
+Commands:
+  run         start a Capsule; the default for backward compatibility
+  build       build the Capsule image without starting it
+  list        list running Capsules
+  doctor, dr  check host support and name repairs
+  completion  generate Bash, Zsh, or Fish completion code
+
+Run 'capsule <command> --help' for command-specific help.
+EOF
+}
+
+script_path="${BASH_SOURCE[0]}"
+while [[ -L "$script_path" ]]; do
+  script_dir="$(CDPATH='' cd -- "$(dirname -- "$script_path")" && pwd -P)"
+  script_path="$(readlink "$script_path")"
+  [[ "$script_path" == /* ]] || script_path="$script_dir/$script_path"
+done
+script_dir="$(CDPATH='' cd -- "$(dirname -- "$script_path")" && pwd -P)"
+CAPSULE_ROOT="$(CDPATH='' cd -- "$script_dir/.." && pwd -P)"
+export CAPSULE_ROOT
+
+run_leaf() {
+  local leaf="$1"
+  local path="$CAPSULE_ROOT/libexec/capsule/$leaf"
+
+  shift
+  if [[ ! -x "$path" ]]; then
+    printf 'capsule: error: command is not executable: %s\n' "$path" >&2
+    exit 1
+  fi
+  exec "$path" "$@"
+}
+
+case "${1-}" in
+  run|build|list|doctor|completion)
+    command="$1"
+    shift
+    run_leaf "$command" "$@"
+    ;;
+  dr)
+    shift
+    run_leaf doctor "$@"
+    ;;
+  -h|--help)
+    usage
+    ;;
+  '')
+    run_leaf run
+    ;;
+  *)
+    run_leaf run "$@"
+    ;;
+esac

@@ -13,8 +13,10 @@ set -euo pipefail
 
 ROOT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
 SCRIPT_PATH="$ROOT_DIR/capsule.sh"
+CAPSULE_BIN="$ROOT_DIR/bin/capsule"
+CORE_PATH="$ROOT_DIR/lib/capsule/common.sh"
 CHECK_ALL_PATH="$ROOT_DIR/tests/check_all.sh"
-DOCTOR_PATH="$ROOT_DIR/capsule-doctor.sh"
+DOCTOR_PATH="$ROOT_DIR/libexec/capsule/doctor"
 COMPOSE_PATH="$ROOT_DIR/compose.yml"
 DOCKERFILE_PATH="$ROOT_DIR/Dockerfile"
 README_PATH="$ROOT_DIR/README.md"
@@ -24,12 +26,18 @@ STORAGE_CONF_PATH="$ROOT_DIR/docker/storage.conf"
 EXAMPLE_PROJECT_DIR="$ROOT_DIR/tests/fixtures/example-project"
 
 unset CAPSULE_CUSTOM_COMPOSE
+unset CAPSULE_BUILD
+unset CAPSULE_BUILD_CUSTOM
 unset CAPSULE_EXTRA_APPROVALS
 unset CAPSULE_GID
 unset CAPSULE_HOME_HOST_DIR
 unset CAPSULE_HOST_PATH_MAP
+unset CAPSULE_HOST_DOCKER
 unset CAPSULE_HOST_WORKDIR
 unset CAPSULE_PUBLISH
+unset CAPSULE_NO_CACHE
+unset CAPSULE_PRIVATE_HOME
+unset CAPSULE_REMOTE
 unset CAPSULE_RUNTIME
 unset CAPSULE_UID
 unset CAPSULE_VOLUME
@@ -270,10 +278,16 @@ run_capsule() {
     printf '%s\n' "${CAPSULE_EXTRA_APPROVALS}" >>"${cfg_file}"
   fi
   PATH="$mock_bin:$PATH" MOCK_LOG="$log_file" CAPSULE_CONFIG="$cfg_file" \
+    CAPSULE_BUILD="${CAPSULE_BUILD-}" \
+    CAPSULE_BUILD_CUSTOM="${CAPSULE_BUILD_CUSTOM-}" \
     CAPSULE_HOST_PATH_MAP="${CAPSULE_HOST_PATH_MAP-}" \
+    CAPSULE_HOST_DOCKER="${CAPSULE_HOST_DOCKER-}" \
     CAPSULE_HOST_WORKDIR="${CAPSULE_HOST_WORKDIR-}" \
     CAPSULE_HOME_HOST_DIR="${CAPSULE_HOME_HOST_DIR-}" \
     CAPSULE_PUBLISH="${CAPSULE_PUBLISH-}" \
+    CAPSULE_NO_CACHE="${CAPSULE_NO_CACHE-}" \
+    CAPSULE_PRIVATE_HOME="${CAPSULE_PRIVATE_HOME-}" \
+    CAPSULE_REMOTE="${CAPSULE_REMOTE-}" \
     CAPSULE_VOLUME="${CAPSULE_VOLUME-}" \
     DOCKER_HOST="${DOCKER_HOST-}" \
     CAPSULE_RUNTIME="${CAPSULE_RUNTIME-docker}" \
@@ -291,6 +305,125 @@ entry_from_log() {
   local index="$2"
   local log_file="$3"
   grep -F "$key=" "$log_file" | sed -n "${index}p"
+}
+
+test_command_layout() {
+  local command=""
+  local help_file="$TEST_TMPDIR/command-help"
+
+  if [[ -x "$CAPSULE_BIN" ]]; then
+    pass "bin/capsule is executable"
+  else
+    fail "bin/capsule is executable"
+  fi
+  for command in run build list doctor completion; do
+    if [[ -x "$ROOT_DIR/libexec/capsule/$command" ]]; then
+      pass "capsule $command has an executable implementation"
+    else
+      fail "capsule $command has an executable implementation"
+    fi
+  done
+  assert_file_contains "$SCRIPT_PATH" 'bin/capsule' \
+    "capsule.sh delegates to bin/capsule"
+  "$CAPSULE_BIN" --help >"$help_file"
+  assert_file_contains "$help_file" 'capsule <command>' \
+    "bin/capsule help describes subcommands"
+  "$CAPSULE_BIN" dr --help >"$help_file"
+  assert_file_contains "$help_file" 'Usage: capsule doctor' \
+    "capsule dr aliases the doctor command"
+  if CAPSULE_PRIVATE_HOME=maybe "$CAPSULE_BIN" list --help \
+    >"$help_file"; then
+    pass "list ignores unrelated run environment options"
+  else
+    fail "list ignores unrelated run environment options"
+  fi
+  "$SCRIPT_PATH" --help >"$help_file"
+  assert_file_contains "$help_file" 'capsule run' \
+    "capsule.sh keeps legacy run help"
+  if [[ ! -e "$ROOT_DIR/capsule-doctor.sh" ]]; then
+    pass "the legacy capsule-doctor.sh entry point is removed"
+  else
+    fail "the legacy capsule-doctor.sh entry point is removed"
+  fi
+}
+
+test_completion_subcommand() {
+  local tdir="$TEST_TMPDIR/completion"
+  local output_file="$tdir/output"
+  local err_file="$tdir/err"
+  local shell=""
+  local marker=""
+  mkdir -p "$tdir"
+
+  for shell in bash zsh fish; do
+    case "$shell" in
+      bash) marker='complete -o bashdefault' ;;
+      zsh) marker='#compdef capsule' ;;
+      fish) marker='complete -c capsule' ;;
+    esac
+    "$CAPSULE_BIN" completion "$shell" >"$output_file"
+    assert_file_contains "$output_file" "$marker" \
+      "completion generates $shell definitions"
+    if [[ "$shell" == "bash" ]]; then
+      if bash -n "$output_file"; then
+        pass "generated Bash completion has valid syntax"
+      else
+        fail "generated Bash completion has valid syntax"
+      fi
+    fi
+    if [[ "$shell" == "zsh" ]]; then
+      assert_file_contains "$output_file" '_capsule_run_arguments()' \
+        "Zsh completion defines default-run option candidates"
+      assert_file_contains "$output_file" 'words[2]=()' \
+        "Zsh completion removes the subcommand from argument context"
+      assert_file_contains "$output_file" \
+        'run|build|list|doctor|dr|completion)' \
+        "Zsh completion shifts only known subcommands"
+      assert_file_contains "$output_file" "'1:shell:(bash zsh fish)'" \
+        "Zsh completion offers shells after the completion subcommand"
+      assert_file_contains "$output_file" \
+        '*)
+      _capsule_run_arguments' \
+        "Zsh completion treats an omitted subcommand as run"
+    fi
+    if [[ "$shell" == "fish" ]]; then
+      assert_file_contains "$output_file" \
+        'function __fish_capsule_using_run' \
+        "Fish completion defines default-run detection"
+      # shellcheck disable=SC2016
+      assert_file_contains "$output_file" \
+        'not contains -- $words[2] build list doctor dr completion' \
+        "Fish completion recognizes omitted run subcommands"
+      assert_file_contains "$output_file" \
+        "-n '__fish_capsule_using_run' -s b -l build" \
+        "Fish completion offers default-run options"
+    fi
+  done
+
+  if "$CAPSULE_BIN" completion >"$output_file" 2>"$err_file"; then
+    fail "completion requires a shell"
+  else
+    pass "completion requires a shell"
+  fi
+  assert_file_contains "$err_file" 'shell is required' \
+    "completion names its missing argument"
+
+  if "$CAPSULE_BIN" completion tcsh >"$output_file" 2>"$err_file"; then
+    fail "completion rejects unsupported shells"
+  else
+    pass "completion rejects unsupported shells"
+  fi
+  assert_file_contains "$err_file" 'unsupported shell: tcsh' \
+    "completion names an unsupported shell"
+
+  if "$CAPSULE_BIN" completion bash extra \
+    >"$output_file" 2>"$err_file"; then
+    fail "completion rejects extra arguments"
+  else
+    pass "completion rejects extra arguments"
+  fi
+  assert_file_contains "$err_file" 'completion accepts one shell' \
+    "completion explains its argument count"
 }
 
 # shellcheck disable=SC2016
@@ -499,6 +632,116 @@ test_build_flag_runs_build_then_runtime() {
     "build flag still runs compose runtime"
 }
 
+test_build_subcommand_builds_without_running() {
+  local tdir="$TEST_TMPDIR/build-command"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local expected_build=""
+  local mise_ver="2024.1.0"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" \
+    build --no-cache
+
+  expected_build="compose -f $COMPOSE_PATH build --no-cache"
+  expected_build="$expected_build --build-arg MISE_VERSION=${mise_ver} cli"
+  assert_equals "$expected_build" \
+    "$(value_from_log ARGS "$log_file")" \
+    "build command builds the image"
+  assert_file_not_contains "$log_file" ' run --rm ' \
+    "build command does not start a Capsule"
+}
+
+test_build_subcommand_skips_run_approval() {
+  local tdir="$TEST_TMPDIR/build-command-no-approval"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local config_file="$tdir/config/approvals"
+  local workdir="$tdir/work"
+  mkdir -p "$workdir"
+  make_mock_bin "$mock_bin"
+
+  PATH="$mock_bin:$PATH" MOCK_LOG="$log_file" \
+    CAPSULE_CONFIG="$config_file" CAPSULE_RUNTIME=docker \
+    CAPSULE_WORKDIR="$workdir" CAPSULE_PRIVATE_HOME=maybe DOCKER_GID=1111 \
+    "$SCRIPT_PATH" build --remote builder
+
+  if [[ ! -e "$config_file" ]]; then
+    pass "build command does not create a run approval file"
+  else
+    fail "build command does not create a run approval file"
+  fi
+  assert_equals "ssh://builder" \
+    "$(value_from_log ENV_DOCKER_HOST "$log_file")" \
+    "build command accepts a remote host without a workdir"
+  pass "build command ignores unrelated run environment options"
+}
+
+test_build_subcommand_can_build_only_custom_image() {
+  local tdir="$TEST_TMPDIR/build-custom-command"
+  local custom_dir="$tdir/custom"
+  local custom_compose="$custom_dir/compose.yml"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+  make_custom_compose "$custom_dir" "build-command:local"
+
+  CAPSULE_CUSTOM_COMPOSE="$custom_compose" DOCKER_GID=1111 \
+    run_capsule "$mock_bin" "$log_file" build --custom
+
+  assert_file_contains "$log_file" \
+    "compose -f $COMPOSE_PATH -f $custom_compose build" \
+    "build --custom builds the merged custom image"
+  assert_file_not_contains "$log_file" ' run --rm ' \
+    "build --custom does not start a Capsule"
+}
+
+test_build_subcommand_rejects_conflicting_modes() {
+  local tdir="$TEST_TMPDIR/build-command-conflict"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local err_file="$tdir/err"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  if DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" \
+    build --all --custom 2>"$err_file"; then
+    fail "build command rejects conflicting modes"
+  else
+    pass "build command rejects conflicting modes"
+  fi
+  assert_file_contains "$err_file" \
+    '--build-custom cannot be combined with --build' \
+    "build command reports conflicting modes"
+
+  if DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" \
+    build --runtime 2>"$err_file"; then
+    fail "build command rejects a missing runtime"
+  else
+    pass "build command rejects a missing runtime"
+  fi
+  assert_file_contains "$err_file" '--runtime requires a value' \
+    "build command reports a missing runtime"
+}
+
+test_explicit_run_subcommand_starts_capsule() {
+  local tdir="$TEST_TMPDIR/run-command"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local expected_run=""
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" run true
+
+  expected_run="compose -f $COMPOSE_PATH run --rm cli true"
+  assert_equals "$expected_run" \
+    "$(value_from_log ARGS "$log_file")" \
+    "run command starts the Capsule"
+}
+
 test_no_cache_flag_applies_to_build_only() {
   local tdir="$TEST_TMPDIR/build-no-cache"
   local mock_bin="$tdir/bin"
@@ -569,6 +812,57 @@ EOF
   cat >"$dir/Dockerfile" <<'EOF'
 FROM casual-capsule-cli:latest
 EOF
+}
+
+test_flag_environment_equivalents() {
+  local tdir="$TEST_TMPDIR/flag-environment"
+  local mock_bin="$tdir/bin"
+  local build_log="$tdir/build-log"
+  local custom_log="$tdir/custom-log"
+  local home_log="$tdir/home-log"
+  local remote_log="$tdir/remote-log"
+  local err_file="$tdir/err"
+  local home_dir="$tdir/home"
+  local custom_dir="$tdir/custom"
+  local custom_compose="$custom_dir/compose.yml"
+  mkdir -p "$home_dir"
+  make_mock_bin "$mock_bin"
+  make_custom_compose "$custom_dir" "env-capsule:local"
+
+  CAPSULE_BUILD=1 CAPSULE_NO_CACHE=1 DOCKER_GID=1111 \
+    run_capsule "$mock_bin" "$build_log" true
+  assert_file_contains "$build_log" 'build --no-cache' \
+    "CAPSULE_BUILD and CAPSULE_NO_CACHE enable their flags"
+  assert_file_contains "$build_log" 'run --rm cli true' \
+    "CAPSULE_BUILD still runs the Capsule"
+
+  CAPSULE_BUILD_CUSTOM=1 CAPSULE_CUSTOM_COMPOSE="$custom_compose" \
+    DOCKER_GID=1111 run_capsule "$mock_bin" "$custom_log" true
+  assert_file_contains "$custom_log" "-f $custom_compose build" \
+    "CAPSULE_BUILD_CUSTOM enables --build-custom"
+
+  HOME="$home_dir" CAPSULE_PRIVATE_HOME=1 DOCKER_GID=1111 \
+    run_capsule "$mock_bin" "$home_log" true
+  assert_equals "$home_dir/.capsule-home:/home/user" \
+    "$(value_from_log ENV_CAPSULE_HOME_MOUNT "$home_log")" \
+    "CAPSULE_PRIVATE_HOME enables --private-home"
+
+  CAPSULE_REMOTE=builder:/srv/work \
+    CAPSULE_EXTRA_APPROVALS=ssh://builder/srv/work \
+    DOCKER_GID=1111 run_capsule "$mock_bin" "$remote_log" true
+  assert_equals "ssh://builder" \
+    "$(value_from_log ENV_DOCKER_HOST "$remote_log")" \
+    "CAPSULE_REMOTE enables --remote"
+
+  if CAPSULE_PRIVATE_HOME=maybe DOCKER_GID=1111 \
+    run_capsule "$mock_bin" "$tdir/invalid-log" true 2>"$err_file"; then
+    fail "boolean environment options reject invalid values"
+  else
+    pass "boolean environment options reject invalid values"
+  fi
+  assert_file_contains "$err_file" \
+    'CAPSULE_PRIVATE_HOME must be one of' \
+    "invalid boolean environment values report the accepted forms"
 }
 
 test_double_dash_keeps_runtime_flags() {
@@ -648,16 +942,16 @@ test_publish_and_volume_env_forward_to_runtime() {
 
 # shellcheck disable=SC2016
 test_empty_optional_arrays_use_nounset_safe_expansion() {
-  assert_file_contains "$SCRIPT_PATH" \
+  assert_file_contains "$CORE_PATH" \
     '${RUNTIME_OPTS[@]+${RUNTIME_OPTS[@]}}' \
     "runtime options expansion is safe under bash 4.3 nounset"
-  assert_file_contains "$SCRIPT_PATH" \
+  assert_file_contains "$CORE_PATH" \
     '${RUNTIME_ARGS[@]+${RUNTIME_ARGS[@]}}' \
     "runtime args expansion is safe under bash 4.3 nounset"
-  assert_file_contains "$SCRIPT_PATH" \
+  assert_file_contains "$CORE_PATH" \
     '${ssh_args[@]+${ssh_args[@]}}' \
     "remote ssh args expansion is safe under bash 4.3 nounset"
-  assert_file_contains "$SCRIPT_PATH" \
+  assert_file_contains "$CORE_PATH" \
     '${build_no_cache_args[@]+"${build_no_cache_args[@]}"}' \
     "build no-cache args expansion is safe under bash 4.3 nounset"
 }
@@ -674,6 +968,15 @@ test_check_all_docker_linters_use_capsule_host_workdir() {
   cat >"$mock_bin/docker" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ "$*" == *koalaman/shellcheck* ]]; then
+  file_count=0
+  for arg in "$@"; do
+    case "$arg" in
+      /mnt/*) file_count=$((file_count + 1)) ;;
+    esac
+  done
+  [[ "$file_count" -eq 1 ]] || exit 1
+fi
 printf 'DOCKER_ARGS=%s\n' "$*" >>"${MOCK_LOG:?MOCK_LOG is required}"
 EOF
   chmod +x "$mock_bin/docker"
@@ -693,6 +996,7 @@ EOF
   assert_file_not_contains "$log_file" \
     "-v $ROOT_DIR:/mnt" \
     "check_all docker linters avoid container-only workdir mounts"
+  pass "check_all shellchecks each file independently like CI"
 }
 
 # A mise shim with no version pinned sits on PATH and fails the moment it
@@ -808,9 +1112,9 @@ test_doctor_reports_each_backend_and_probes_by_running() {
   make_doctor_bin "$bin_dir"
 
   if ! bash -n "$DOCTOR_PATH"; then
-    fail "capsule-doctor.sh has valid shell syntax"
+    fail "capsule doctor has valid shell syntax"
   else
-    pass "capsule-doctor.sh has valid shell syntax"
+    pass "capsule doctor has valid shell syntax"
   fi
 
   # The verdict depends on the host; the report does not.
@@ -837,6 +1141,10 @@ test_doctor_reports_each_backend_and_probes_by_running() {
   assert_file_contains "$out_file" \
     'passed,' \
     "the doctor ends with a tally"
+  assert_file_not_contains "$out_file" $'\033[' \
+    "the doctor leaves redirected output uncolored"
+  assert_file_contains "$DOCTOR_PATH" "-z \"\${NO_COLOR:-}\"" \
+    "the doctor honors NO_COLOR before coloring output"
 }
 
 # The remedy has to fit the cause: a session bus that systemd is not on is a
@@ -1101,7 +1409,7 @@ test_list_finds_docker_and_podman_capsules() {
     MOCK_PODMAN_PS="$podman_ps" \
     MOCK_PODMAN_INSPECT=$'CAPSULE_HOST_WORKDIR=/srv/podman\nCAPSULE_UID=1000' \
     MOCK_ID_USER=bob \
-    run_capsule "$mock_bin" "$log_file" --list >"$out_file"
+    run_capsule "$mock_bin" "$log_file" list >"$out_file"
 
   assert_file_contains "$out_file" 'HOST_DIR' \
     "list prints a stable header"
@@ -1126,6 +1434,7 @@ test_list_queries_remote_docker_without_workdir_or_approval() {
   local mock_bin="$tdir/bin"
   local log_file="$tdir/log"
   local out_file="$tdir/out"
+  local env_out_file="$tdir/env-out"
   local docker_inspect=$'CAPSULE_HOST_WORKDIR=/remote/project\n'
   docker_inspect+='CAPSULE_UID=2000'
   mkdir -p "$tdir"
@@ -1136,7 +1445,7 @@ test_list_queries_remote_docker_without_workdir_or_approval() {
     MOCK_DOCKER_INSPECT="$docker_inspect" \
     MOCK_SSH_OUTPUT=remote-user \
     run_capsule "$mock_bin" "$log_file" \
-    --list --remote builder:2222 >"$out_file"
+    list --remote builder:2222 >"$out_file"
 
   assert_file_contains "$out_file" 'remote-user' \
     "remote list resolves a Capsule creator through SSH"
@@ -1147,6 +1456,14 @@ test_list_queries_remote_docker_without_workdir_or_approval() {
     "remote list queries Docker through its SSH endpoint"
   assert_file_not_contains "$log_file" 'PODMAN_PS_ARGS=' \
     "remote list does not query local podman"
+
+  CAPSULE_RUNTIME=auto CAPSULE_REMOTE=builder:2222 \
+    MOCK_DOCKER_PS=$'remote-id\tremote-capsule\t3 days\timage:r\tUp 3 days\t' \
+    MOCK_DOCKER_INSPECT="$docker_inspect" \
+    MOCK_SSH_OUTPUT=remote-user \
+    run_capsule "$mock_bin" "$log_file" list >"$env_out_file"
+  assert_file_contains "$env_out_file" 'remote-user' \
+    "CAPSULE_REMOTE selects the remote list target"
 }
 
 test_list_rejects_launch_commands() {
@@ -1157,13 +1474,13 @@ test_list_rejects_launch_commands() {
   mkdir -p "$tdir"
   make_mock_bin "$mock_bin"
 
-  if run_capsule "$mock_bin" "$log_file" --list true 2>"$err_file"; then
+  if run_capsule "$mock_bin" "$log_file" list true 2>"$err_file"; then
     fail "list rejects launch commands"
   else
     pass "list rejects launch commands"
   fi
   assert_file_contains "$err_file" \
-    '--list cannot be combined with launch options or commands' \
+    'unknown list option: true' \
     "list reports its launch-command conflict"
 }
 
@@ -2239,6 +2556,13 @@ test_podman_host_docker_is_opt_in() {
   assert_podman_args_contain "$CASE_DIR/with" \
     "${socket_path}:/var/lib/capsule/docker.sock" \
     "--host-docker binds the host daemon socket deliberately"
+
+  CAPSULE_RUNTIME=podman CAPSULE_HOST_DOCKER=1 \
+    DOCKER_HOST="unix://$socket_path" \
+    run_capsule "$CASE_BIN" "$CASE_DIR/with-env" true
+  assert_podman_args_contain "$CASE_DIR/with-env" \
+    "${socket_path}:/var/lib/capsule/docker.sock" \
+    "CAPSULE_HOST_DOCKER enables --host-docker"
 }
 
 test_podman_host_docker_without_a_socket_is_an_error() {
@@ -2288,7 +2612,7 @@ test_podman_backend_requires_built_image() {
     pass "podman backend refuses to run an image that was never built"
   fi
   assert_file_contains "$CASE_ERR" \
-    'capsule.sh --build' \
+    'capsule build' \
     "podman backend names the build command in the error"
 }
 
@@ -2752,15 +3076,23 @@ main() {
     skip "shellcheck unavailable; skipping lint check"
   fi
 
+  test_command_layout
+  test_completion_subcommand
   test_compose_contract
   test_dockerfile_tooling_contract
   test_dockerfile_uid_gid_contract
   test_entrypoint_contract
   test_build_flag_runs_build_then_runtime
+  test_build_subcommand_builds_without_running
+  test_build_subcommand_skips_run_approval
+  test_build_subcommand_can_build_only_custom_image
+  test_build_subcommand_rejects_conflicting_modes
+  test_explicit_run_subcommand_starts_capsule
   test_no_cache_flag_applies_to_build_only
   test_double_dash_keeps_runtime_flags
   test_publish_and_volume_flags_forward_to_runtime
   test_publish_and_volume_env_forward_to_runtime
+  test_flag_environment_equivalents
   test_empty_optional_arrays_use_nounset_safe_expansion
   test_check_all_docker_linters_use_capsule_host_workdir
   test_check_all_ignores_an_unusable_linter

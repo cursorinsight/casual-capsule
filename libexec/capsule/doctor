@@ -19,23 +19,32 @@ WARN_COUNT=0
 FAIL_COUNT=0
 DOCKER_USABLE=0
 PODMAN_USABLE=0
+PASS_LABEL="PASS"
+WARN_LABEL="WARN"
+FAIL_LABEL="FAIL"
+
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != "dumb" ]]; then
+  PASS_LABEL=$'\033[32mPASS\033[0m'
+  WARN_LABEL=$'\033[33mWARN\033[0m'
+  FAIL_LABEL=$'\033[31mFAIL\033[0m'
+fi
 
 # Print a satisfied check.
 pass() {
-  printf 'PASS  %s\n' "$1"
+  printf '%s  %s\n' "$PASS_LABEL" "$1"
   PASS_COUNT=$((PASS_COUNT + 1))
 }
 
 # Print a check that costs a capability but leaves the host usable.
 warn() {
-  printf 'WARN  %s\n' "$1"
+  printf '%s  %s\n' "$WARN_LABEL" "$1"
   printf '      %s\n' "$2"
   WARN_COUNT=$((WARN_COUNT + 1))
 }
 
 # Print a check that leaves the host unable to run what it advertises.
 fail() {
-  printf 'FAIL  %s\n' "$1"
+  printf '%s  %s\n' "$FAIL_LABEL" "$1"
   printf '      %s\n' "$2"
   FAIL_COUNT=$((FAIL_COUNT + 1))
 }
@@ -290,6 +299,18 @@ check_tooling() {
 }
 
 main() {
+  case "${1-}" in
+    -h|--help)
+      printf '%s\n' 'Usage: capsule doctor'
+      return
+      ;;
+    '') ;;
+    *)
+      printf 'capsule: error: unknown doctor option: %s\n' "$1" >&2
+      return 2
+      ;;
+  esac
+
   printf 'Capsule environment check\n'
 
   check_docker

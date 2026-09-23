@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ -n "${CAPSULE_ROOT:-}" ]] || {
+  printf 'capsule: error: run this command through capsule\n' >&2
+  exit 1
+}
+
+# shellcheck source=lib/capsule/common.sh
+# shellcheck disable=SC1091
+source "$CAPSULE_ROOT/lib/capsule/common.sh"
+
+CAPSULE_LIST_ROWS=()
+
+usage() {
+  cat <<'EOF'
+Usage: capsule list [options]
+
+Options:
+  -r, --remote HOST[:PORT]  Query a remote Docker host over SSH.
+      --runtime RUNTIME     Query auto, docker, or podman (default: auto).
+  -h, --help                Show this help message.
+
+Environment:
+  CAPSULE_REMOTE   Remote HOST[:PORT] target.
+  CAPSULE_RUNTIME  Runtime to query: auto, docker, or podman.
+EOF
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -r|--remote)
+        if [[ $# -lt 2 ]] || [[ "${2:-}" == -* ]]; then
+          die '--remote requires HOST[:PORT]'
+        fi
+        parse_remote_target "$2"
+        shift 2
+        ;;
+      --remote=*)
+        parse_remote_target "${1#--remote=}"
+        shift
+        ;;
+      --runtime)
+        if [[ $# -lt 2 ]] || [[ "${2:-}" == -* ]]; then
+          die '--runtime requires podman, docker, or auto'
+        fi
+        set_runtime_selection "$2"
+        shift 2
+        ;;
+      --runtime=*)
+        set_runtime_selection "${1#--runtime=}"
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown list option: $1"
+        ;;
+    esac
+  done
+}
+
+# Read one value from the container's configured environment.
+container_env_value() {
+  local engine="$1"
+  local container_id="$2"
+  local variable="$3"
+  local container_env=""
+
+  container_env="$("$engine" inspect --format \
+    '{{range .Config.Env}}{{println .}}{{end}}' \
+    "$container_id" 2>/dev/null)" || return 1
+
+  printf '%s\n' "$container_env" | awk -v prefix="${variable}=" '
+    index($0, prefix) == 1 {
+      print substr($0, length(prefix) + 1)
+      exit
+    }
+  '
+}
+
+# Resolve a numeric host user locally or through the configured SSH target.
+resolve_host_user() {
+  local host_uid="$1"
+  local resolved_user=""
+
+  if [[ ! "$host_uid" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$host_uid"
+    return
+  fi
+
+  if [[ -n "$REMOTE_HOST" ]]; then
+    resolved_user="$(run_remote_ssh \
+      "id -nu $host_uid 2>/dev/null || true")"
+  else
+    resolved_user="$(id -nu "$host_uid" 2>/dev/null || true)"
+  fi
+
+  printf '%s\n' "${resolved_user:-$host_uid}"
+}
+
+# Print the collected tab-separated rows as an aligned table.
+print_capsule_list() {
+  {
+    printf 'TARGET\tRUNTIME\tUSER\tID\tNAME\tUPTIME'
+    printf '\tIMAGE\tSTATUS\tPORTS\tHOST_DIR\n'
+    if [[ "${#CAPSULE_LIST_ROWS[@]}" -gt 0 ]]; then
+      printf '%s\n' \
+        ${CAPSULE_LIST_ROWS[@]+"${CAPSULE_LIST_ROWS[@]}"}
+    fi
+  } | awk -F '\t' '
+    {
+      rows = NR
+      if (NF > columns) columns = NF
+      for (column = 1; column <= NF; column++) {
+        value[NR, column] = $column
+        if (length($column) > width[column]) width[column] = length($column)
+      }
+    }
+    END {
+      for (row = 1; row <= rows; row++) {
+        for (column = 1; column < columns; column++) {
+          printf "%-*s  ", width[column], value[row, column]
+        }
+        print value[row, columns]
+      }
+    }
+  '
+}
+
+# Print running Capsules visible to one container engine.
+list_engine_capsules() {
+  local engine="$1"
+  local target="$2"
+  local ps_format=""
+  local ps_output=""
+  local row=""
+  local container_id=""
+  local host_workdir=""
+  local host_user=""
+  local host_uid=""
+  local list_row=""
+
+  ps_format='{{.ID}}{{"\t"}}{{.Names}}{{"\t"}}{{.RunningFor}}'
+  ps_format="${ps_format}"'{{"\t"}}{{.Image}}{{"\t"}}{{.Status}}'
+  ps_format="${ps_format}"'{{"\t"}}{{.Ports}}'
+
+  if ! ps_output="$(
+    "$engine" ps --format "$ps_format" 2>&1
+  )"; then
+    warn "cannot query $engine containers: $ps_output"
+    return 1
+  fi
+
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    container_id="${row%%$'\t'*}"
+    if ! host_workdir="$(container_env_value \
+      "$engine" "$container_id" CAPSULE_HOST_WORKDIR)"; then
+      continue
+    fi
+    [[ -n "$host_workdir" ]] || continue
+    host_uid="$(container_env_value \
+      "$engine" "$container_id" CAPSULE_UID || true)"
+    host_user="$(resolve_host_user "$host_uid")"
+    list_row="$target"$'\t'"$engine"$'\t'"${host_user:-unknown}"
+    list_row+=$'\t'"$row"$'\t'"$host_workdir"
+    CAPSULE_LIST_ROWS+=("$list_row")
+  done <<<"$ps_output"
+}
+
+# List local Capsules from selected engines, or Docker Capsules remotely.
+list_running_capsules() {
+  local queried=0
+  local engine=""
+  local engines=()
+
+  if [[ -n "$REMOTE_HOST" ]]; then
+    if [[ "$RUNTIME_SELECTION" == "podman" ]]; then
+      warn 'remote listing uses Docker; ignoring --runtime podman'
+    fi
+    if ! command -v docker >/dev/null 2>&1; then
+      die 'docker is required to query a remote host'
+    fi
+    export DOCKER_HOST="ssh://$REMOTE_HOST"
+    list_engine_capsules docker "$REMOTE_HOST" || \
+      die "failed to query running Capsules on $REMOTE_HOST"
+    print_capsule_list
+    return
+  fi
+
+  case "$RUNTIME_SELECTION" in
+    auto) engines=(docker podman) ;;
+    docker) engines=(docker) ;;
+    podman) engines=(podman) ;;
+  esac
+
+  for engine in "${engines[@]}"; do
+    if ! command -v "$engine" >/dev/null 2>&1; then
+      if [[ "$RUNTIME_SELECTION" != "auto" ]]; then
+        die "$engine is required by --runtime $RUNTIME_SELECTION"
+      fi
+      continue
+    fi
+    if list_engine_capsules "$engine" local; then
+      queried=1
+    elif [[ "$RUNTIME_SELECTION" != "auto" ]]; then
+      die "failed to query running Capsules with $engine"
+    fi
+  done
+
+  if [[ "$queried" -eq 0 ]]; then
+    die 'no usable container runtime found'
+  fi
+
+  print_capsule_list
+}
+
+main() {
+  initialize_runtime_state
+  parse_args "$@"
+  apply_remote_env
+  list_running_capsules
+}
+
+main "$@"
