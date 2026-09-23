@@ -68,16 +68,16 @@ container_env_value() {
   local engine="$1"
   local container_id="$2"
   local variable="$3"
-  local container_env=""
 
-  container_env="$("$engine" inspect --format \
+  "$engine" inspect --format \
     '{{range .Config.Env}}{{println .}}{{end}}' \
-    "$container_id" 2>/dev/null)" || return 1
-
-  printf '%s\n' "$container_env" | awk -v prefix="${variable}=" '
-    index($0, prefix) == 1 {
-      print substr($0, length(prefix) + 1)
-      exit
+    "$container_id" 2>/dev/null | awk -v prefix="${variable}=" '
+    !found && index($0, prefix) == 1 {
+      value = substr($0, length(prefix) + 1)
+      found = 1
+    }
+    END {
+      if (found) print value
     }
   '
 }
