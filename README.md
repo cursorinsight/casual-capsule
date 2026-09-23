@@ -639,9 +639,14 @@ capsule list --runtime docker
 capsule list --runtime podman
 ```
 
-The default `auto` selection queries both local Docker and podman. The output
-includes the runtime, host user, container ID and name, uptime, image, status,
-published ports, and host workspace directory.
+The default `auto` selection queries Docker's configured endpoint and local
+podman. The output includes the runtime, host user, container ID and name,
+uptime, image, status, published ports, and host workspace directory.
+
+When `DOCKER_HOST`, `DOCKER_CONTEXT`, or the active Docker context selects a
+non-local endpoint, the target column shows that endpoint. Capsule leaves its
+recorded UID numeric because the local account database does not describe the
+daemon host. Use `--remote` for an SSH target whose user should be resolved.
 
 Capsule recognizes containers through their `CAPSULE_HOST_WORKDIR`
 environment variable. It resolves the recorded `CAPSULE_UID` against the

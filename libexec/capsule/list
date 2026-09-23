@@ -63,6 +63,28 @@ parse_args() {
   done
 }
 
+# Name the Docker endpoint selected by its environment or active context.
+docker_list_target() {
+  local endpoint=""
+
+  if [[ -n "${DOCKER_CONTEXT:-}" ]]; then
+    if ! endpoint="$(docker context inspect "$DOCKER_CONTEXT" \
+      --format '{{(index .Endpoints "docker").Host}}' 2>/dev/null)"; then
+      endpoint="context:$DOCKER_CONTEXT"
+    fi
+  elif [[ -n "${DOCKER_HOST:-}" ]]; then
+    endpoint="$DOCKER_HOST"
+  else
+    endpoint="$(docker context inspect \
+      --format '{{(index .Endpoints "docker").Host}}' 2>/dev/null || true)"
+  fi
+
+  case "$endpoint" in
+    ''|unix://*|npipe://*|fd://*) printf '%s\n' local ;;
+    *) printf '%s\n' "$endpoint" ;;
+  esac
+}
+
 # Read one value from the container's configured environment.
 container_env_value() {
   local engine="$1"
@@ -85,6 +107,7 @@ container_env_value() {
 # Resolve a numeric host user locally or through the configured SSH target.
 resolve_host_user() {
   local host_uid="$1"
+  local resolve_local="${2:-1}"
   local resolved_user=""
 
   if [[ ! "$host_uid" =~ ^[0-9]+$ ]]; then
@@ -95,6 +118,8 @@ resolve_host_user() {
   if [[ -n "$REMOTE_HOST" ]]; then
     resolved_user="$(run_remote_ssh \
       "id -nu $host_uid 2>/dev/null || true")"
+  elif [[ "$resolve_local" -eq 0 ]]; then
+    resolved_user="$host_uid"
   else
     resolved_user="$(id -nu "$host_uid" 2>/dev/null || true)"
   fi
@@ -135,6 +160,7 @@ print_capsule_list() {
 list_engine_capsules() {
   local engine="$1"
   local target="$2"
+  local resolve_local_user="${3:-1}"
   local ps_format=""
   local ps_output=""
   local row=""
@@ -165,7 +191,7 @@ list_engine_capsules() {
     [[ -n "$host_workdir" ]] || continue
     host_uid="$(container_env_value \
       "$engine" "$container_id" CAPSULE_UID || true)"
-    host_user="$(resolve_host_user "$host_uid")"
+    host_user="$(resolve_host_user "$host_uid" "$resolve_local_user")"
     list_row="$target"$'\t'"$engine"$'\t'"${host_user:-unknown}"
     list_row+=$'\t'"$row"$'\t'"$host_workdir"
     CAPSULE_LIST_ROWS+=("$list_row")
@@ -177,6 +203,8 @@ list_running_capsules() {
   local queried=0
   local engine=""
   local engines=()
+  local target=""
+  local resolve_local_user=1
 
   if [[ -n "$REMOTE_HOST" ]]; then
     if [[ "$RUNTIME_SELECTION" == "podman" ]]; then
@@ -186,7 +214,7 @@ list_running_capsules() {
       die 'docker is required to query a remote host'
     fi
     export DOCKER_HOST="ssh://$REMOTE_HOST"
-    list_engine_capsules docker "$REMOTE_HOST" || \
+    list_engine_capsules docker "$REMOTE_HOST" 0 || \
       die "failed to query running Capsules on $REMOTE_HOST"
     print_capsule_list
     return
@@ -205,7 +233,13 @@ list_running_capsules() {
       fi
       continue
     fi
-    if list_engine_capsules "$engine" local; then
+    target="local"
+    resolve_local_user=1
+    if [[ "$engine" == "docker" ]]; then
+      target="$(docker_list_target)"
+      [[ "$target" == "local" ]] || resolve_local_user=0
+    fi
+    if list_engine_capsules "$engine" "$target" "$resolve_local_user"; then
       queried=1
     elif [[ "$RUNTIME_SELECTION" != "auto" ]]; then
       die "failed to query running Capsules with $engine"

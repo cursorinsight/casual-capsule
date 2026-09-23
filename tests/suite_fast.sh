@@ -43,6 +43,7 @@ unset CAPSULE_UID
 unset CAPSULE_VOLUME
 unset CAPSULE_WORKDIR
 unset DOCKER_GID
+unset DOCKER_CONTEXT
 unset DOCKER_HOST
 
 TEST_TMPDIR="$(mktemp -d)"
@@ -1451,6 +1452,40 @@ test_list_debug_trace_hides_container_secrets() {
     "debug list still reads the selected container environment value"
   assert_file_not_contains "$err_file" "$secret" \
     "debug list does not trace unrelated container secrets"
+}
+
+test_list_labels_implicit_remote_docker_endpoints() {
+  local tdir="$TEST_TMPDIR/list-implicit-remote"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local host_out="$tdir/host-out"
+  local context_out="$tdir/context-out"
+  local docker_ps=$'remote-id\tremote-capsule\t3 days\timage:r\tUp\t'
+  local docker_inspect=$'CAPSULE_HOST_WORKDIR=/remote/project\n'
+  docker_inspect+='CAPSULE_UID=2000'
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  DOCKER_HOST=tcp://builder:2376 CAPSULE_RUNTIME=docker \
+    MOCK_DOCKER_PS="$docker_ps" \
+    MOCK_DOCKER_INSPECT="$docker_inspect" MOCK_ID_USER=wrong-local-user \
+    run_capsule "$mock_bin" "$log_file" list >"$host_out"
+  assert_file_contains "$host_out" 'tcp://builder:2376' \
+    "list labels a remote DOCKER_HOST endpoint"
+  assert_file_not_contains "$host_out" 'wrong-local-user' \
+    "list does not resolve a remote UID against local accounts"
+  assert_file_contains "$host_out" '2000' \
+    "list reports the recorded UID for an implicit remote endpoint"
+
+  DOCKER_CONTEXT=builder-context CAPSULE_RUNTIME=docker \
+    MOCK_CONTEXT_HOST=ssh://context-builder \
+    MOCK_DOCKER_PS="$docker_ps" MOCK_DOCKER_INSPECT="$docker_inspect" \
+    MOCK_ID_USER=wrong-local-user \
+    run_capsule "$mock_bin" "$log_file" list >"$context_out"
+  assert_file_contains "$context_out" 'ssh://context-builder' \
+    "list labels the active remote Docker context"
+  assert_file_not_contains "$context_out" 'wrong-local-user' \
+    "list avoids local UID lookup for a remote Docker context"
 }
 
 test_list_queries_remote_docker_without_workdir_or_approval() {
@@ -3134,6 +3169,7 @@ main() {
   test_remote_flag_requires_absolute_workdir_syntax
   test_list_finds_docker_and_podman_capsules
   test_list_debug_trace_hides_container_secrets
+  test_list_labels_implicit_remote_docker_endpoints
   test_list_queries_remote_docker_without_workdir_or_approval
   test_list_rejects_launch_commands
   test_remote_flag_requires_authorization
