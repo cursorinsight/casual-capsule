@@ -18,7 +18,7 @@ Options:
       --all                 Build base and profile/custom image (default).
       --custom              Build only the profile/custom image.
       --no-cache            Disable build cache.
-      --profile DIR         Apply a Capsule profile. Repeatable.
+      --profile NAME|PATH   Apply a Capsule profile. Repeatable.
   -r, --remote HOST[:PORT]  Build on a remote Docker host over SSH.
       --runtime RUNTIME     Use auto, docker, or podman (default: auto).
   -h, --help                Show this help message.
@@ -46,14 +46,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --profile)
       if [[ $# -lt 2 ]] || [[ -z "${2:-}" ]] || [[ "${2:-}" == -* ]]; then
-        die '--profile requires a directory'
+        die '--profile requires a name or directory path'
       fi
       args+=("$1" "$2")
       shift 2
       ;;
     --profile=*)
       if [[ -z "${1#--profile=}" ]]; then
-        die '--profile requires a directory'
+        die '--profile requires a name or directory path'
       fi
       args+=("$1")
       shift

@@ -362,6 +362,7 @@ Set `NO_COLOR` to disable them.
 ### Shell completion
 
 `capsule completion` generates completion definitions for Bash, Zsh, or Fish.
+Profile completion offers user and bundled profile names plus local directories.
 Install the generated file where your shell loads completions:
 
 ```bash
@@ -747,9 +748,17 @@ CAPSULE_UID=2000 CAPSULE_GID=2000 capsule build
 
 
 On the first run in a new directory, `capsule` prompts for explicit approval
-and records the approved path in `~/.config/capsule` (overridable via
-`CAPSULE_CONFIG`) when you answer `y`. Answer `o` to allow only the current run
-without updating the approval file. The default answer is `N`.
+and records the approved path in
+`${XDG_CONFIG_HOME:-$HOME/.config}/capsule/approved-directories`
+(overridable via `CAPSULE_CONFIG`) when you answer `y`. Answer `o` to allow
+only the current run without updating the approval file. The default answer
+is `N`. XDG base-directory variables used by Capsule must be absolute paths.
+
+When `XDG_CONFIG_HOME` is unset and the old `~/.config/capsule` approval file
+exists, Capsule moves it to the new default location automatically and resumes
+an interrupted migration on the next run. Symlinks are not migrated
+automatically: replace the symlink with a regular file containing the approval
+list, then retry.
 
 When a remote run is active, Capsule checks only the remote target in that
 same allowlist. Remote targets approved via `--remote` are stored as
@@ -804,12 +813,22 @@ capsule --profile /home/myuser/python-capsule
 capsule --profile /profiles/tools --profile /profiles/project
 ```
 
-`CAPSULE_PROFILES` is the environment equivalent. Separate profile
-directories with semicolons:
+For reusable profiles, create
+`${XDG_CONFIG_HOME:-$HOME/.config}/capsule/profiles/NAME/capsule.toml`.
+Both `--profile` and `CAPSULE_PROFILES` accept `NAME`. Bare values always name
+a profile. Capsule checks the user profile directory first, then profiles
+shipped with Capsule. Use an explicit path such as `./python` to select a
+directory relative to the current working directory.
+
+`CAPSULE_PROFILES` is the environment equivalent. Separate profile names or
+directory paths with semicolons:
 
 ```bash
-CAPSULE_PROFILES="/profiles/tools;/profiles/project" capsule
+CAPSULE_PROFILES="tools;/profiles/project" capsule
 ```
+
+Selecting the same canonical profile directory more than once emits a warning
+and applies it only once. Distinct profiles must still have unique names.
 
 Relative volume sources resolve from the profile directory. Before a bind
 mount reaches Docker or Podman, Capsule applies its normal host-path mapping,
@@ -824,10 +843,13 @@ default named home volume has no daemon-host path a nested run can bind.
 Remote runs reject relative profile volume sources. Use `~` or an absolute
 path on the remote daemon host.
 
+Generated Dockerfiles and Compose overrides are cached under
+`${XDG_CACHE_HOME:-$HOME/.cache}/capsule/profiles`.
+
 The repository includes an NVIDIA profile:
 
 ```bash
-capsule --profile /path/to/casual-capsule/profiles/nvidia
+capsule --profile nvidia
 ```
 
 #### Migrating a custom Compose file
@@ -1045,8 +1067,8 @@ Run options:
 *   `--build-custom`: Build only the configured profile image or merged legacy
     custom Compose image before `run`.
 
-*   `--profile DIR`: Apply a Capsule profile. May be passed multiple times;
-    order controls Dockerfile fragment and runtime-setting order.
+*   `--profile NAME|PATH`: Apply a Capsule profile. May be passed multiple
+    times; order controls Dockerfile fragment and runtime-setting order.
 
 *   `-r HOST[:PORT]:/abs/path`, `--remote HOST[:PORT]:/abs/path`: Run
     `docker compose` against `ssh://HOST[:PORT]` and mount `/abs/path` as
@@ -1082,7 +1104,8 @@ Build options:
 *   `--custom`: Build only the configured profile image or merged legacy
     custom Compose image.
 
-*   `--profile DIR`: Apply a Capsule profile. May be passed multiple times.
+*   `--profile NAME|PATH`: Apply a Capsule profile. May be passed multiple
+    times.
 
 *   `--no-cache`: Disable the build cache.
 
@@ -1125,8 +1148,8 @@ empty value, `0`, `false`, `no`, or `off`.
 
     Default: empty.
 
-*   `CAPSULE_PROFILES`: Semicolon-separated profile directories. Environment
-    profiles apply before command-line `--profile` options.
+*   `CAPSULE_PROFILES`: Semicolon-separated profile names or directory paths.
+    Environment profiles apply before command-line `--profile` options.
 
     Default: empty.
 
@@ -1223,7 +1246,8 @@ empty value, `0`, `false`, `no`, or `off`.
 
 *   `CAPSULE_CONFIG`: Path to the file that contains the approved directories.
 
-    Default: `~/.config/capsule`.
+    Default:
+    `${XDG_CONFIG_HOME:-$HOME/.config}/capsule/approved-directories`.
 
 *   `CAPSULE_HOST_WORKDIR`: daemon-host-visible path for `/home/workspace`.
 
@@ -1233,6 +1257,11 @@ empty value, `0`, `false`, `no`, or `off`.
 *   `GITHUB_API_TOKEN`: Passed as a build secret for `gh` auth and for `mise`
     tool downloads from GitHub, and as a runtime secret for automatic `gh`
     login. Optional; unset or empty means no secret is supplied.
+
+    Podman stages its per-run secret under `$XDG_RUNTIME_DIR/capsule`.
+    Without that directory, it uses
+    `${XDG_CACHE_HOME:-$HOME/.cache}/capsule/runtime`. On macOS it always uses
+    `$HOME/.cache/capsule/runtime`, which the Podman machine can access.
 
 ## 🧪 Run checks and tests
 

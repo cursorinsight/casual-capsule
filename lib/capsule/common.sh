@@ -55,6 +55,7 @@ PODMAN_SECRET_FILE=""
 PODMAN_INFO_OUTPUT=""
 BASE_COMPOSE_CMD=()
 COMPOSE_CMD=()
+CAPSULE_PROFILE_HOME=""
 
 # Print a Capsule error and exit.
 die() {
@@ -65,6 +66,16 @@ die() {
 # Print a Capsule warning.
 warn() {
   printf 'capsule: warning: %s\n' "$*" >&2
+}
+
+# Reject invalid XDG base directories before using them for trusted state.
+validate_xdg_path() {
+  local name="$1"
+  local value="${!name:-}"
+
+  if [[ -n "$value" && "$value" != /* ]]; then
+    die "$name must be an absolute path: $value"
+  fi
 }
 
 # Return success when a boolean environment option is enabled.
@@ -303,7 +314,7 @@ Usage: capsule run [options] [--] [command...]
 Options:
   -b, --build  Build base and configured profile/custom image before runtime.
   -p, --private-home  Bind-mount a per-user home directory.
-      --profile DIR  Apply a Capsule profile. Repeatable.
+      --profile NAME|PATH  Apply a Capsule profile. Repeatable.
       --publish HOST[:CONTAINER]  Publish port on host machine. Repeatable.
   -r, --remote HOST[:PORT]:/abs/path  Run on a remote Docker host over SSH.
       --runtime podman|docker|auto  Backend to run in (default: auto).
@@ -325,7 +336,7 @@ Environment:
   CAPSULE_BUILD_CUSTOM  Enable --build-custom when true.
   CAPSULE_NO_CACHE  Enable --no-cache when set to a true value.
   CAPSULE_PRIVATE_HOME  Enable --private-home when true.
-  CAPSULE_PROFILES  Semicolon-separated profile directories.
+  CAPSULE_PROFILES  Semicolon-separated profile names or directory paths.
   CAPSULE_REMOTE   Remote HOST[:PORT]:/absolute/workdir target.
   CAPSULE_HOST_DOCKER  Enable --host-docker when true.
   CAPSULE_PUBLISH  Semicolon-separated --publish specs.
@@ -500,14 +511,14 @@ parse_args() {
         ;;
       --profile)
         if [[ $# -lt 2 ]] || [[ -z "${2:-}" ]] || [[ "${2:-}" == -* ]]; then
-          die '--profile requires a directory'
+          die '--profile requires a name or directory path'
         fi
         PROFILE_PATHS+=("$2")
         shift 2
         ;;
       --profile=*)
         if [[ -z "${1#--profile=}" ]]; then
-          die '--profile requires a directory'
+          die '--profile requires a name or directory path'
         fi
         PROFILE_PATHS+=("${1#--profile=}")
         shift
@@ -628,9 +639,73 @@ validate_build_mode() {
   fi
 }
 
-# Initialize the allowlist file location and its parent directory.
+# Move the legacy approval file out of the new config directory's path.
+migrate_legacy_capsule_config() {
+  local legacy_path="$1"
+  local destination="$2"
+  local temporary="${legacy_path}.migration"
+
+  if [[ -L "$legacy_path" ]]; then
+    die 'replace legacy config symlink with a regular approval file before' \
+      "retrying: $legacy_path"
+  fi
+  if [[ -e "$temporary" || -L "$temporary" ]]; then
+    if [[ -L "$temporary" || ! -f "$temporary" ]]; then
+      die "legacy config recovery path is not a file: $temporary"
+    fi
+    if [[ -e "$destination" || -L "$destination" ]]; then
+      die "legacy config recovery destination exists: $destination"
+    fi
+    if [[ -e "$legacy_path" && ! -d "$legacy_path" ]]; then
+      die "legacy config and recovery file both exist: $legacy_path"
+    fi
+  else
+    if [[ -d "$legacy_path" ]] || [[ ! -e "$legacy_path" ]]; then
+      return
+    fi
+    if [[ ! -f "$legacy_path" ]]; then
+      die "legacy config path is not a file: $legacy_path"
+    fi
+    if ! mv "$legacy_path" "$temporary"; then
+      die "cannot prepare legacy config migration: $legacy_path"
+    fi
+  fi
+  if ! mkdir -p "$(dirname -- "$destination")"; then
+    die "cannot create config directory: $(dirname -- "$destination")"
+  fi
+  if ! mv "$temporary" "$destination"; then
+    die "cannot migrate legacy config to: $destination"
+  fi
+  warn "migrated approval list to $destination"
+}
+
+# Initialize standard config locations before profiles are resolved.
+initialize_capsule_paths() {
+  local config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+  local config_dir=""
+  local default_config=""
+
+  validate_xdg_path XDG_CONFIG_HOME
+  validate_xdg_path XDG_CACHE_HOME
+  validate_xdg_path XDG_RUNTIME_DIR
+
+  config_home="$(trim_trailing_slash "$config_home")"
+  config_dir="$(join_host_path "$config_home" "/capsule")"
+  default_config="$config_dir/approved-directories"
+
+  # Read by resolve_profile_dir() in the sourced profile module.
+  # shellcheck disable=SC2034
+  CAPSULE_PROFILE_HOME="$config_dir/profiles"
+  if [[ -z "${CAPSULE_CONFIG:-}" ]]; then
+    if [[ "$config_dir" == "$HOME/.config/capsule" ]]; then
+      migrate_legacy_capsule_config "$config_dir" "$default_config"
+    fi
+    CAPSULE_CONFIG="$default_config"
+  fi
+}
+
+# Create the allowlist file's parent directory when a run needs it.
 initialize_capsule_config() {
-  CAPSULE_CONFIG="${CAPSULE_CONFIG:-"${HOME}/.config/capsule"}"
   mkdir -p "$(dirname -- "$CAPSULE_CONFIG")"
 }
 
@@ -1097,14 +1172,22 @@ podman_inner_volume() {
     "$(path_token "$CAPSULE_HOST_WORKDIR")"
 }
 
-# Write the GitHub token where podman can mount it as the runtime secret the
-# entrypoint reads. It lives under the user home because a podman machine
-# shares that path with its guest.
+# Write the GitHub token where podman can mount it as a runtime secret.
 configure_podman_secret() {
-  local secret_dir="${HOME}/.capsule"
+  local cache_home="${XDG_CACHE_HOME:-$HOME/.cache}"
+  local secret_dir=""
 
   if [[ -z "${GITHUB_API_TOKEN:+set}" ]]; then
     return
+  fi
+
+  # A macOS podman machine shares HOME, not arbitrary host cache paths.
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    secret_dir="$HOME/.cache/capsule/runtime"
+  elif [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+    secret_dir="$cache_home/capsule/runtime"
+  else
+    secret_dir="$XDG_RUNTIME_DIR/capsule"
   fi
 
   mkdir -p "$secret_dir"
@@ -1495,6 +1578,7 @@ main() {
 
   initialize_workdir_state
   initialize_user_ids
+  initialize_capsule_paths
   configure_profiles
   apply_profile_namespace
   configure_custom_compose
