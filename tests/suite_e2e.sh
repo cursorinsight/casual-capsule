@@ -109,6 +109,18 @@ assert_file_contains() {
   fi
 }
 
+# Assert that a file does not contain a fixed string.
+assert_file_not_contains() {
+  local file="$1"
+  local needle="$2"
+  local msg="$3"
+  if grep -Fq -- "$needle" "$file"; then
+    fail "$msg (unexpected: $needle)"
+  else
+    pass "$msg"
+  fi
+}
+
 # Check whether Docker, Compose, and the daemon are available for e2e tests.
 require_docker_prereqs() {
   if ! command -v docker >/dev/null 2>&1; then
@@ -213,7 +225,6 @@ test_podman_backend_end_to_end() {
 test_profile_end_to_end() {
   local tdir="$TEST_TMPDIR/profile-e2e"
   local config_file="$tdir/config"
-  local check_cmd=""
   mkdir -p "$tdir"
   log_message "Starting test_profile_end_to_end"
 
@@ -221,26 +232,144 @@ test_profile_end_to_end() {
     return
   fi
   printf '%s\n' "$EXAMPLE_PROJECT_DIR" >"$config_file"
-  # shellcheck disable=SC2016
-  check_cmd='bash ./check-env.sh'
-  check_cmd="$check_cmd && [[ \"\${CUSTOM_CAPSULE_IMAGE:-}\" == \"1\" ]]"
-  check_cmd="$check_cmd && [[ \"\${CUSTOM_CAPSULE_PROFILE:-}\" == \"1\" ]]"
-  check_cmd="$check_cmd && printf \"profile capsule ok\\n\""
-
-  log_message "Running capsule.sh --build-custom with --profile"
+  log_message "Building and running the Docker profile through both selectors"
   # shellcheck disable=SC2016
   if run_logged bash -c '
-    unset CAPSULE_WORKDIR
+    unset CAPSULE_WORKDIR CAPSULE_PROFILES
     cd "$1" &&
       CAPSULE_CONFIG="$2" CAPSULE_RUNTIME=docker \
-      "$3" --build-custom --profile "$4" bash -lc "$5"
+      "$3" build --custom --profile "$4" &&
+      CAPSULE_CONFIG="$2" CAPSULE_RUNTIME=docker \
+      "$3" --profile "$4" capsule-profile-sentinel cli &&
+      CAPSULE_CONFIG="$2" CAPSULE_RUNTIME=docker CAPSULE_PROFILES="$4" \
+      "$3" capsule-profile-sentinel env
   ' bash "$EXAMPLE_PROJECT_DIR" "$config_file" "$SCRIPT_PATH" \
-    "$PROFILE_CAPSULE_DIR" "$check_cmd"; then
+    "$PROFILE_CAPSULE_DIR"; then
     assert_file_contains "$LOG_FILE" \
-      "profile capsule ok" \
-      "profiles build and run end to end through Docker"
+      "profile sentinel cli" \
+      "a built Docker profile runs its sentinel through --profile"
+    assert_file_contains "$LOG_FILE" \
+      "profile sentinel env" \
+      "CAPSULE_PROFILES selects the same built Docker profile"
   else
     fail "profiles build and run end to end through Docker"
+  fi
+}
+
+# Verify an absent generated image fails before Compose creates a container.
+test_unbuilt_profile_fails_before_container_creation() {
+  local tdir="$TEST_TMPDIR/profile-unbuilt-e2e"
+  local profile_dir="$tdir/profile"
+  local config_file="$tdir/config"
+  local command_log="$tdir/docker-commands"
+  local mock_bin="$tdir/bin"
+  local real_docker=""
+  local token=""
+  local image=""
+  mkdir -p "$profile_dir" "$mock_bin"
+  log_message "Starting test_unbuilt_profile_fails_before_container_creation"
+
+  if ! require_docker_prereqs "unbuilt profile e2e"; then
+    return
+  fi
+
+  cat >"$profile_dir/capsule.toml" <<'EOF'
+version = 1
+name = "unbuilt-e2e"
+
+[dockerfile]
+content = '''
+RUN true
+'''
+EOF
+  printf '%s\n' "$EXAMPLE_PROJECT_DIR" >"$config_file"
+  token="$(printf '%s\n' "$profile_dir" | cksum | cut -d' ' -f1)"
+  printf -v token '%08x' "$token"
+  image="casual-capsule-profile-unbuilt-e2e-${token}:local"
+  docker image rm -f "$image" >/dev/null 2>&1 || true
+  real_docker="$(command -v docker)"
+  : >"$command_log"
+
+  cat >"$mock_bin/docker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${DOCKER_COMMAND_LOG:?}"
+exec "${REAL_DOCKER:?}" "$@"
+EOF
+  chmod +x "$mock_bin/docker"
+
+  if run_logged env \
+    REAL_DOCKER="$real_docker" DOCKER_COMMAND_LOG="$command_log" \
+    PATH="$mock_bin:$PATH" \
+    CAPSULE_CONFIG="$config_file" CAPSULE_RUNTIME=docker \
+    CAPSULE_WORKDIR="$EXAMPLE_PROJECT_DIR" \
+    "$SCRIPT_PATH" --profile "$profile_dir" true; then
+    fail "an unbuilt Docker profile is rejected"
+  else
+    pass "an unbuilt Docker profile is rejected"
+  fi
+  assert_file_contains "$LOG_FILE" \
+    "capsule build --profile $profile_dir --runtime docker" \
+    "the unbuilt profile error gives the exact build command"
+  assert_file_not_contains "$command_log" 'compose' \
+    "an unbuilt profile fails before Compose creates a container"
+}
+
+# Run Capsule from a plain controller container against the host daemon.
+test_profile_from_docker_controller_container() {
+  local host_root="${CAPSULE_HOST_WORKDIR:-$ROOT_DIR}"
+  local host_workspace="$host_root/tests/fixtures/example-project"
+  local host_uid=""
+  local host_gid=""
+  mkdir -p "$TEST_TMPDIR/profile-controller-e2e"
+  log_message "Starting test_profile_from_docker_controller_container"
+
+  if ! require_docker_prereqs "controller container profile e2e"; then
+    return
+  fi
+  if ! require_github_token "controller container profile e2e"; then
+    return
+  fi
+  if [[ ! -S /var/run/docker.sock ]]; then
+    skip "controller container profile e2e requires /var/run/docker.sock"
+    return
+  fi
+  if ! docker image inspect casual-capsule-cli:latest >/dev/null 2>&1; then
+    skip "controller container profile e2e requires the base image"
+    return
+  fi
+
+  host_uid="$(id -u)"
+  host_gid="$(id -g)"
+  # shellcheck disable=SC2016
+  if run_logged docker run --rm \
+    --entrypoint bash \
+    --volume "$host_root:/controller/repo:ro" \
+    --volume /var/run/docker.sock:/controller/docker.sock \
+    --env "CAPSULE_UID=$host_uid" \
+    --env "CAPSULE_GID=$host_gid" \
+    --env GITHUB_API_TOKEN \
+    casual-capsule-cli:latest -c '
+      set -euo pipefail
+      mkdir -p /tmp/controller-bin
+      ln -s /usr/bin/docker /tmp/controller-bin/docker
+      export PATH="/tmp/controller-bin:$PATH"
+      export DOCKER_HOST=unix:///controller/docker.sock
+      export CAPSULE_HOST_PATH_MAP="/controller/repo=$4"
+      printf "%s\n" "$3" >/tmp/capsule-approvals
+      cd /controller/repo/tests/fixtures/example-project
+      CAPSULE_CONFIG=/tmp/capsule-approvals CAPSULE_RUNTIME=docker \
+        "$1" --build-custom --profile "$2" \
+        capsule-profile-sentinel controller
+    ' bash \
+    /controller/repo/capsule.sh \
+    /controller/repo/tests/fixtures/profile-capsule \
+    "$host_workspace" "$host_root"; then
+    assert_file_contains "$LOG_FILE" \
+      "profile sentinel controller" \
+      "a non-Capsule controller runs the selected Docker profile image"
+  else
+    fail "a non-Capsule controller runs a Docker profile"
   fi
 }
 
@@ -357,6 +486,8 @@ main() {
   test_custom_compose_end_to_end
   test_custom_compose_build_custom_end_to_end
   test_profile_end_to_end
+  test_unbuilt_profile_fails_before_container_creation
+  test_profile_from_docker_controller_container
   test_podman_backend_end_to_end
 
   log_message \

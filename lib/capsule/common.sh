@@ -1519,6 +1519,44 @@ run_requested_builds() {
   fi
 }
 
+# Print the command that builds the selected Docker profile image.
+docker_profile_build_command() {
+  local command="capsule build"
+  local profile_dir=""
+  local quoted=""
+
+  for profile_dir in ${PROFILE_DIRS[@]+"${PROFILE_DIRS[@]}"}; do
+    printf -v quoted '%q' "$profile_dir"
+    command="$command --profile $quoted"
+  done
+  command="$command --runtime docker"
+  if [[ -n "$REMOTE_HOST" ]]; then
+    printf -v quoted '%q' "$REMOTE_HOST"
+    command="$command --remote $quoted"
+  fi
+  printf '%s\n' "$command"
+}
+
+# Refuse to let Compose fall back to the base image for a profile runtime.
+require_docker_profile_image() {
+  local inspect_error=""
+
+  [[ "$PROFILE_HAS_FRAGMENT" -eq 1 ]] || return 0
+
+  if inspect_error="$(
+    docker image inspect "$PROFILE_IMAGE" 2>&1 >/dev/null
+  )"; then
+    return
+  fi
+
+  if [[ "$inspect_error" == *"No such image"* ]]; then
+    die "profile image ${PROFILE_IMAGE} is not built; run:" \
+      "$(docker_profile_build_command)"
+  fi
+
+  die "unable to inspect profile image ${PROFILE_IMAGE}:" "$inspect_error"
+}
+
 # Run the runtime container and remove per-run files after it exits.
 run_capsule_runtime() {
   local exit_code=0
@@ -1622,5 +1660,6 @@ main() {
     return
   fi
 
+  require_docker_profile_image
   run_capsule_runtime
 }

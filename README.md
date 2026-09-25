@@ -846,6 +846,10 @@ path on the remote daemon host.
 Generated Dockerfiles and Compose overrides are cached under
 `${XDG_CACHE_HOME:-$HOME/.cache}/capsule/profiles`.
 
+A profile with `[dockerfile].content` runs only from the image built for that
+exact ordered profile set. If the image is absent, Capsule stops before
+container creation and prints the required `capsule build --profile` command.
+
 The repository includes an NVIDIA profile:
 
 ```bash
