@@ -31,6 +31,7 @@ common developer tools.
   - [UID and GID detection](#uid-and-gid-detection)
   - [Directory approval list](#directory-approval-list)
   - [Private home bind mount](#private-home-bind-mount)
+  - [Capsule profiles](#capsule-profiles)
   - [Custom Capsule images](#custom-capsule-images)
   - [Updating your GitHub token](#updating-your-github-token)
   - [Port publishing](#port-publishing)
@@ -47,7 +48,7 @@ common developer tools.
 
 ## 📋 Prerequisites
 
-- Docker Engine 24+ and Docker Compose v2
+- Docker Engine 24+ and Docker Compose 2.34.0+
 - Optionally rootless [podman](https://podman.io) 4.9+, to run the Capsule
   with a container engine of its own instead of the host daemon
   ([what it needs](#what-the-podman-backend-needs))
@@ -313,7 +314,13 @@ capsule build
 capsule build --no-cache
 ```
 
-Build only a configured custom image:
+Build only a configured profile image:
+
+```bash
+capsule build --custom --profile /home/myuser/python-capsule
+```
+
+Build only a legacy custom Compose image:
 
 ```bash
 CAPSULE_CUSTOM_COMPOSE=/home/myuser/python-capsule/compose.yml \
@@ -766,11 +773,92 @@ host. When `CAPSULE_HOST_PATH_MAP` is active inside a non-Capsule container,
 Capsule resolves `~/.capsule-home` through that map; if the map does not cover
 `$HOME`, set `CAPSULE_HOME_HOST_DIR` explicitly.
 
+### Capsule profiles
+
+Profiles are the preferred way to customize a Capsule. They work with both
+Docker and Podman. A profile is a directory containing `capsule.toml` and any
+files used by its optional Dockerfile fragment:
+
+```toml
+version = 1
+name = "python"
+volume = ["./config:/home/user/.config/example:ro"]
+publish = ["8080:8080"]
+
+[env]
+PYTHON_CAPSULE = "1"
+FORWARDED_TOKEN = "${SOURCE_TOKEN}"
+
+[dockerfile]
+content = '''
+RUN uv tool install black
+COPY --from=python config/ /opt/python-capsule/config/
+'''
+```
+
+Apply and build it with the same ordered, repeatable option:
+
+```bash
+capsule build --profile /home/myuser/python-capsule
+capsule --profile /home/myuser/python-capsule
+capsule --profile /profiles/tools --profile /profiles/project
+```
+
+`CAPSULE_PROFILES` is the environment equivalent. Separate profile
+directories with semicolons:
+
+```bash
+CAPSULE_PROFILES="/profiles/tools;/profiles/project" capsule
+```
+
+Relative volume sources resolve from the profile directory. Before a bind
+mount reaches Docker or Podman, Capsule applies its normal host-path mapping,
+including `CAPSULE_HOST_PATH_MAP` for nested Capsules. A profile Dockerfile
+fragment uses `COPY --from=PROFILE_NAME` to read its directory as a named
+build context.
+
+Nested Docker Capsules map every profile source under `$HOME` through
+`CAPSULE_HOME_HOST_DIR`. Start the outer Capsule with `--private-home`; its
+default named home volume has no daemon-host path a nested run can bind.
+
+Remote runs reject relative profile volume sources. Use `~` or an absolute
+path on the remote daemon host.
+
+The repository includes an NVIDIA profile:
+
+```bash
+capsule --profile /path/to/casual-capsule/profiles/nvidia
+```
+
+#### Migrating a custom Compose file
+
+Move backend-neutral `cli` customization into `capsule.toml`:
+
+| Compose or Dockerfile setting            | Profile setting        |
+|------------------------------------------|------------------------|
+| Dockerfile after its initial `FROM`      | `[dockerfile].content` |
+| `environment`                            | `[env]`                |
+| `volumes`                                | `volume`               |
+| `ports`                                  | `publish`              |
+| `extra_hosts`                            | `host`                 |
+| NVIDIA runtime                           | `gpu = "all"`          |
+| Compose project or home-volume isolation | `namespace`            |
+
+Remove `FROM` from the old Dockerfile and place the remaining instructions in
+`[dockerfile].content`. Change local `COPY` instructions to named-context
+copies such as `COPY --from=python source/ /destination/`. Then replace
+`CAPSULE_CUSTOM_COMPOSE=/path/compose.yml` with
+`CAPSULE_PROFILES=/path/to/profile`.
+
+Keep a custom Compose file when the customization needs sidecars, custom
+networks, service dependencies, or arbitrary Compose keys. Profiles and
+`CAPSULE_CUSTOM_COMPOSE` cannot be combined in one invocation.
+
 ### Custom Capsule images
 
-If you want to extend the Docker image or Compose configuration provided by
-Capsule, you can do that by creating a custom `compose.yml` file and setting its
-path in `CAPSULE_CUSTOM_COMPOSE`.
+Legacy custom Compose overrides remain supported for Docker-only
+customization that a profile cannot express. Create a custom `compose.yml`
+file and set its path in `CAPSULE_CUSTOM_COMPOSE`.
 
 The custom `compose.yml` file must override the `cli` section.
 
@@ -815,9 +903,8 @@ With a custom compose file, `capsule build` first rebuilds the base image
 the container with `capsule` afterward.
 
 If you only want to rebuild the merged custom `cli` image, use
-`capsule build --custom` instead. This option requires
-`CAPSULE_CUSTOM_COMPOSE`. The legacy `--build` and `--build-custom` run options
-still build and start in one invocation.
+`capsule build --custom` instead. The legacy `--build` and `--build-custom`
+run options still build and start in one invocation.
 
 ### Updating your GitHub token
 
@@ -949,13 +1036,17 @@ subcommand, for example `capsule run build`.
 
 Run options:
 
-*   `-b`, `--build`: Run `docker compose build cli` before `run`.
+*   `-b`, `--build`: Build the base image and configured profile or legacy
+    custom image before `run`.
 
 *   `-p`, `--private-home`: Bind-mount `~/.capsule-home` from the Docker daemon
     host to `/home/user` in the container.
 
-*   `--build-custom`: Run `docker compose build cli` only for the merged custom
-    compose configuration before `run`. Requires `CAPSULE_CUSTOM_COMPOSE`.
+*   `--build-custom`: Build only the configured profile image or merged legacy
+    custom Compose image before `run`.
+
+*   `--profile DIR`: Apply a Capsule profile. May be passed multiple times;
+    order controls Dockerfile fragment and runtime-setting order.
 
 *   `-r HOST[:PORT]:/abs/path`, `--remote HOST[:PORT]:/abs/path`: Run
     `docker compose` against `ssh://HOST[:PORT]` and mount `/abs/path` as
@@ -985,11 +1076,13 @@ Run options:
 
 Build options:
 
-*   `--all`: Build the base image and configured custom image. This is the
-    default.
+*   `--all`: Build the base image and configured profile or legacy custom
+    Compose image. This is the default.
 
-*   `--custom`: Build only the merged custom image. Requires
-    `CAPSULE_CUSTOM_COMPOSE`.
+*   `--custom`: Build only the configured profile image or merged legacy
+    custom Compose image.
+
+*   `--profile DIR`: Apply a Capsule profile. May be passed multiple times.
 
 *   `--no-cache`: Disable the build cache.
 
@@ -1029,6 +1122,11 @@ empty value, `0`, `false`, `no`, or `off`.
     Default: empty.
 
 *   `CAPSULE_PRIVATE_HOME`: Enable `--private-home`.
+
+    Default: empty.
+
+*   `CAPSULE_PROFILES`: Semicolon-separated profile directories. Environment
+    profiles apply before command-line `--profile` options.
 
     Default: empty.
 
@@ -1118,7 +1216,8 @@ empty value, `0`, `false`, `no`, or `off`.
 
     Default: current working directory.
 
-*   `CAPSULE_CUSTOM_COMPOSE`: Optional custom compose override file.
+*   `CAPSULE_CUSTOM_COMPOSE`: Optional legacy custom Compose override file.
+    It cannot be combined with `CAPSULE_PROFILES` or `--profile`.
 
     Default: empty.
 

@@ -17,6 +17,7 @@ source "$ROOT_DIR/lib/capsule/podman.sh"
 SCRIPT_PATH="$ROOT_DIR/capsule.sh"
 EXAMPLE_PROJECT_DIR="$ROOT_DIR/tests/fixtures/example-project"
 CUSTOM_CAPSULE_DIR="$ROOT_DIR/tests/fixtures/custom-capsule"
+PROFILE_CAPSULE_DIR="$ROOT_DIR/tests/fixtures/profile-capsule"
 BUILD_DIR="$ROOT_DIR/_build/tests"
 
 mkdir -p "$BUILD_DIR"
@@ -176,6 +177,8 @@ test_podman_backend_end_to_end() {
   # shellcheck disable=SC2016
   check_cmd='read -r payload && [[ "$payload" == "capsule stdin ok" ]]'
   check_cmd+=' && printf "capsule stdin ok\n" && bash ./check-env.sh'
+  check_cmd="$check_cmd && [[ \"\${CUSTOM_CAPSULE_IMAGE:-}\" == \"1\" ]]"
+  check_cmd="$check_cmd && [[ \"\${CUSTOM_CAPSULE_PROFILE:-}\" == \"1\" ]]"
   check_cmd="$check_cmd && touch written-by-capsule"
   check_cmd="$check_cmd && capsule-docker status"
   check_cmd="$check_cmd && docker run --rm alpine:3.20 echo capsule inner ok"
@@ -185,8 +188,10 @@ test_podman_backend_end_to_end() {
   if printf 'capsule stdin ok\n' | run_logged bash -c '
     unset CAPSULE_WORKDIR
     cd "$1" &&
-      CAPSULE_CONFIG="$2" CAPSULE_RUNTIME=podman "$3" --build bash -lc "$4"
-  ' bash "$workspace" "$config_file" "$SCRIPT_PATH" "$check_cmd"; then
+      CAPSULE_CONFIG="$2" CAPSULE_RUNTIME=podman \
+      "$3" --build --profile "$4" bash -lc "$5"
+  ' bash "$workspace" "$config_file" "$SCRIPT_PATH" \
+    "$PROFILE_CAPSULE_DIR" "$check_cmd"; then
     assert_file_contains "$LOG_FILE" \
       "capsule stdin ok" \
       "the Podman-backed Capsule preserves piped stdin end to end"
@@ -201,6 +206,41 @@ test_podman_backend_end_to_end() {
     pass "the Capsule writes to its workspace as the calling user"
   else
     fail "the Capsule writes to its workspace as the calling user"
+  fi
+}
+
+# Verify profile image and runtime settings through the Docker backend.
+test_profile_end_to_end() {
+  local tdir="$TEST_TMPDIR/profile-e2e"
+  local config_file="$tdir/config"
+  local check_cmd=""
+  mkdir -p "$tdir"
+  log_message "Starting test_profile_end_to_end"
+
+  if ! require_docker_prereqs "profile e2e"; then
+    return
+  fi
+  printf '%s\n' "$EXAMPLE_PROJECT_DIR" >"$config_file"
+  # shellcheck disable=SC2016
+  check_cmd='bash ./check-env.sh'
+  check_cmd="$check_cmd && [[ \"\${CUSTOM_CAPSULE_IMAGE:-}\" == \"1\" ]]"
+  check_cmd="$check_cmd && [[ \"\${CUSTOM_CAPSULE_PROFILE:-}\" == \"1\" ]]"
+  check_cmd="$check_cmd && printf \"profile capsule ok\\n\""
+
+  log_message "Running capsule.sh --build-custom with --profile"
+  # shellcheck disable=SC2016
+  if run_logged bash -c '
+    unset CAPSULE_WORKDIR
+    cd "$1" &&
+      CAPSULE_CONFIG="$2" CAPSULE_RUNTIME=docker \
+      "$3" --build-custom --profile "$4" bash -lc "$5"
+  ' bash "$EXAMPLE_PROJECT_DIR" "$config_file" "$SCRIPT_PATH" \
+    "$PROFILE_CAPSULE_DIR" "$check_cmd"; then
+    assert_file_contains "$LOG_FILE" \
+      "profile capsule ok" \
+      "profiles build and run end to end through Docker"
+  else
+    fail "profiles build and run end to end through Docker"
   fi
 }
 
@@ -316,6 +356,7 @@ main() {
   test_example_project_end_to_end
   test_custom_compose_end_to_end
   test_custom_compose_build_custom_end_to_end
+  test_profile_end_to_end
   test_podman_backend_end_to_end
 
   log_message \

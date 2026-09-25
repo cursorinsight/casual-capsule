@@ -1,0 +1,10 @@
+version = 1
+name = "test-profile"
+
+[env]
+CUSTOM_CAPSULE_PROFILE = "1"
+
+[dockerfile]
+content = '''
+ENV CUSTOM_CAPSULE_IMAGE=1
+'''

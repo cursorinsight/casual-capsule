@@ -15,6 +15,7 @@ ROOT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
 SCRIPT_PATH="$ROOT_DIR/capsule.sh"
 CAPSULE_BIN="$ROOT_DIR/bin/capsule"
 CORE_PATH="$ROOT_DIR/lib/capsule/common.sh"
+PROFILE_CORE_PATH="$ROOT_DIR/lib/capsule/profile.sh"
 CHECK_ALL_PATH="$ROOT_DIR/tests/check_all.sh"
 DOCTOR_PATH="$ROOT_DIR/libexec/capsule/doctor"
 CI_PATH="$ROOT_DIR/.github/workflows/ci.yml"
@@ -26,19 +27,24 @@ ENTRYPOINT_PATH="$ROOT_DIR/docker/entrypoint.sh"
 ROUTER_PATH="$ROOT_DIR/docker/capsule-docker.sh"
 STORAGE_CONF_PATH="$ROOT_DIR/docker/storage.conf"
 EXAMPLE_PROJECT_DIR="$ROOT_DIR/tests/fixtures/example-project"
+PROFILE_CAPSULE_DIR="$ROOT_DIR/tests/fixtures/profile-capsule"
 
 unset CAPSULE_CUSTOM_COMPOSE
 unset CAPSULE_BUILD
 unset CAPSULE_BUILD_CUSTOM
+unset CAPSULE_COMPOSE_PROJECT_NAME
 unset CAPSULE_EXTRA_APPROVALS
 unset CAPSULE_GID
 unset CAPSULE_HOME_HOST_DIR
+unset CAPSULE_HOME_VOLUME
 unset CAPSULE_HOST_PATH_MAP
 unset CAPSULE_HOST_DOCKER
 unset CAPSULE_HOST_WORKDIR
+unset CAPSULE_IMAGE
 unset CAPSULE_PUBLISH
 unset CAPSULE_NO_CACHE
 unset CAPSULE_PRIVATE_HOME
+unset CAPSULE_PROFILES
 unset CAPSULE_REMOTE
 unset CAPSULE_RUNTIME
 unset CAPSULE_UID
@@ -156,6 +162,15 @@ if [[ "${1:-}" == "inspect" ]]; then
 fi
 
 if [[ "${1:-}" == "compose" ]]; then
+  previous=""
+  profile_env_file=""
+  for argument in "$@"; do
+    if [[ "$previous" == "--env-from-file" ]]; then
+      profile_env_file="$argument"
+      break
+    fi
+    previous="$argument"
+  done
   {
     printf 'ENV_DOCKER_GID=%s\n' "${DOCKER_GID:-}"
     printf 'ENV_DOCKER_HOST=%s\n' "${DOCKER_HOST:-}"
@@ -164,10 +179,41 @@ if [[ "${1:-}" == "compose" ]]; then
     printf 'ENV_CAPSULE_WORKDIR=%s\n' "${CAPSULE_WORKDIR:-}"
     printf 'ENV_CAPSULE_HOST_WORKDIR=%s\n' "${CAPSULE_HOST_WORKDIR:-}"
     printf 'ENV_CAPSULE_CUSTOM_DIR=%s\n' "${CAPSULE_CUSTOM_DIR:-}"
+    printf 'ENV_CAPSULE_COMPOSE_PROJECT_NAME=%s\n' \
+      "${CAPSULE_COMPOSE_PROJECT_NAME:-}"
     printf 'ENV_CAPSULE_UID=%s\n' "${CAPSULE_UID:-}"
     printf 'ENV_CAPSULE_GID=%s\n' "${CAPSULE_GID:-}"
     printf 'ARGS=%s\n' "$*"
+    if [[ -n "$profile_env_file" ]]; then
+      if ! permissions="$(/usr/bin/stat -c '%a' \
+        "$profile_env_file" 2>/dev/null)"; then
+        permissions="$(/usr/bin/stat -f '%Lp' "$profile_env_file")"
+      fi
+      printf 'PROFILE_ENV_FILE=%s\n' "$profile_env_file"
+      printf 'PROFILE_ENV_PERMISSIONS=%s\n' "$permissions"
+      while IFS= read -r entry; do
+        printf 'PROFILE_ENV_ENTRY=%s\n' "$entry"
+      done <"$profile_env_file"
+    fi
   } >>"${MOCK_LOG:?MOCK_LOG is required}"
+  if [[ -n "${MOCK_DOCKER_STDIN_FILE:-}" ]] && \
+    [[ " $* " == *" run --rm "* ]]; then
+    cat >"$MOCK_DOCKER_STDIN_FILE"
+  fi
+  if [[ -n "${MOCK_COMPOSE_READY_FILE:-}" ]] && \
+    [[ " $* " == *" run --rm "* ]]; then
+    printf '%s\n' "$$" >"$MOCK_COMPOSE_READY_FILE"
+    trap 'printf "INT\n" >>"$MOCK_COMPOSE_SIGNAL_LOG"; exit 130' INT
+    trap 'printf "TERM\n" >>"$MOCK_COMPOSE_SIGNAL_LOG"; exit 143' TERM
+    while true; do
+      sleep 1
+    done
+  fi
+  exit 0
+fi
+
+if [[ "${1:-}" == "build" ]]; then
+  printf 'DOCKER_ARGS=%s\n' "$*" >>"${MOCK_LOG:?MOCK_LOG is required}"
   exit 0
 fi
 
@@ -264,6 +310,28 @@ if [[ "${1:-}" == "image" ]] && [[ "${2:-}" == "exists" ]]; then
 fi
 
 printf 'PODMAN_ARGS=%s\n' "$*" >>"${MOCK_LOG:?MOCK_LOG is required}"
+previous=""
+profile_env_file=""
+for argument in "$@"; do
+  if [[ "$previous" == "--env-file" ]]; then
+    profile_env_file="$argument"
+    break
+  fi
+  previous="$argument"
+done
+if [[ -n "$profile_env_file" ]]; then
+  if ! permissions="$(/usr/bin/stat -c '%a' \
+    "$profile_env_file" 2>/dev/null)"; then
+    permissions="$(/usr/bin/stat -f '%Lp' "$profile_env_file")"
+  fi
+  {
+    printf 'PROFILE_ENV_FILE=%s\n' "$profile_env_file"
+    printf 'PROFILE_ENV_PERMISSIONS=%s\n' "$permissions"
+    while IFS= read -r entry; do
+      printf 'PROFILE_ENV_ENTRY=%s\n' "$entry"
+    done <"$profile_env_file"
+  } >>"${MOCK_LOG:?MOCK_LOG is required}"
+fi
 if [[ "${1:-}" == "run" && -n "${MOCK_PODMAN_STDIN_FILE:-}" ]]; then
   cat >"$MOCK_PODMAN_STDIN_FILE"
 fi
@@ -281,6 +349,9 @@ EOF
 
   cat >"$dir/curl" <<'EOF'
 #!/usr/bin/env bash
+if [[ -n "${MOCK_CURL_FAIL:-}" ]]; then
+  exit 1
+fi
 printf '2024.1.0\n'
 EOF
 
@@ -307,11 +378,36 @@ run_capsule() {
     CAPSULE_PUBLISH="${CAPSULE_PUBLISH-}" \
     CAPSULE_NO_CACHE="${CAPSULE_NO_CACHE-}" \
     CAPSULE_PRIVATE_HOME="${CAPSULE_PRIVATE_HOME-}" \
+    CAPSULE_PROFILES="${CAPSULE_PROFILES-}" \
     CAPSULE_REMOTE="${CAPSULE_REMOTE-}" \
     CAPSULE_VOLUME="${CAPSULE_VOLUME-}" \
     DOCKER_HOST="${DOCKER_HOST-}" \
     CAPSULE_RUNTIME="${CAPSULE_RUNTIME-docker}" \
     "$SCRIPT_PATH" "$@"
+}
+
+run_signal_capsule() {
+  local mock_bin="$1"
+  local log_file="$2"
+  local ready_file="$3"
+  local signal_file="$4"
+  local config_file="$5"
+  local profile_dir="${6:-}"
+
+  trap - INT TERM
+  export PATH="$mock_bin:$PATH"
+  export MOCK_LOG="$log_file"
+  export MOCK_COMPOSE_READY_FILE="$ready_file"
+  export MOCK_COMPOSE_SIGNAL_LOG="$signal_file"
+  export CAPSULE_CONFIG="$config_file"
+  export CAPSULE_RUNTIME=docker
+  export DOCKER_GID=1111
+  if [[ -n "$profile_dir" ]]; then
+    export CAPSULE_PROFILES="$profile_dir"
+  else
+    unset CAPSULE_PROFILES
+  fi
+  exec "$SCRIPT_PATH" true
 }
 
 value_from_log() {
@@ -325,6 +421,28 @@ entry_from_log() {
   local index="$2"
   local log_file="$3"
   grep -F "$key=" "$log_file" | sed -n "${index}p"
+}
+
+profile_path_token() {
+  local checksum=""
+
+  checksum="$(printf '%s\n' "$@" | cksum | cut -d' ' -f1)"
+  printf '%08x\n' "$checksum"
+}
+
+profile_generated_file() {
+  local token="$1"
+  local name="$2"
+  local candidate=""
+  local found=""
+
+  for candidate in "$ROOT_DIR/_build/profiles/$token"/*/"$name"; do
+    [[ -f "$candidate" ]] || continue
+    [[ -z "$found" ]] || return 1
+    found="$candidate"
+  done
+  [[ -n "$found" ]] || return 1
+  printf '%s\n' "$found"
 }
 
 test_command_layout() {
@@ -373,17 +491,29 @@ test_completion_subcommand() {
   local err_file="$tdir/err"
   local shell=""
   local marker=""
+  local profile_marker=""
   mkdir -p "$tdir"
 
   for shell in bash zsh fish; do
     case "$shell" in
-      bash) marker='complete -o bashdefault' ;;
-      zsh) marker='#compdef capsule' ;;
-      fish) marker='complete -c capsule' ;;
+      bash)
+        marker='complete -o bashdefault'
+        profile_marker='--profile'
+        ;;
+      zsh)
+        marker='#compdef capsule'
+        profile_marker='*--profile'
+        ;;
+      fish)
+        marker='complete -c capsule'
+        profile_marker='-l profile'
+        ;;
     esac
     "$CAPSULE_BIN" completion "$shell" >"$output_file"
     assert_file_contains "$output_file" "$marker" \
       "completion generates $shell definitions"
+    assert_file_contains "$output_file" "$profile_marker" \
+      "$shell completion offers Capsule profiles"
     if [[ "$shell" == "bash" ]]; then
       if bash -n "$output_file"; then
         pass "generated Bash completion has valid syntax"
@@ -1122,6 +1252,10 @@ make_doctor_bin() {
 
   cat >"$dir/docker" <<'EOF'
 #!/usr/bin/env bash
+if [[ "$*" == "compose run --help" ]] && \
+  [[ "${MOCK_COMPOSE_ENV_FROM_FILE:-1}" -ne 0 ]]; then
+  printf '      --env-from-file stringArray\n'
+fi
 exit 0
 EOF
 
@@ -1177,6 +1311,9 @@ test_doctor_reports_each_backend_and_probes_by_running() {
     'Docker backend' \
     "the doctor reports on the Docker backend"
   assert_file_contains "$out_file" \
+    'docker compose supports profile environment files' \
+    "the doctor probes the required Compose run option"
+  assert_file_contains "$out_file" \
     'podman backend' \
     "the doctor reports on the podman backend"
   assert_file_contains "$out_file" \
@@ -1198,6 +1335,15 @@ test_doctor_reports_each_backend_and_probes_by_running() {
     "the doctor leaves redirected output uncolored"
   assert_file_contains "$DOCTOR_PATH" "-z \"\${NO_COLOR:-}\"" \
     "the doctor honors NO_COLOR before coloring output"
+
+  MOCK_COMPOSE_ENV_FROM_FILE=0 PATH="$bin_dir" \
+    "$DOCTOR_PATH" >"$out_file" 2>&1 || true
+  assert_file_contains "$out_file" \
+    'docker compose lacks run --env-from-file' \
+    "the doctor rejects Compose without profile environment support"
+  assert_file_contains "$out_file" \
+    'upgrade Docker Compose to 2.34.0 or newer' \
+    "the doctor reports the minimum supported Compose version"
 }
 
 # The remedy has to fit the cause: a session bus that systemd is not on is a
@@ -1317,7 +1463,7 @@ test_build_flag_without_runtime_args() {
     "build flag works without runtime args (run call)"
 }
 
-# Verify --build-custom fails early without CAPSULE_CUSTOM_COMPOSE.
+# Verify --build-custom fails early without a profile or custom Compose.
 test_build_custom_flag_requires_custom_compose() {
   local tdir="$TEST_TMPDIR/build-custom-missing-config"
   local mock_bin="$tdir/bin"
@@ -1328,13 +1474,13 @@ test_build_custom_flag_requires_custom_compose() {
 
   if DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" \
     --build-custom true 2>"$err_file"; then
-    fail "build-custom flag requires a custom compose"
+    fail "build-custom flag requires custom configuration"
   else
-    pass "build-custom flag requires a custom compose"
+    pass "build-custom flag requires custom configuration"
   fi
   assert_file_contains "$err_file" \
-    "--build-custom requires CAPSULE_CUSTOM_COMPOSE" \
-    "build-custom flag reports a clear missing compose error"
+    "--build-custom requires a profile or CAPSULE_CUSTOM_COMPOSE" \
+    "build-custom flag reports a clear missing configuration error"
 }
 
 # Verify --build and --build-custom cannot be combined.
@@ -2215,14 +2361,31 @@ test_debug_mode_enables_xtrace() {
 }
 
 test_debug_mode_redacts_github_token() {
+  local forwarded_token='capsule-synthetic-forwarded-token'
+  local profile_dir=""
   local runtime=""
   local token='capsule-synthetic-debug-token'
   setup_mock_case debug-token
-  mkdir -p "$CASE_DIR/home"
+  profile_dir="$CASE_DIR/profile"
+  mkdir -p "$CASE_DIR/home" "$profile_dir"
+
+  cat >"$profile_dir/capsule.toml" <<'EOF'
+version = 1
+name = "debug-token"
+
+[env]
+FORWARDED_TOKEN = "${PROFILE_SOURCE_TOKEN}"
+
+[dockerfile]
+content = '''
+ENV DEBUG_TOKEN_PROFILE=1
+'''
+EOF
 
   for runtime in docker podman; do
     CAPSULE_DEBUG=1 CAPSULE_RUNTIME="$runtime" GITHUB_API_TOKEN="$token" \
-      HOME="$CASE_DIR/home" \
+      CAPSULE_PROFILES="$profile_dir" HOME="$CASE_DIR/home" \
+      PROFILE_SOURCE_TOKEN="$forwarded_token" \
       run_capsule "$CASE_BIN" "$CASE_DIR/$runtime-log" --build true \
       >"$CASE_DIR/$runtime-out" 2>"$CASE_DIR/$runtime-err"
     assert_file_not_contains "$CASE_DIR/$runtime-err" "$token" \
@@ -2231,11 +2394,32 @@ test_debug_mode_redacts_github_token() {
       "$runtime output never exposes the GitHub token"
     assert_file_not_contains "$CASE_DIR/$runtime-log" "$token" \
       "$runtime invocations never contain the GitHub token"
+    assert_file_not_contains "$CASE_DIR/$runtime-err" "$forwarded_token" \
+      "$runtime debug trace never exposes a forwarded token"
+    assert_file_not_contains "$CASE_DIR/$runtime-out" "$forwarded_token" \
+      "$runtime output never exposes a forwarded token"
+    assert_file_contains "$CASE_DIR/$runtime-log" "$forwarded_token" \
+      "$runtime profile environment receives the forwarded token"
     assert_file_contains "$CASE_DIR/$runtime-err" '+ set -euo pipefail' \
       "$runtime debugging remains enabled with a token"
+    assert_file_contains "$CASE_DIR/$runtime-err" \
+      '+ cleanup_runtime_state' \
+      "$runtime tracing resumes after writing the profile environment"
+    assert_file_contains "$CASE_DIR/$runtime-log" \
+      '--secret id=github_api_token,env=GITHUB_API_TOKEN' \
+      "$runtime profile build receives the protected token"
   done
   assert_file_contains "$CASE_DIR/podman-err" '+ cleanup_podman_state' \
     "Podman restores parent tracing after writing its secret"
+}
+
+test_token_presence_checks_do_not_expand_values() {
+  if grep -Eq '\$\{[A-Z_][A-Z0-9_]*TOKEN:-' \
+    "$CORE_PATH" "$PROFILE_CORE_PATH"; then
+    fail "xtrace-enabled token checks avoid value expansion"
+  else
+    pass "xtrace-enabled token checks avoid value expansion"
+  fi
 }
 
 test_uid_gid_autodetect() {
@@ -2569,6 +2753,953 @@ test_default_gid_when_detection_fails() {
     MOCK_STAT_FAIL=1 run_capsule "$mock_bin" "$log_file" true
   assert_equals "991" "$(value_from_log ENV_DOCKER_GID "$log_file")" \
     "macOS default DOCKER_GID is 991 when detection fails"
+}
+
+test_profile_runtime_settings() {
+  local tdir="$TEST_TMPDIR/profile-runtime"
+  local profile_dir="$tdir/profile"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local err_file="$tdir/err"
+  local override_file=""
+  local profile_env_file=""
+  mkdir -p "$profile_dir/data"
+  make_mock_bin "$mock_bin"
+
+  cat >"$profile_dir/capsule.toml" <<'EOF'
+version = 1
+name = "runtime-test"
+namespace = "runtime"
+volume = [
+  "./data:/profile-data:ro",
+]
+publish = ["8080:80"]
+host = ["example.internal=192.0.2.10"]
+
+[env]
+SAME_VALUE = "${SAME_VALUE}"
+RENAMED_VALUE = "${SOURCE_VALUE}"
+COMPLEX_VALUE = "${SOURCE_COMPLEX_VALUE}"
+TRAILING_VALUE = "${SOURCE_TRAILING_VALUE}"
+FIXED_VALUE = "enabled"
+DOCKER_HOST = "container-only"
+UNSET_VALUE = "${MISSING_VALUE}"
+LITERAL_VALUE = "$${SOURCE_VALUE}"
+EOF
+
+  (
+    export SAME_VALUE="same"
+    export SOURCE_VALUE="renamed"
+    export SOURCE_COMPLEX_VALUE="^\\d+\$ and it's"
+    export SOURCE_TRAILING_VALUE=$'line\n'
+    CAPSULE_PROFILES="$profile_dir" DOCKER_GID=1111 \
+      run_capsule "$mock_bin" "$log_file" --build true
+  )
+  override_file="$(
+    profile_generated_file \
+      "$(profile_path_token "$profile_dir")" compose.yml
+  )"
+
+  assert_file_not_contains "$log_file" '--env SAME_VALUE=same' \
+    "profile keeps forwarded values out of Docker arguments"
+  assert_file_contains "$log_file" "PROFILE_ENV_ENTRY=SAME_VALUE='same'" \
+    "profile forwards an environment variable under the same name"
+  assert_file_contains "$log_file" \
+    "PROFILE_ENV_ENTRY=RENAMED_VALUE='renamed'" \
+    "profile forwards an environment variable under a new name"
+  assert_file_contains "$log_file" \
+    "PROFILE_ENV_ENTRY=COMPLEX_VALUE='^\\d+\$ and it\\'s'" \
+    "Docker environment preserves backslashes and apostrophes"
+  if grep -Fxq "PROFILE_ENV_ENTRY='" "$log_file"; then
+    pass "Docker environment preserves a trailing newline"
+  else
+    fail "Docker environment loses a trailing newline"
+  fi
+  assert_file_contains "$log_file" \
+    "PROFILE_ENV_ENTRY=FIXED_VALUE='enabled'" \
+    "profile sets a literal environment value"
+  assert_file_not_contains "$log_file" 'PROFILE_ENV_ENTRY=UNSET_VALUE=' \
+    "profile leaves an unset referenced environment variable unset"
+  # The marker is intentionally literal.
+  # shellcheck disable=SC2016
+  assert_file_contains "$log_file" \
+    "PROFILE_ENV_ENTRY=LITERAL_VALUE='\${SOURCE_VALUE}'" \
+    "profile escapes a literal interpolation marker"
+  assert_file_contains "$log_file" '--env-from-file ' \
+    "Docker reads profile environment from a private file"
+  assert_file_contains "$log_file" \
+    "PROFILE_ENV_ENTRY=DOCKER_HOST='container-only'" \
+    "profile environment can use a Docker client variable name"
+  assert_file_contains "$log_file" 'ENV_DOCKER_HOST=' \
+    "profile environment does not alter the Docker client"
+  assert_file_contains "$log_file" 'PROFILE_ENV_PERMISSIONS=600' \
+    "profile environment file is owner-readable only"
+  profile_env_file="$(value_from_log PROFILE_ENV_FILE "$log_file")"
+  if [[ -n "$profile_env_file" && ! -e "$profile_env_file" ]]; then
+    pass "profile environment file is removed after Docker exits"
+  else
+    fail "profile environment file remains after Docker exits"
+  fi
+  assert_file_contains "$log_file" '--publish 8080:80' \
+    "profile forwards published ports"
+  assert_file_not_contains "$log_file" '--add-host' \
+    "Docker profile avoids unsupported host mapping flags"
+  assert_file_contains "$log_file" \
+    "--volume $profile_dir/data:/profile-data:ro" \
+    "profile resolves relative volumes against its directory"
+  assert_file_not_contains "$log_file" '-profile-' \
+    "runtime-only profile does not replace the Capsule image"
+  assert_file_contains "$log_file" \
+    'ENV_CAPSULE_COMPOSE_PROJECT_NAME=casual-capsule-runtime' \
+    "profile namespace isolates the Docker Compose project"
+  assert_file_contains "$log_file" \
+    'ARGS=compose --project-name casual-capsule -f' \
+    "profile namespace builds the stable Docker base project"
+  assert_file_contains "$log_file" \
+    "ARGS=compose --project-name casual-capsule-runtime -f" \
+    "profile namespace uses the namespaced runtime project"
+  assert_file_contains "$override_file" \
+    'image: casual-capsule-cli:latest' \
+    "profile namespace keeps the Docker base image stable"
+  assert_file_contains "$override_file" 'extra_hosts:' \
+    "Docker profile declares static host mappings in Compose"
+  assert_file_contains "$override_file" \
+    "- 'example.internal=192.0.2.10'" \
+    "Docker profile writes its static host mapping"
+
+  GITHUB_API_TOKEN=token-value CAPSULE_PROFILES="$profile_dir" \
+    DOCKER_GID=1111 run_capsule "$mock_bin" "$tdir/token-log" --build true
+  assert_file_contains "$tdir/token-log" \
+    "--project-name casual-capsule -f $COMPOSE_PATH -f $TOKEN_COMPOSE_PATH" \
+    "profile base build retains the supplied token override"
+  assert_file_contains "$tdir/token-log" \
+    "-f $TOKEN_COMPOSE_PATH -f $override_file run --rm" \
+    "profile runtime retains the supplied token override"
+
+  if SOURCE_TRAILING_VALUE=$'line\n' CAPSULE_PROFILES="$profile_dir" \
+    CAPSULE_RUNTIME=podman run_capsule "$mock_bin" "$log_file" true \
+    2>"$err_file"; then
+    fail "Podman accepts a forwarded environment newline"
+  else
+    pass "Podman rejects a forwarded environment newline"
+  fi
+  assert_file_contains "$err_file" \
+    'profile environment value contains a newline: TRAILING_VALUE' \
+    "Podman reports the forwarded environment newline"
+}
+
+test_profile_honors_compose_project_name() {
+  local tdir="$TEST_TMPDIR/profile-compose-project"
+  local profile_dir="$tdir/profile"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local override_file=""
+  mkdir -p "$profile_dir"
+  make_mock_bin "$mock_bin"
+
+  cat >"$profile_dir/capsule.toml" <<'EOF'
+version = 1
+name = "compose-project"
+namespace = "runtime"
+
+[dockerfile]
+content = '''
+ENV COMPOSE_PROJECT_PROFILE=1
+'''
+EOF
+
+  COMPOSE_PROJECT_NAME=inherited-project \
+    CAPSULE_COMPOSE_PROJECT_NAME=ignored-project \
+    DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" \
+    --build --profile "$profile_dir" true
+  override_file="$(
+    profile_generated_file \
+      "$(profile_path_token "$profile_dir")" compose.yml
+  )"
+
+  assert_file_contains "$log_file" \
+    'ARGS=compose --project-name inherited-project -f' \
+    "Compose project environment selects the profile base project"
+  assert_file_contains "$log_file" \
+    '--build-arg CAPSULE_BASE_IMAGE=inherited-project-cli:latest' \
+    "profile build extends the effective Compose base image"
+  assert_file_contains "$override_file" \
+    'image: inherited-project-runtime-profile-compose-project-' \
+    "profile image uses the effective namespaced project"
+  assert_file_contains "$log_file" \
+    'ARGS=compose --project-name inherited-project-runtime -f' \
+    "profile runtime pins the effective namespaced project"
+}
+
+test_docker_profile_preserves_piped_stdin() {
+  local tdir="$TEST_TMPDIR/docker-profile-stdin"
+  local profile_dir="$tdir/profile"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  mkdir -p "$profile_dir"
+  make_mock_bin "$mock_bin"
+
+  cat >"$profile_dir/capsule.toml" <<'EOF'
+version = 1
+name = "stdin-test"
+
+[env]
+STDIN_TEST = "enabled"
+EOF
+
+  printf 'capsule piped payload\n' |
+    MOCK_DOCKER_STDIN_FILE="$tdir/stdin" DOCKER_GID=1111 \
+      run_capsule "$mock_bin" "$log_file" \
+      --profile "$profile_dir" cat
+
+  assert_file_contains "$tdir/stdin" 'capsule piped payload' \
+    "Docker profile preserves piped stdin"
+}
+
+test_docker_runtime_forwards_signals() {
+  local tdir="$TEST_TMPDIR/docker-signals"
+  local mock_bin="$tdir/bin"
+  local profile_dir="$tdir/profile"
+  local config_file="$tdir/config"
+  local launcher_pid=""
+  local runtime_pid=""
+  local profile_env_file=""
+  local exit_code=0
+  local attempt=0
+  local signal=""
+  local expected_status=0
+  mkdir -p "$profile_dir"
+  make_mock_bin "$mock_bin"
+  printf '%s\n' "$(pwd -P)" >"$config_file"
+
+  run_signal_capsule \
+    "$mock_bin" \
+    "$tdir/direct-log" \
+    "$tdir/direct-ready" \
+    "$tdir/direct-signal" \
+    "$config_file" &
+  launcher_pid=$!
+  for ((attempt = 0; attempt < 50; attempt++)); do
+    [[ -s "$tdir/direct-ready" ]] && break
+    sleep 0.1
+  done
+  if [[ -s "$tdir/direct-ready" ]]; then
+    pass "Docker runtime starts for direct signal delivery"
+  else
+    fail "Docker runtime starts for direct signal delivery"
+    kill -TERM "$launcher_pid" 2>/dev/null || true
+    wait "$launcher_pid" 2>/dev/null || true
+    return
+  fi
+  runtime_pid="$(cat "$tdir/direct-ready")"
+  assert_equals "$launcher_pid" "$runtime_pid" \
+    "Docker runtime replaces the launcher when cleanup is unnecessary"
+  kill -TERM "$launcher_pid"
+  if wait "$launcher_pid"; then
+    exit_code=0
+  else
+    exit_code=$?
+  fi
+  assert_equals 143 "$exit_code" \
+    "direct Docker runtime returns its termination status"
+  assert_file_contains "$tdir/direct-signal" TERM \
+    "direct Docker runtime receives the launcher's termination signal"
+
+  cat >"$profile_dir/capsule.toml" <<'EOF'
+version = 1
+name = "signal-test"
+
+[env]
+SIGNAL_TEST = "enabled"
+EOF
+
+  for signal in INT TERM; do
+    case "$signal" in
+      INT) expected_status=130 ;;
+      TERM) expected_status=143 ;;
+    esac
+    run_signal_capsule \
+      "$mock_bin" \
+      "$tdir/$signal-log" \
+      "$tdir/$signal-ready" \
+      "$tdir/$signal-received" \
+      "$config_file" \
+      "$profile_dir" &
+    launcher_pid=$!
+    for ((attempt = 0; attempt < 50; attempt++)); do
+      [[ -s "$tdir/$signal-ready" ]] && break
+      sleep 0.1
+    done
+    if [[ -s "$tdir/$signal-ready" ]]; then
+      pass "supervised Docker runtime starts for $signal forwarding"
+    else
+      fail "supervised Docker runtime starts for $signal forwarding"
+      kill -TERM "$launcher_pid" 2>/dev/null || true
+      wait "$launcher_pid" 2>/dev/null || true
+      continue
+    fi
+    runtime_pid="$(cat "$tdir/$signal-ready")"
+    if [[ "$launcher_pid" != "$runtime_pid" ]]; then
+      pass "profile environment keeps a supervising launcher for $signal"
+    else
+      fail "profile environment keeps a supervising launcher for $signal"
+    fi
+    kill -"$signal" "$launcher_pid"
+    if wait "$launcher_pid"; then
+      exit_code=0
+    else
+      exit_code=$?
+    fi
+    assert_equals "$expected_status" "$exit_code" \
+      "supervised Docker runtime returns the $signal status"
+    assert_file_contains "$tdir/$signal-received" "$signal" \
+      "supervised Docker runtime forwards $signal"
+    profile_env_file="$(
+      value_from_log PROFILE_ENV_FILE "$tdir/$signal-log"
+    )"
+    if [[ -n "$profile_env_file" && ! -e "$profile_env_file" ]]; then
+      pass "supervised Docker runtime cleans its file after $signal"
+    else
+      fail "supervised Docker runtime cleans its file after $signal"
+    fi
+  done
+}
+
+test_profile_volumes_use_host_path_map() {
+  local tdir="$TEST_TMPDIR/profile-path-map"
+  local profile_dir="$tdir/profile"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  mkdir -p "$profile_dir"
+  make_mock_bin "$mock_bin"
+
+  cat >"$profile_dir/capsule.toml" <<'EOF'
+version = 1
+name = "mapped-volume"
+volume = [".:/profile"]
+EOF
+
+  CAPSULE_HOST_PATH_MAP="$profile_dir=/daemon/profile" \
+    DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" \
+    --profile "$profile_dir" true
+
+  assert_file_contains "$log_file" \
+    '--volume /daemon/profile:/profile' \
+    "profile volumes use CAPSULE_HOST_PATH_MAP"
+}
+
+test_nested_profile_home_volumes_use_host_visible_home() {
+  local tdir="$TEST_TMPDIR/profile-nested-home"
+  local home_dir="$tdir/home"
+  local profile_dir="$home_dir/profile"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  mkdir -p "$profile_dir"
+  make_mock_bin "$mock_bin"
+
+  cat >"$profile_dir/capsule.toml" <<EOF
+version = 1
+name = "nested-home"
+volume = [
+  "~:/profile-home",
+  "~/.cache:/profile-cache",
+  "$home_dir/absolute:/profile-absolute",
+  "./relative:/profile-relative",
+]
+EOF
+
+  HOME="$home_dir" DOCKER_GID=1111 \
+    CAPSULE_WORKDIR="/home/workspace/project" \
+    CAPSULE_HOST_WORKDIR="/host/workspace" \
+    CAPSULE_HOME_HOST_DIR="/host/home/alice" \
+    run_capsule "$mock_bin" "$log_file" \
+    --profile "$profile_dir" true
+
+  assert_file_contains "$log_file" \
+    '--volume /host/home/alice:/profile-home' \
+    "nested profile maps its home directory to the daemon host"
+  assert_file_contains "$log_file" \
+    '--volume /host/home/alice/.cache:/profile-cache' \
+    "nested profile maps a tilde path to the daemon host"
+  assert_file_contains "$log_file" \
+    '--volume /host/home/alice/absolute:/profile-absolute' \
+    "nested profile maps an absolute home path to the daemon host"
+  assert_file_contains "$log_file" \
+    '--volume /host/home/alice/profile/relative:/profile-relative' \
+    "nested profile maps a relative home path to the daemon host"
+}
+
+test_nested_profile_home_volume_requires_host_visible_home() {
+  local tdir="$TEST_TMPDIR/profile-nested-named-home"
+  local home_dir="$tdir/home"
+  local profile_dir="$tdir/profile"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local err_file="$tdir/err"
+  mkdir -p "$home_dir" "$profile_dir"
+  make_mock_bin "$mock_bin"
+
+  cat >"$profile_dir/capsule.toml" <<'EOF'
+version = 1
+name = "nested-named-home"
+volume = ["~/.cache:/profile-cache"]
+EOF
+
+  if HOME="$home_dir" DOCKER_GID=1111 \
+    CAPSULE_WORKDIR="/home/workspace/project" \
+    CAPSULE_HOST_WORKDIR="/host/workspace" \
+    run_capsule "$mock_bin" "$log_file" \
+    --profile "$profile_dir" true 2>"$err_file"; then
+    fail "nested profile rejects an unmappable named-volume home"
+  else
+    pass "nested profile rejects an unmappable named-volume home"
+  fi
+  assert_file_contains "$err_file" \
+    'inside Capsule requires CAPSULE_HOME_HOST_DIR' \
+    "nested profile reports how to expose its home to the daemon"
+}
+
+test_profile_home_volume_uses_remote_home() {
+  local tdir="$TEST_TMPDIR/profile-remote-home"
+  local profile_dir="$tdir/profile"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  mkdir -p "$profile_dir"
+  make_mock_bin "$mock_bin"
+
+  cat >"$profile_dir/capsule.toml" <<'EOF'
+version = 1
+name = "remote-home"
+volume = ["~/.cache/example:/cache"]
+EOF
+
+  CAPSULE_EXTRA_APPROVALS='ssh://builder/srv/project' \
+    MOCK_SSH_OUTPUT=/home/remote DOCKER_GID=1111 \
+    run_capsule "$mock_bin" "$log_file" \
+    --remote builder:/srv/project --profile "$profile_dir" true
+
+  assert_file_contains "$log_file" \
+    '--volume /home/remote/.cache/example:/cache' \
+    "profile home volumes resolve on a remote Docker host"
+}
+
+test_profile_home_volume_rejects_missing_remote_home() {
+  local tdir="$TEST_TMPDIR/profile-missing-remote-home"
+  local profile_dir="$tdir/profile"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local err_file="$tdir/err"
+  mkdir -p "$profile_dir"
+  make_mock_bin "$mock_bin"
+
+  cat >"$profile_dir/capsule.toml" <<'EOF'
+version = 1
+name = "remote-home"
+volume = ["~/.cache/example:/cache"]
+EOF
+
+  if CAPSULE_EXTRA_APPROVALS='ssh://builder/srv/project' \
+    MOCK_SSH_OUTPUT='' DOCKER_GID=1111 \
+    run_capsule "$mock_bin" "$log_file" \
+    --remote builder:/srv/project --profile "$profile_dir" true \
+    2>"$err_file"; then
+    fail "profile home volumes reject a missing remote home"
+  else
+    pass "profile home volumes reject a missing remote home"
+  fi
+  assert_file_contains "$err_file" \
+    'failed to resolve remote home for profile volume' \
+    "missing remote home reports a clear error"
+}
+
+test_remote_profile_volume_source_rules() {
+  local tdir="$TEST_TMPDIR/profile-remote-volume-source"
+  local profile_dir="$tdir/profile"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local err_file="$tdir/err"
+  local local_source="$tdir/local-link/cache"
+  mkdir -p "$profile_dir"
+  make_mock_bin "$mock_bin"
+
+  cat >"$profile_dir/capsule.toml" <<'EOF'
+version = 1
+name = "remote-volume"
+volume = ["./cache:/cache"]
+EOF
+
+  if CAPSULE_EXTRA_APPROVALS='ssh://builder/srv/project' \
+    DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" \
+    --remote builder:/srv/project --profile "$profile_dir" true \
+    2>"$err_file"; then
+    fail "remote profiles reject relative volume sources"
+  else
+    pass "remote profiles reject relative volume sources"
+  fi
+  assert_file_contains "$err_file" \
+    'relative profile volume source is unsupported with --remote: ./cache' \
+    "relative remote profile volume reports a clear error"
+
+  : >"$log_file"
+  if DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" \
+    build --remote builder --profile "$profile_dir" 2>"$err_file"; then
+    pass "remote profile builds ignore relative runtime volumes"
+  else
+    fail "remote profile builds ignore relative runtime volumes"
+  fi
+  assert_file_not_contains "$log_file" ' run --rm ' \
+    "remote profile builds do not start a container"
+
+  cat >"$profile_dir/capsule.toml" <<'EOF'
+version = 1
+name = "remote-volume"
+volume = ["/srv/cache:/cache"]
+EOF
+
+  CAPSULE_EXTRA_APPROVALS='ssh://builder/srv/project' \
+    DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" \
+    --remote builder:/srv/project --profile "$profile_dir" true
+  assert_file_contains "$log_file" '--volume /srv/cache:/cache' \
+    "remote profiles accept absolute volume sources"
+
+  mkdir -p "$tdir/local-target"
+  ln -s "$tdir/local-target" "$tdir/local-link"
+  cat >"$profile_dir/capsule.toml" <<EOF
+version = 1
+name = "remote-volume"
+volume = ["$local_source:/cache"]
+EOF
+
+  : >"$log_file"
+  CAPSULE_EXTRA_APPROVALS='ssh://builder/srv/project' \
+    CAPSULE_HOST_PATH_MAP="$tdir=/daemon/client" DOCKER_GID=1111 \
+    run_capsule "$mock_bin" "$log_file" \
+    --remote builder:/srv/project --profile "$profile_dir" true
+  assert_file_contains "$log_file" \
+    "--volume $local_source:/cache" \
+    "remote profile volumes bypass local path translation"
+}
+
+test_profile_custom_build_generates_ordered_image() {
+  local tdir="$TEST_TMPDIR/profile-build"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local token=""
+  local generated_file=""
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  MOCK_CURL_FAIL=1 DOCKER_GID=1111 \
+    run_capsule "$mock_bin" "$log_file" \
+    build --custom --profile "$PROFILE_CAPSULE_DIR"
+
+  token="$(profile_path_token "$PROFILE_CAPSULE_DIR")"
+  generated_file="$(profile_generated_file "$token" Dockerfile)"
+  if [[ "${#token}" -eq 8 && "$token" != *[!0-9a-f]* ]]; then
+    pass "profile image token is fixed-width lowercase hexadecimal"
+  else
+    fail "profile image token is fixed-width lowercase hexadecimal"
+  fi
+  assert_file_contains "$log_file" \
+    "DOCKER_ARGS=build --tag casual-capsule-profile-test-profile-$token" \
+    "profile custom build invokes Docker without release lookup"
+  assert_file_contains "$log_file" \
+    '--build-arg CAPSULE_BASE_IMAGE=casual-capsule-cli:latest' \
+    "profile build extends the selected base image"
+  assert_file_contains "$generated_file" \
+    'ARG CAPSULE_BASE_IMAGE=casual-capsule-cli:latest' \
+    "generated Dockerfile gives its base image argument a valid default"
+  assert_file_contains "$log_file" \
+    "--build-context test-profile=$PROFILE_CAPSULE_DIR" \
+    "profile build supplies its directory as a named context"
+  assert_file_contains "$generated_file" '# profile: test-profile' \
+    "generated Dockerfile retains profile boundaries"
+  assert_file_contains "$generated_file" 'ENV CUSTOM_CAPSULE_IMAGE=1' \
+    "generated Dockerfile contains profile instructions"
+}
+
+test_generated_profile_files_are_cached_by_output() {
+  local tdir="$TEST_TMPDIR/profile-generated-cache"
+  local profile_dir="$tdir/profile"
+  local mock_bin="$tdir/bin"
+  local token=""
+  local cache_dir=""
+  local artifact_dir=""
+  local compose_file=""
+  local first_artifact=""
+  local second_artifact=""
+  local artifact_count=""
+  mkdir -p "$profile_dir"
+  make_mock_bin "$mock_bin"
+
+  cat >"$profile_dir/capsule.toml" <<'EOF'
+version = 1
+name = "generated-cache"
+host = ["cache.internal=192.0.2.30"]
+
+[dockerfile]
+content = '''
+ENV GENERATED_CACHE=1
+'''
+EOF
+
+  CAPSULE_COMPOSE_PROJECT_NAME=first-project DOCKER_GID=1111 \
+    run_capsule "$mock_bin" "$tdir/first-log" \
+    build --custom --profile "$profile_dir"
+  CAPSULE_COMPOSE_PROJECT_NAME=second-project DOCKER_GID=1111 \
+    run_capsule "$mock_bin" "$tdir/second-log" \
+    build --custom --profile "$profile_dir"
+
+  token="$(profile_path_token "$profile_dir")"
+  cache_dir="$ROOT_DIR/_build/profiles/$token"
+  for compose_file in "$cache_dir"/*/compose.yml; do
+    [[ -f "$compose_file" ]] || continue
+    artifact_dir="${compose_file%/compose.yml}"
+    if grep -Fq 'image: first-project-profile-generated-cache-' \
+      "$compose_file"; then
+      first_artifact="$artifact_dir"
+    elif grep -Fq 'image: second-project-profile-generated-cache-' \
+      "$compose_file"; then
+      second_artifact="$artifact_dir"
+    fi
+    assert_file_contains "$artifact_dir/.complete" '1' \
+      "generated profile artifact is marked complete"
+  done
+  artifact_count="$(
+    find "$cache_dir" -mindepth 1 -maxdepth 1 -type d | wc -l | \
+      tr -d ' '
+  )"
+  assert_equals 2 "$artifact_count" \
+    "project-specific generated files use distinct cache entries"
+  if [[ -z "$first_artifact" || -z "$second_artifact" ]]; then
+    fail "a project loses its generated Compose override"
+    return
+  elif [[ "$first_artifact" == "$second_artifact" ]]; then
+    fail "project-specific generated Compose overrides collide"
+    return
+  else
+    pass "both projects retain distinct generated Compose overrides"
+  fi
+
+  printf '%s\n' 'reuse-sentinel' >"$first_artifact/.complete"
+  CAPSULE_COMPOSE_PROJECT_NAME=first-project DOCKER_GID=1111 \
+    run_capsule "$mock_bin" "$tdir/reuse-log" \
+    build --custom --profile "$profile_dir"
+  assert_file_contains "$first_artifact/.complete" 'reuse-sentinel' \
+    "complete generated profile artifacts are reused without rendering"
+  if find "$cache_dir" -type f \
+    \( -name '.Dockerfile.*' -o -name '.compose.yml.*' \
+    -o -name '.complete.*' \) | grep -q .; then
+    fail "generated profile cache retains temporary files"
+  else
+    pass "generated profile cache publishes without temporary leftovers"
+  fi
+}
+
+
+test_profile_build_preserves_selected_order() {
+  local tdir="$TEST_TMPDIR/profile-order"
+  local first_dir="$tdir/first"
+  local second_dir="$tdir/second"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local forward_token=""
+  local reverse_token=""
+  local generated_file=""
+  mkdir -p "$first_dir" "$second_dir"
+  make_mock_bin "$mock_bin"
+
+  cat >"$first_dir/capsule.toml" <<'EOF'
+version = 1
+name = "first"
+
+[dockerfile]
+content = '''
+ENV PROFILE_ORDER=first
+'''
+EOF
+  cat >"$second_dir/capsule.toml" <<'EOF'
+version = 1
+name = "second"
+
+[dockerfile]
+content = '''
+ENV PROFILE_ORDER=second
+'''
+EOF
+
+  CAPSULE_PROFILES="$first_dir;$second_dir" DOCKER_GID=1111 \
+    run_capsule "$mock_bin" "$log_file" build --custom
+  forward_token="$(profile_path_token "$first_dir" "$second_dir")"
+  generated_file="$(profile_generated_file "$forward_token" Dockerfile)"
+  assert_file_contains "$log_file" \
+    "--tag casual-capsule-profile-first-second-$forward_token:local" \
+    "profile image names preserve selected profile order"
+  assert_file_contains \
+    "$generated_file" \
+    $'# profile: first\nENV PROFILE_ORDER=first\n\n# profile: second' \
+    "profile fragments retain command-line order"
+
+  : >"$log_file"
+  DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" \
+    build --custom --profile "$second_dir" --profile "$first_dir"
+  reverse_token="$(profile_path_token "$second_dir" "$first_dir")"
+  generated_file="$(profile_generated_file "$reverse_token" Dockerfile)"
+  assert_file_contains "$log_file" \
+    "--tag casual-capsule-profile-second-first-$reverse_token:local" \
+    "reversed profile names remain readable in the image tag"
+  if [[ "$forward_token" != "$reverse_token" ]]; then
+    pass "reversing profiles selects a distinct image tag"
+  else
+    fail "reversing profiles selects a distinct image tag"
+  fi
+  assert_file_contains \
+    "$generated_file" \
+    $'# profile: second\nENV PROFILE_ORDER=second\n\n# profile: first' \
+    "reversing profiles reverses generated instructions"
+}
+
+test_profile_accepts_multiline_eof_without_newline() {
+  local tdir="$TEST_TMPDIR/profile-multiline-eof"
+  local array_dir="$tdir/array"
+  local profile_dir="$tdir/dockerfile"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local token=""
+  local generated_file=""
+  mkdir -p "$array_dir/data" "$profile_dir"
+  make_mock_bin "$mock_bin"
+
+  printf '%s' 'version = 1
+name = "array-eof"
+volume = [
+  "./data:/data",
+]' >"$array_dir/capsule.toml"
+  DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" \
+    --profile "$array_dir" true
+  assert_file_contains "$log_file" \
+    "--volume $array_dir/data:/data" \
+    "multiline arrays accept an unterminated final line"
+
+  printf '%s' "version = 1
+name = \"dockerfile-eof\"
+
+[dockerfile]
+content = '''
+ENV PROFILE_EOF=1
+'''" >"$profile_dir/capsule.toml"
+  DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" \
+    build --custom --profile "$profile_dir"
+  token="$(profile_path_token "$profile_dir")"
+  generated_file="$(profile_generated_file "$token" Dockerfile)"
+  assert_file_contains "$generated_file" 'ENV PROFILE_EOF=1' \
+    "Dockerfile content accepts an unterminated final line"
+}
+
+test_profile_rejects_unsupported_toml() {
+  local tdir="$TEST_TMPDIR/profile-invalid"
+  local profile_dir="$tdir/profile"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local err_file="$tdir/err"
+  mkdir -p "$profile_dir"
+  make_mock_bin "$mock_bin"
+
+  cat >"$profile_dir/capsule.toml" <<'EOF'
+version = 1
+name = "invalid"
+volume = { source = "/tmp", target = "/tmp" }
+EOF
+  if DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" \
+    build --custom --profile "$profile_dir" 2>"$err_file"; then
+    fail "profiles reject unsupported valid TOML"
+  else
+    pass "profiles reject unsupported valid TOML"
+  fi
+  assert_file_contains "$err_file" 'invalid or unsupported string array' \
+    "unsupported TOML reports a profile parser error"
+
+  cat >"$profile_dir/capsule.toml" <<'EOF'
+version = 1
+name = "invalid"
+
+[env]
+BROKEN = "prefix-${SOURCE_VALUE}"
+EOF
+  if DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" \
+    build --custom --profile "$profile_dir" 2>"$err_file"; then
+    fail "profiles reject partial interpolation"
+  else
+    pass "profiles reject partial interpolation"
+  fi
+  assert_file_contains "$err_file" 'invalid partial interpolation' \
+    "partial interpolation reports a clear error"
+
+  cat >"$profile_dir/capsule.toml" <<'EOF'
+version = 1
+name = "invalid"
+
+[dockerfile]
+content = '''
+FROM alpine:3.20
+'''
+EOF
+  if DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" \
+    build --custom --profile "$profile_dir" 2>"$err_file"; then
+    fail "profiles reject Dockerfile FROM instructions"
+  else
+    pass "profiles reject Dockerfile FROM instructions"
+  fi
+  assert_file_contains "$err_file" \
+    'Dockerfile content must not contain FROM' \
+    "a forbidden FROM instruction reports a clear error"
+}
+
+test_profiles_conflict_with_custom_compose() {
+  local tdir="$TEST_TMPDIR/profile-compose-conflict"
+  local custom_dir="$tdir/custom"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local err_file="$tdir/err"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+  make_custom_compose "$custom_dir" "legacy:local"
+
+  if CAPSULE_CUSTOM_COMPOSE="$custom_dir/compose.yml" DOCKER_GID=1111 \
+    run_capsule "$mock_bin" "$log_file" \
+    --profile "$PROFILE_CAPSULE_DIR" true 2>"$err_file"; then
+    fail "profiles conflict with legacy custom Compose"
+  else
+    pass "profiles conflict with legacy custom Compose"
+  fi
+  assert_file_contains "$err_file" \
+    'profiles cannot be combined with CAPSULE_CUSTOM_COMPOSE' \
+    "profile and custom Compose conflict reports a clear error"
+}
+
+test_profile_option_rejects_empty_directory() {
+  local tdir="$TEST_TMPDIR/profile-empty-option"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  local err_file="$tdir/err"
+  mkdir -p "$tdir"
+  make_mock_bin "$mock_bin"
+
+  if DOCKER_GID=1111 run_capsule "$mock_bin" "$log_file" \
+    --profile= true 2>"$err_file"; then
+    fail "an empty --profile value is rejected"
+  else
+    pass "an empty --profile value is rejected"
+  fi
+  assert_file_contains "$err_file" '--profile requires a directory' \
+    "empty profile option reports a clear error"
+}
+
+test_podman_profile_runtime_settings() {
+  local tdir="$TEST_TMPDIR/podman-profile"
+  local profile_dir="$tdir/profile"
+  local workspace="$tdir/workspace"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  mkdir -p "$profile_dir" "$workspace"
+  make_mock_bin "$mock_bin"
+
+  cat >"$profile_dir/capsule.toml" <<'EOF'
+version = 1
+name = "podman-runtime"
+gpu = "all"
+namespace = "gpu"
+host = ["gpu.internal=192.0.2.20"]
+
+[env]
+PROFILE_FLAG = "enabled"
+EOF
+
+  CAPSULE_WORKDIR="$workspace" \
+    run_capsule "$mock_bin" "$log_file" --runtime podman \
+    --profile "$profile_dir" true
+
+  assert_podman_args_contain "$log_file" \
+    '--device nvidia.com/gpu=all' \
+    "podman profile requests all NVIDIA devices"
+  assert_podman_args_lack "$log_file" '--env PROFILE_FLAG=enabled' \
+    "podman profile keeps environment values out of arguments"
+  assert_podman_args_contain "$log_file" '--env-file ' \
+    "podman reads profile environment from a private file"
+  assert_file_contains "$log_file" \
+    'PROFILE_ENV_ENTRY=PROFILE_FLAG=enabled' \
+    "podman profile forwards environment values"
+  assert_file_contains "$log_file" 'PROFILE_ENV_PERMISSIONS=600' \
+    "podman profile environment file is owner-readable only"
+  profile_env_file="$(value_from_log PROFILE_ENV_FILE "$log_file")"
+  if [[ -n "$profile_env_file" && ! -e "$profile_env_file" ]]; then
+    pass "profile environment file is removed after podman exits"
+  else
+    fail "profile environment file remains after podman exits"
+  fi
+  assert_podman_args_contain "$log_file" \
+    '--add-host gpu.internal:192.0.2.20' \
+    "podman profile forwards static host mappings"
+  assert_podman_args_contain "$log_file" \
+    '--volume casual-capsule-home-gpu:/home/user' \
+    "podman profile namespaces persistent home state"
+  assert_podman_args_contain "$log_file" 'capsule-workspace-gpu-' \
+    "podman profile namespaces generated container names"
+}
+
+test_podman_profile_image_includes_base_identity() {
+  local tdir="$TEST_TMPDIR/podman-profile-base"
+  local profile_dir="$tdir/profile"
+  local mock_bin="$tdir/bin"
+  local path_token=""
+  local first_base_token=""
+  local second_base_token=""
+  local first_image=""
+  local second_image=""
+  mkdir -p "$profile_dir"
+  make_mock_bin "$mock_bin"
+
+  cat >"$profile_dir/capsule.toml" <<'EOF'
+version = 1
+name = "podman-base"
+
+[dockerfile]
+content = '''
+ENV PODMAN_BASE_PROFILE=1
+'''
+EOF
+
+  path_token="$(profile_path_token "$profile_dir")"
+  first_base_token="$(
+    printf '%s\0' 'base-a:local' | cksum | cut -d' ' -f1
+  )"
+  printf -v first_base_token '%08x' "$first_base_token"
+  second_base_token="$(
+    printf '%s\0' 'base-b:local' | cksum | cut -d' ' -f1
+  )"
+  printf -v second_base_token '%08x' "$second_base_token"
+  first_image="casual-capsule-profile-podman-base-${path_token}"
+  first_image="${first_image}-${first_base_token}:local"
+  second_image="casual-capsule-profile-podman-base-${path_token}"
+  second_image="${second_image}-${second_base_token}:local"
+
+  CAPSULE_RUNTIME=podman CAPSULE_IMAGE=base-a:local \
+    run_capsule "$mock_bin" "$tdir/first-log" \
+    build --custom --profile "$profile_dir"
+  CAPSULE_RUNTIME=podman CAPSULE_IMAGE=base-b:local \
+    run_capsule "$mock_bin" "$tdir/second-log" \
+    build --custom --profile "$profile_dir"
+
+  assert_podman_args_contain "$tdir/first-log" "--tag $first_image" \
+    "first Podman base selects its own profile image"
+  assert_podman_args_contain "$tdir/first-log" \
+    '--build-arg CAPSULE_BASE_IMAGE=base-a:local' \
+    "first Podman profile image extends its selected base"
+  assert_podman_args_contain "$tdir/second-log" "--tag $second_image" \
+    "second Podman base selects a distinct profile image"
+  assert_podman_args_contain "$tdir/second-log" \
+    '--build-arg CAPSULE_BASE_IMAGE=base-b:local' \
+    "second Podman profile image extends its selected base"
 }
 #-------------------------------------------------------------------------------
 # podman backend
@@ -2922,14 +4053,30 @@ test_doctor_checks_gid_capacity() {
 
 test_github_token_is_optional() {
   local compose_file=""
+  local profile_dir=""
   setup_mock_case optional-github-token
   compose_file="$CASE_DIR/custom.yml"
+  profile_dir="$CASE_DIR/profile"
+  mkdir -p "$profile_dir"
   printf 'services:\n  cli:\n    image: custom:latest\n' >"$compose_file"
+  cat >"$profile_dir/capsule.toml" <<'EOF'
+version = 1
+name = "optional-token"
 
-  GITHUB_API_TOKEN='' CAPSULE_RUNTIME=docker \
+[dockerfile]
+content = '''
+ENV OPTIONAL_TOKEN_PROFILE=1
+'''
+EOF
+
+  unset GITHUB_API_TOKEN
+  CAPSULE_PROFILES="$profile_dir" CAPSULE_RUNTIME=docker \
     run_capsule "$CASE_BIN" "$CASE_LOG" --build true
   assert_file_not_contains "$CASE_LOG" 'compose.github-token.yml' \
     "Docker builds and runs without a token override"
+  assert_file_not_contains "$CASE_LOG" \
+    '--secret id=github_api_token,env=GITHUB_API_TOKEN' \
+    "Docker profile builds without a GitHub secret"
 
   GITHUB_API_TOKEN=token-value CAPSULE_RUNTIME=docker \
     run_capsule "$CASE_BIN" "$CASE_DIR/docker-token" --build true
@@ -2946,7 +4093,8 @@ test_github_token_is_optional() {
     "-f $TOKEN_COMPOSE_PATH -f $compose_file" \
     "custom Compose builds and runs retain the supplied token override"
 
-  GITHUB_API_TOKEN='' CAPSULE_RUNTIME=podman \
+  GITHUB_API_TOKEN='' CAPSULE_PROFILES="$profile_dir" \
+    CAPSULE_RUNTIME=podman \
     run_capsule "$CASE_BIN" "$CASE_DIR/podman" --build true
   assert_podman_args_lack "$CASE_DIR/podman" '--secret' \
     "Podman builds without a GitHub secret"
@@ -3030,6 +4178,68 @@ test_podman_on_macos_requires_workspace_under_home() {
   assert_file_contains "$CASE_ERR" \
     'podman machine cannot see it' \
     "a workspace the podman machine cannot see falls back to Docker"
+}
+
+test_podman_on_macos_requires_profiles_under_home() {
+  local profile_dir=""
+  setup_mock_case podman-macos-profile
+  profile_dir="$CASE_DIR/profile"
+  mkdir -p "$CASE_DIR/home/project" "$profile_dir"
+  cat >"$profile_dir/capsule.toml" <<'EOF'
+version = 1
+name = "outside-home"
+EOF
+
+  CAPSULE_RUNTIME=auto MOCK_UNAME=Darwin HOME="$CASE_DIR/home" \
+    CAPSULE_WORKDIR="$CASE_DIR/home/project" \
+    run_capsule "$CASE_BIN" "$CASE_LOG" \
+    --profile "$profile_dir" true 2>"$CASE_ERR"
+
+  assert_file_contains "$CASE_ERR" \
+    'a profile directory is outside' \
+    "a profile the podman machine cannot see falls back to Docker"
+}
+
+test_podman_on_macos_requires_profile_volumes_under_home() {
+  local profile_dir=""
+  local source=""
+  setup_mock_case podman-macos-profile-volume
+  profile_dir="$CASE_DIR/home/profile"
+  mkdir -p "$CASE_DIR/home/project" "$profile_dir" \
+    "$CASE_DIR/elsewhere"
+
+  for source in \
+    "$CASE_DIR/elsewhere/absolute" \
+    '../../elsewhere/relative'; do
+    cat >"$profile_dir/capsule.toml" <<EOF
+version = 1
+name = "outside-home-volume"
+volume = ["$source:/data"]
+EOF
+    : >"$CASE_LOG"
+    : >"$CASE_ERR"
+
+    CAPSULE_RUNTIME=auto MOCK_UNAME=Darwin HOME="$CASE_DIR/home" \
+      CAPSULE_WORKDIR="$CASE_DIR/home/project" \
+      run_capsule "$CASE_BIN" "$CASE_LOG" \
+      --profile "$profile_dir" true 2>"$CASE_ERR"
+
+    assert_file_contains "$CASE_ERR" \
+      'a profile volume source is outside' \
+      "an inaccessible profile volume makes Podman fall back"
+    assert_file_contains "$CASE_LOG" 'compose' \
+      "Docker runs when Podman cannot see a profile volume"
+  done
+
+  : >"$CASE_LOG"
+  : >"$CASE_ERR"
+  CAPSULE_RUNTIME=podman MOCK_UNAME=Darwin HOME="$CASE_DIR/home" \
+    CAPSULE_WORKDIR="$CASE_DIR/home/project" \
+    run_capsule "$CASE_BIN" "$CASE_LOG" build \
+    --profile "$profile_dir" 2>"$CASE_ERR"
+
+  assert_podman_args_contain "$CASE_LOG" 'build ' \
+    "podman profile builds ignore inaccessible runtime volumes"
 }
 
 test_podman_on_macos_runs_a_workspace_under_home() {
@@ -4177,6 +5387,11 @@ main() {
   else
     pass "capsule.sh has valid shell syntax"
   fi
+  if ! bash -n "$PROFILE_CORE_PATH"; then
+    fail "profile parser has valid shell syntax"
+  else
+    pass "profile parser has valid shell syntax"
+  fi
 
   # Ask shellcheck to run rather than just look it up: a mise shim with no
   # version set is on PATH but errors out the moment it is called.
@@ -4250,6 +5465,7 @@ main() {
   test_explicit_docker_gid_passthrough
   test_debug_mode_enables_xtrace
   test_debug_mode_redacts_github_token
+  test_token_presence_checks_do_not_expand_values
   test_uid_gid_autodetect
   test_uid_gid_fallback_when_id_fails
   test_explicit_uid_gid_passthrough
@@ -4265,8 +5481,27 @@ main() {
   test_bad_docker_host_falls_back_to_context_socket
   test_macos_staff_gid_override
   test_default_gid_when_detection_fails
+  test_profile_runtime_settings
+  test_profile_honors_compose_project_name
+  test_docker_profile_preserves_piped_stdin
+  test_docker_runtime_forwards_signals
+  test_profile_volumes_use_host_path_map
+  test_nested_profile_home_volumes_use_host_visible_home
+  test_nested_profile_home_volume_requires_host_visible_home
+  test_profile_home_volume_uses_remote_home
+  test_profile_home_volume_rejects_missing_remote_home
+  test_remote_profile_volume_source_rules
+  test_profile_custom_build_generates_ordered_image
+  test_generated_profile_files_are_cached_by_output
+  test_profile_build_preserves_selected_order
+  test_profile_accepts_multiline_eof_without_newline
+  test_profile_rejects_unsupported_toml
+  test_profiles_conflict_with_custom_compose
+  test_profile_option_rejects_empty_directory
   test_podman_backend_runs_container_with_keep_id
   test_podman_preserves_piped_stdin
+  test_podman_profile_runtime_settings
+  test_podman_profile_image_includes_base_identity
   test_nested_capsule_podman_uses_local_workdir
   test_podman_inner_volume_is_per_workspace
   test_podman_backend_translates_publish_and_volume
@@ -4283,6 +5518,8 @@ main() {
   test_podman_falls_back_when_engine_unreachable
   test_podman_falls_back_for_remote_and_custom_compose
   test_podman_on_macos_requires_workspace_under_home
+  test_podman_on_macos_requires_profiles_under_home
+  test_podman_on_macos_requires_profile_volumes_under_home
   test_podman_on_macos_runs_a_workspace_under_home
   test_runtime_docker_keeps_docker_with_podman_available
   test_runtime_flag_rejects_bad_values

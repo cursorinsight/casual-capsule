@@ -21,7 +21,7 @@ _capsule() {
 
   if ((COMP_CWORD == 1)); then
     values='run build list doctor dr completion -b --build -p --private-home
-      --publish -r --remote --runtime --host-docker -v --volume
+      --profile --publish -r --remote --runtime --host-docker -v --volume
       --build-custom --no-cache -h --help --'
     # Intentional word splitting for completion candidates.
     # shellcheck disable=SC2207
@@ -35,19 +35,20 @@ _capsule() {
       COMPREPLY=($(compgen -W 'auto docker podman' -- "$cur"))
       return
       ;;
-    --remote|--publish|--volume)
+    --profile|--remote|--publish|--volume)
       return
       ;;
   esac
 
   case "$command" in
     run)
-      options='-b --build -p --private-home --publish -r --remote
+      options='-b --build -p --private-home --profile --publish -r --remote
         --runtime --host-docker -v --volume --build-custom --no-cache
         -h --help --'
       ;;
     build)
-      options='--all --custom --no-cache -r --remote --runtime -h --help'
+      options='--all --custom --no-cache --profile -r --remote --runtime
+        -h --help'
       ;;
     list)
       options='-r --remote --runtime -h --help'
@@ -59,7 +60,7 @@ _capsule() {
       options='bash zsh fish -h --help'
       ;;
     *)
-      options='-b --build -p --private-home --publish -r --remote
+      options='-b --build -p --private-home --profile --publish -r --remote
         --runtime --host-docker -v --volume --build-custom --no-cache
         -h --help --'
       ;;
@@ -82,6 +83,7 @@ _capsule_run_arguments() {
   _arguments \
     '(-b --build)'{-b,--build}'[build before running]' \
     '(-p --private-home)'{-p,--private-home}'[use private home]' \
+    '*--profile[apply a profile]:profile directory:_directories' \
     '--publish[map a port]:port mapping:' \
     '(-r --remote)'{-r,--remote}'[run remotely]:remote target:' \
     '--runtime[select runtime]:runtime:(auto docker podman)' \
@@ -125,6 +127,7 @@ _capsule() {
         '--all[build base and configured custom image]' \
         '--custom[build only the configured custom image]' \
         '--no-cache[disable build cache]' \
+        '*--profile[apply a profile]:profile directory:_directories' \
         '(-r --remote)'{-r,--remote}'[build remotely]:remote target:' \
         '--runtime[select runtime]:runtime:(auto docker podman)' \
         '(-h --help)'{-h,--help}'[show help]'
@@ -179,6 +182,7 @@ complete -c capsule -n '__fish_use_subcommand' -a completion \
 complete -c capsule -n '__fish_capsule_using_run' -s b -l build
 complete -c capsule -n '__fish_capsule_using_run' -s p \
   -l private-home
+complete -c capsule -n '__fish_capsule_using_run' -l profile -r
 complete -c capsule -n '__fish_capsule_using_run' -l publish -r
 complete -c capsule -n '__fish_capsule_using_run' -s r -l remote -r
 complete -c capsule -n '__fish_capsule_using_run' -l runtime -r \
@@ -191,6 +195,7 @@ complete -c capsule -n '__fish_capsule_using_run' -l no-cache
 complete -c capsule -n '__fish_seen_subcommand_from build' -l all
 complete -c capsule -n '__fish_seen_subcommand_from build' -l custom
 complete -c capsule -n '__fish_seen_subcommand_from build' -l no-cache
+complete -c capsule -n '__fish_seen_subcommand_from build' -l profile -r
 complete -c capsule -n '__fish_seen_subcommand_from build' -s r -l remote -r
 complete -c capsule -n '__fish_seen_subcommand_from build' -l runtime -r \
   -a 'auto docker podman'

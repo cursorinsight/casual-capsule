@@ -15,16 +15,17 @@ usage() {
 Usage: capsule build [options]
 
 Options:
-      --all                 Build base and configured custom image (default).
-      --custom              Build only the configured custom image.
+      --all                 Build base and profile/custom image (default).
+      --custom              Build only the profile/custom image.
       --no-cache            Disable build cache.
+      --profile DIR         Apply a Capsule profile. Repeatable.
   -r, --remote HOST[:PORT]  Build on a remote Docker host over SSH.
       --runtime RUNTIME     Use auto, docker, or podman (default: auto).
   -h, --help                Show this help message.
 
 Environment:
   CAPSULE_BUILD, CAPSULE_BUILD_CUSTOM, CAPSULE_NO_CACHE
-  CAPSULE_REMOTE, CAPSULE_RUNTIME, CAPSULE_CUSTOM_COMPOSE
+  CAPSULE_REMOTE, CAPSULE_RUNTIME, CAPSULE_CUSTOM_COMPOSE, CAPSULE_PROFILES
 EOF
 }
 
@@ -40,6 +41,20 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --no-cache)
+      args+=("$1")
+      shift
+      ;;
+    --profile)
+      if [[ $# -lt 2 ]] || [[ -z "${2:-}" ]] || [[ "${2:-}" == -* ]]; then
+        die '--profile requires a directory'
+      fi
+      args+=("$1" "$2")
+      shift 2
+      ;;
+    --profile=*)
+      if [[ -z "${1#--profile=}" ]]; then
+        die '--profile requires a directory'
+      fi
       args+=("$1")
       shift
       ;;
