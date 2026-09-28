@@ -69,6 +69,11 @@ pass() {
 
 # Record a skipped assertion and print it to stdout.
 skip() {
+  if [[ "${CAPSULE_E2E_STRICT:-}" == "1" ]]; then
+    fail "$1"
+    return
+  fi
+
   log_message "SKIP: $1"
   printf 'SKIP: %s\n' "$1"
   SKIP_COUNT=$((SKIP_COUNT + 1))

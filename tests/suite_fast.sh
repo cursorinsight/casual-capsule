@@ -15,6 +15,7 @@ ROOT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
 SCRIPT_PATH="$ROOT_DIR/capsule.sh"
 CHECK_ALL_PATH="$ROOT_DIR/tests/check_all.sh"
 DOCTOR_PATH="$ROOT_DIR/capsule-doctor.sh"
+CI_PATH="$ROOT_DIR/.github/workflows/ci.yml"
 COMPOSE_PATH="$ROOT_DIR/compose.yml"
 DOCKERFILE_PATH="$ROOT_DIR/Dockerfile"
 ENTRYPOINT_PATH="$ROOT_DIR/docker/entrypoint.sh"
@@ -803,6 +804,29 @@ test_doctor_names_a_stale_session_bus() {
   assert_file_contains "$out_file" \
     'install dbus-user-session' \
     "the doctor names the package when no user bus exists at all"
+}
+
+# Verify CI exercises a nested Capsule through each supported backend.
+# shellcheck disable=SC2016
+test_ci_runs_nested_capsules_for_each_backend() {
+  assert_file_contains "$CI_PATH" \
+    'name: nested-capsule (${{ matrix.runtime }})' \
+    "GitHub CI exposes separate nested backend checks"
+  assert_file_contains "$CI_PATH" \
+    'runtime:' \
+    "GitHub CI defines a nested Capsule runtime matrix"
+  assert_file_contains "$CI_PATH" \
+    '- docker' \
+    "GitHub CI tests a Docker-backed Capsule"
+  assert_file_contains "$CI_PATH" \
+    '- podman' \
+    "GitHub CI tests a Podman-backed Capsule"
+  assert_file_contains "$CI_PATH" \
+    'CAPSULE_E2E_STRICT=1 tests/test_all.sh' \
+    "nested CI rejects skipped backend prerequisites"
+  assert_file_contains "$CI_PATH" \
+    "grep -Eq '^true ([2-9]|[1-9][0-9]+)$'" \
+    "Podman CI requires rootless subordinate ID mappings"
 }
 
 test_build_flag_without_runtime_args() {
@@ -2525,6 +2549,7 @@ main() {
   test_check_all_ignores_an_unusable_linter
   test_doctor_reports_each_backend_and_probes_by_running
   test_doctor_names_a_stale_session_bus
+  test_ci_runs_nested_capsules_for_each_backend
   test_build_custom_flag_keeps_runtime_flags
   test_build_flag_without_runtime_args
   test_build_custom_flag_requires_custom_compose

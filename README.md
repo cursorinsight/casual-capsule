@@ -937,6 +937,10 @@ When one of these tools is missing, it prints a warning and skips that linter.
 
 `test_all.sh` prints each suite name before running it.
 
+GitHub CI runs the same two nested checks as separate matrix jobs. It enables
+strict e2e mode there, so a missing Docker or rootless Podman prerequisite
+fails the corresponding job instead of silently skipping its cases.
+
 *   The fast suite uses command stubs, so it does not require a running Docker
     daemon.
 
