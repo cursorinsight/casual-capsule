@@ -24,6 +24,10 @@ common developer tools.
 - [Usage](#-usage)
 - [Capsule command examples](#%EF%B8%8F-capsule-command-examples)
 - [Additional features](#-additional-features)
+  - [Checking your environment](#checking-your-environment)
+  - [Shell completion](#shell-completion)
+  - [Runtime backends: podman and Docker](#runtime-backends-podman-and-docker)
+  - [Listing running Capsules](#listing-running-capsules)
   - [UID and GID detection](#uid-and-gid-detection)
   - [Directory approval list](#directory-approval-list)
   - [Private home bind mount](#private-home-bind-mount)
@@ -44,7 +48,13 @@ common developer tools.
 ## 📋 Prerequisites
 
 - Docker Engine 24+ and Docker Compose v2
+- Optionally rootless [podman](https://podman.io) 4.9+, to run the Capsule
+  with a container engine of its own instead of the host daemon
+  ([what it needs](#what-the-podman-backend-needs))
 - Access to Claude or Codex.
+
+Run [`capsule doctor`](#checking-your-environment) to check all of this and get
+the command that repairs whatever is missing.
 
 ## 🚀 Initial setup
 
@@ -104,14 +114,15 @@ easier.
     $ echo "My favorite color is purple." > CLAUDE.md
     ```
 
-4.  Create an alias:
+4.  Add Capsule's `bin` directory to `PATH`:
 
     ```
-    alias capsule="/absolute/path/to/casual-capsule/capsule.sh"
+    export PATH="/absolute/path/to/casual-capsule/bin:$PATH"
     ```
 
     You might want to add this to your init script (such as `~/.bashrc` or
-    `~/.zshrc`).
+    `~/.zshrc`). The existing `capsule.sh` entry point remains available for
+    backward compatibility.
 
 5.  Set `GITHUB_API_TOKEN` to the value you received from GitHub (replace
     `[GITHUB_API_TOKEN]`).
@@ -125,28 +136,30 @@ easier.
 
 ### Phase 2: Start Capsule
 
-1.  Build the Capsule Docker image and start it in the current directory.
+1.  Build the Capsule image, then start it in the current directory.
 
     ```
-    $ capsule --build
+    $ capsule build
+    $ capsule
     ```
 
-2.  When Capsule asks the following, type "y".
+2.  When Capsule asks the following, type `y`.
 
     ```
-    Allow capsule to run in /home/myuser/myproject (y/N)?
+    Allow capsule to run in /home/myuser/myproject ([y]es/[N]no/[o]nly once)?
     ```
 
 3.  You should see that Docker builds the Capsule image, creates a container and
     starts it:
 
     ```
-    $ capsule --build
-    Allow capsule to run in /home/myuser/myproject (y/N)? y
+    $ capsule build
     [...]
     [+] build 1/1
      ✔ Image hcs-capsule:local Built
-     ✔ Volume casual-capsule_home Created
+    $ capsule
+    Allow capsule to run in /home/myuser/myproject ([y]es/[N]no/[o]nly once)? y
+    ✔ Volume casual-capsule_home Created
     Container casual-capsule-cli-run-4d7e2776d2fd Creating
     Container casual-capsule-cli-run-4d7e2776d2fd Created
     user@capsule:/home/workspace$
@@ -262,27 +275,10 @@ easier.
 
     Choose the following response: "Yes, continue".
 
-5.  Codex probably prints the following warning:
-
-    ```
-    Codex could not find bubblewrap on PATH. Install bubblewrap with your OS
-    package manager. See the sandbox prerequisites:
-    https://developers.openai.com/codex/concepts/sandboxing#prerequisites.
-    Codex will use the vendored bubblewrap in the meantime.
-    ```
-
-    You can continue this setup, but later you might want to fix this warning.
-    There are at least two ways:
-
-    *   One way to eliminate this warning is to run `codex` with
-        `--dangerously-bypass-approvals-and-sandbox`. This disables the sandbox
-        which would use `bubblewrap`.
-
-    *   Another way to eliminate the warning is to use a custom `compose.yml`
-        file that adds `privileged: True` to the `cli` service, and use a
-        custom `Dockerfile` that installs the `bubblewrap` package with `apt`.
-        See more information about this kind of customization in the *Custom
-        Capsule images* section.
+5.  Capsule automatically starts Codex with
+    `--dangerously-bypass-approvals-and-sandbox`. Codex therefore runs without
+    approval prompts or its own sandbox and can access everything exposed to
+    the Capsule, including a mounted host Docker socket.
 
 6.  Test the connection and that Codex can read `AGENTS.md`:
 
@@ -308,23 +304,27 @@ Pass a command instead of the default shell:
 
 ```bash
 capsule claude
+capsule run codex
 capsule bash -lc "node -v && python --version"
 capsule docker ps
 ```
 
-Build the image before starting:
+Build without starting a Capsule:
 
 ```bash
-capsule --build
-capsule -b claude
+capsule build
+capsule build --no-cache
 ```
 
-Build only the custom image before starting:
+Build only a configured custom image:
 
 ```bash
 CAPSULE_CUSTOM_COMPOSE=/home/myuser/python-capsule/compose.yml \
-  capsule --build-custom
+  capsule build --custom
 ```
+
+The legacy `--build` and `--build-custom` run options remain available. They
+build first, then start a Capsule.
 
 Use `--` when arguments overlap launcher flags:
 
@@ -333,6 +333,337 @@ capsule -- --build true
 ```
 
 ## 🧩 Additional features
+
+### Checking your environment
+
+`capsule doctor` (or `capsule dr`) reports whether this host can run Capsule,
+and names the fix for whatever it cannot:
+
+```bash
+capsule doctor
+```
+
+It covers both backends -- the Docker client, its compose plugin and daemon;
+podman's rootless mode, sub-id range, systemd user scopes, delegated cgroup
+controllers, OCI runtime and lingering, or the podman machine on macOS -- and
+the linters this repository's own checks reach for.
+
+A warning costs a capability and leaves the host usable. A failure means
+something that looks available cannot actually run, and the command exits
+non-zero on any failure, so a setup script can gate on it. Run it first
+whenever `capsule` fails in a way that looks environmental.
+Status labels use terminal colors when stdout is a color-capable terminal.
+Set `NO_COLOR` to disable them.
+
+### Shell completion
+
+`capsule completion` generates completion definitions for Bash, Zsh, or Fish.
+Install the generated file where your shell loads completions:
+
+```bash
+# Bash
+mkdir -p ~/.local/share/bash-completion/completions
+capsule completion bash \
+  >~/.local/share/bash-completion/completions/capsule
+
+# Zsh; add ~/.local/share/zsh/site-functions to fpath if needed
+mkdir -p ~/.local/share/zsh/site-functions
+capsule completion zsh >~/.local/share/zsh/site-functions/_capsule
+
+# Fish
+mkdir -p ~/.config/fish/completions
+capsule completion fish >~/.config/fish/completions/capsule.fish
+```
+
+### Runtime backends: podman and Docker
+
+Capsule can start its container two ways. The Docker backend runs
+`docker compose run cli`, as it always has, and shares the host's Docker
+daemon. The podman backend runs the same image as a rootless
+[podman](https://podman.io) container that carries **its own container
+engine**, so the chain becomes:
+
+```
+host -> podman -> capsule -> the Capsule's own engine -> your project
+```
+
+Both backends run the Capsule as a privileged container. The Docker backend
+needs this so the rootless podman installed in the Capsule can run the
+repository's podman tests; the podman backend needs it for its own nested
+engine. On the Docker backend the entrypoint also assigns a complete
+subordinate ID range, so nested builds can use standard system accounts such
+as UID/GID 65534. The entrypoint still runs interactive commands as `user`.
+
+That inner engine is private to the workspace the Capsule was started for. A
+project brought up inside a Capsule cannot see the host's containers or
+another workspace's, and `docker compose up` on a real stack behaves the way
+it does on the host.
+
+Capsule picks the backend on its own, and `--runtime` or `CAPSULE_RUNTIME`
+decides it for you:
+
+```bash
+capsule --runtime podman           # run the Capsule as a rootless container
+capsule --runtime docker           # keep using docker compose
+CAPSULE_RUNTIME=podman capsule     # the same choice, from the environment
+```
+
+#### What the podman backend needs
+
+*   **Rootless podman**, which is how it runs by default. Capsule refuses a
+    rootful podman rather than run your Capsule as real root.
+
+*   **A sub-id range** for your account, from the `uidmap` package. podman
+    reports it as a second entry in its id map; without one it cannot even
+    unpack an image that chowns a file. Capsule reads the same report and
+    falls back to the Docker backend, naming the reason.
+
+*   **A reachable systemd user bus** on Linux, because rootless podman asks
+    your own `systemd --user` manager to create a cgroup scope for every
+    container. Without it the runtime falls back to the system manager,
+    polkit refuses the request, and nothing starts.
+    [How to check and fix it](#when-podman-cannot-start-a-container).
+
+*   **A Linux VM on macOS**, which podman manages itself (`podman machine
+    init && podman machine start`). The workspace must live under `$HOME`
+    for the machine to see it.
+
+Unlike the Docker backend, no AppArmor or sysctl change is needed on Ubuntu
+23.10+: podman's rootless path works there as shipped.
+
+#### When podman container startup is slow
+
+Capsule uses `--userns=keep-id` so the host user maps to `user` in the
+container. With native overlayfs, creating the first container for an image
+and UID/GID mapping can spend a long time adjusting image-layer ownership.
+This delays container creation, not the running container.
+
+Using `fuse-overlayfs` avoids that native-overlayfs penalty by applying the
+mapping dynamically. Check the active implementation first:
+
+```bash
+podman info --format \
+  '{{index .Store.GraphStatus "Native Overlay Diff"}}'
+```
+
+`true` means native overlayfs is active. Install your distribution's
+`fuse-overlayfs` package, then merge this into
+`$XDG_CONFIG_HOME/containers/storage.conf`, or
+`~/.config/containers/storage.conf` when `XDG_CONFIG_HOME` is unset:
+
+```toml
+[storage]
+driver = "overlay"
+
+[storage.options.overlay]
+mount_program = "/usr/bin/fuse-overlayfs"
+```
+
+Configure this before first use when possible. An existing Podman store may
+need `podman system reset` before the change takes effect. That command deletes
+all Podman containers, images, networks, volumes, and machines for the user,
+including Capsule's Podman volumes, so back up anything needed first. See
+Podman's performance guide for details:
+<https://github.com/containers/podman/blob/main/docs/tutorials/performance.md>
+
+#### When podman cannot start a container
+
+A build or run that dies with `Interactive authentication required`, on a
+scope request naming `system.slice` rather than `user.slice`, means the
+runtime could not reach your systemd user manager. `crun` reports the same
+condition differently, as `sd-bus call: Process org.freedesktop.systemd1
+exited with status 1`: it reached a session bus that has no systemd on it and
+tried to activate one. One command settles either, run in the same shell
+where Capsule failed:
+
+```bash
+busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 \
+  org.freedesktop.DBus.Peer Ping
+```
+
+That asks the session bus for systemd the way the container runtime does. Do
+not trust `systemctl --user` or `systemd-run --user` here: both reach the
+user manager through `$XDG_RUNTIME_DIR/systemd/private` rather than through
+the bus, so they answer happily while the bus itself is wrong.
+
+If the probe fails, podman fails the same way, and the cause is one of the
+three pieces that have to line up:
+`pam_systemd` gives a login session `/run/user/$(id -u)` and a
+`user@$(id -u).service` manager; the `dbus-user-session` package puts the
+bus at `$XDG_RUNTIME_DIR/bus`; and clients use `$DBUS_SESSION_BUS_ADDRESS`
+when it is set, falling back to `$XDG_RUNTIME_DIR/bus` when it is not. A
+*wrong* address is therefore worse than none, because it overrides the
+working default.
+
+*   **On a desktop login**, a session without `dbus-user-session` falls back
+    to `dbus-launch`, which puts a private bus in `/tmp/dbus-XXXXXX` and
+    exports its address. systemd is not on that bus. Install the package,
+    then log out of the desktop completely: a new terminal inherits the
+    stale address from the session that spawned it.
+
+*   **Over SSH**, `DBUS_SESSION_BUS_ADDRESS` is normally unset and the
+    fallback does the right thing, so the causes are the package missing, or
+    a stale address arriving from a shell startup file or from a terminal
+    multiplexer that was started on the desktop. Grep your dotfiles for
+    `dbus-launch`, and run `tmux kill-server` so new panes stop inheriting
+    the old environment.
+
+*   **`su` and `sudo -u` create no login session**, so that account gets no
+    `XDG_RUNTIME_DIR` and no user manager at all. Use `ssh` or
+    `machinectl shell user@` instead.
+
+Enable lingering as well, so the user manager and `/run/user/$(id -u)`
+outlive your last session rather than taking a running Capsule with them:
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+If you would rather not depend on a session bus at all -- a headless
+builder, cron, CI -- take systemd out of the path instead. Rootless resource
+limits become advisory rather than enforced, which does not affect building
+or running the Capsule itself:
+
+```bash
+mkdir -p ~/.config/containers
+cat >> ~/.config/containers/containers.conf <<'EOF'
+[engine]
+cgroup_manager = "cgroupfs"
+EOF
+```
+
+Once the bus works, a container that still dies on `unable to get oom kill
+count` has a cgroup problem rather than a bus problem. systemd has to
+delegate the `memory` controller to your user manager:
+
+```bash
+cd "/sys/fs/cgroup/user.slice/user-$(id -u).slice"
+cat "user@$(id -u).service/cgroup.controllers"
+```
+
+`memory` has to appear in that list. When it does not, delegate it and log
+in again:
+
+```bash
+sudo mkdir -p /etc/systemd/system/user@.service.d
+printf '[Service]\nDelegate=cpu cpuset io memory pids\n' |
+  sudo tee /etc/systemd/system/user@.service.d/delegate.conf
+sudo systemctl daemon-reload
+```
+
+If the controller is delegated and containers still refuse to start, the OCI
+runtime is what is left. Recent `runc` releases turn a missing
+`memory.events` into a fatal error where `crun`, the runtime podman prefers,
+carries on. Install it, confirm it, then pin it:
+
+```bash
+sudo apt-get install -y crun
+podman --runtime crun run --rm alpine:3.20 echo ok
+```
+
+```bash
+mkdir -p ~/.config/containers
+cat >> ~/.config/containers/containers.conf <<'EOF'
+[engine]
+runtime = "crun"
+EOF
+```
+
+#### The Capsule's own engine
+
+Inside a podman Capsule, `docker` is served by an engine of the Capsule's
+own, and nothing runs until the first container command:
+
+```
+user@capsule:/home/workspace$ docker ps
+capsule: starting podman API socket (first use)...
+CONTAINER ID   IMAGE   COMMAND   CREATED   STATUS   PORTS   NAMES
+```
+
+That default engine is podman answering the **Docker API**, so the `docker`
+CLI and `docker compose` drive it with no daemon at rest. Projects that need
+a true Docker Engine switch to one, and the choice then sticks for the life
+of the Capsule:
+
+```
+user@capsule:/home/workspace$ capsule-docker use-dockerd
+capsule: starting docker daemon (first use)...
+capsule: engine: dockerd
+user@capsule:/home/workspace$ capsule-docker status
+engine: dockerd
+podman api socket: stopped
+dockerd: running
+```
+
+`capsule-docker use-podman` switches back and `capsule-docker stop` stops
+whatever the Capsule started. The real Engine is only present when the image
+was built with `CAPSULE_WITH_DOCKERD=1`, because it is the heavier of the
+two; the router says so if it is missing.
+
+#### What differs inside a podman Capsule
+
+*   **You are still `user`, and your files are still yours.** podman's
+    `keep-id` mapping puts your host account on the image's `user`, so
+    everything written in `/home/workspace` belongs to you on the host and
+    no UID/GID sync or privilege drop is needed.
+
+*   **The inner engine's storage is per workspace.** Images, volumes and
+    containers live in a volume keyed to the workspace path and mounted at
+    `/var/lib/capsule/inner`, so two projects never share an image cache or
+    see each other's containers. `CAPSULE_INNER_VOLUME` overrides the name.
+
+*   **The host's Docker daemon is out of reach unless you ask for it.**
+    `--host-docker` binds the host socket into the Capsule for the cases
+    where you deliberately want it; without the flag the Capsule only has
+    its own engine.
+
+*   **Publishing a port takes two hops.** The project publishes to the
+    Capsule, and `capsule --publish` publishes the Capsule to the host, so
+    a service on 8080 wants `capsule --publish 8080:8080` as well as the
+    usual `ports:` entry in the project's compose file.
+
+*   **The outer podman container is `--privileged`.** A nested engine has to
+    mount a proc and stack image layers. Rootless, that grants only what your
+    own account already has: the Capsule still cannot exceed you on the host.
+
+*   **`--remote` and custom compose files need a Docker daemon**, so those
+    invocations use the Docker backend and say so.
+
+### Listing running Capsules
+
+Use `capsule list` to query running Capsules without starting one:
+
+```bash
+capsule list
+capsule list --runtime docker
+capsule list --runtime podman
+```
+
+The default `auto` selection queries Docker's configured endpoint and local
+podman. The output includes the runtime, host user, container ID and name,
+uptime, image, status, published ports, and host workspace directory.
+
+When `DOCKER_HOST`, `DOCKER_CONTEXT`, or the active Docker context selects a
+non-local endpoint, the target column shows that endpoint. Capsule leaves its
+recorded UID numeric because the local account database does not describe the
+daemon host. Use `--remote` for an SSH target whose user should be resolved.
+
+Capsule recognizes containers through their `CAPSULE_HOST_WORKDIR`
+environment variable. It resolves the recorded `CAPSULE_UID` against the
+daemon host's account database. An unresolved UID is shown numerically;
+missing UID metadata is shown as `unknown`.
+
+Query a remote Docker host with the same SSH endpoint syntax used for runs,
+but without a workspace path or allowlist approval:
+
+```bash
+capsule list --remote buildbox
+capsule list --remote buildbox:2222
+```
+
+Remote listing uses Docker. A full run target such as
+`buildbox:/srv/project` is also accepted and still lists every running
+Capsule visible to that Docker daemon.
 
 ### UID and GID detection
 
@@ -354,18 +685,19 @@ CAPSULE_UID=2000 CAPSULE_GID=2000 capsule
 Bake a custom UID/GID into the image (avoids runtime `chown`):
 
 ```bash
-CAPSULE_UID=2000 CAPSULE_GID=2000 capsule --build
+CAPSULE_UID=2000 CAPSULE_GID=2000 capsule build
 ```
 
 ### Directory approval list
 
 
-On the first run in a new directory, `capsule.sh` prompts for explicit approval
+On the first run in a new directory, `capsule` prompts for explicit approval
 and records the approved path in `~/.config/capsule` (overridable via
-`CAPSULE_CONFIG`).
+`CAPSULE_CONFIG`) when you answer `y`. Answer `o` to allow only the current run
+without updating the approval file. The default answer is `N`.
 
-When `--remote` is active, Capsule checks only the remote target in that same
-allowlist. Remote targets approved via `--remote` are stored as
+When a remote run is active, Capsule checks only the remote target in that
+same allowlist. Remote targets approved via `--remote` are stored as
 `ssh://HOST[:PORT]/path`.
 
 ### Private home bind mount
@@ -427,16 +759,17 @@ Use it like this:
 
 ```bash
 export CAPSULE_CUSTOM_COMPOSE=/home/myuser/python-capsule/compose.yml
-./capsule --build
+capsule build
 ```
 
-With a custom compose file, `capsule.sh --build` first rebuilds the base image
-`casual-capsule-cli:latest`, then builds the merged custom `cli` image, and
-finally starts the container from that merged configuration.
+With a custom compose file, `capsule build` first rebuilds the base image
+`casual-capsule-cli:latest`, then builds the merged custom `cli` image. Start
+the container with `capsule` afterward.
 
 If you only want to rebuild the merged custom `cli` image, use
-`capsule.sh --build-custom` instead. This flag requires
-`CAPSULE_CUSTOM_COMPOSE`.
+`capsule build --custom` instead. This option requires
+`CAPSULE_CUSTOM_COMPOSE`. The legacy `--build` and `--build-custom` run options
+still build and start in one invocation.
 
 ### Updating your GitHub token
 
@@ -496,15 +829,17 @@ CAPSULE_VOLUME="/host/data:/data;/host/config:/etc/config:ro" capsule
 
 ### Bind mounts in containers started in a Capsule
 
-When `capsule.sh` runs inside an existing container, the path it sees may not
+When `capsule` runs inside an existing container, the path it sees may not
 be a path the Docker daemon can mount. Capsule translates the current container
 path back to the daemon-host path before asking Docker to create the
 `/home/workspace` bind mount.
 
 Inside a Capsule, do not reset `CAPSULE_HOST_WORKDIR`. The outer Capsule sets
 it to the daemon-host workspace root, and nested launches reuse it
-automatically. Use `CAPSULE_HOST_PATH_MAP` only when the current non-Capsule
-container sees the same files under a different absolute path.
+automatically when they use Docker. When a nested launch selects local podman,
+Capsule automatically uses the current container path instead. Use
+`CAPSULE_HOST_PATH_MAP` only when the current non-Capsule container sees the
+same files under a different absolute path.
 
 ```bash
 CAPSULE_HOST_PATH_MAP=/workspace=/home/myuser/myproject capsule
@@ -524,10 +859,13 @@ over SSH. Capsule sets `DOCKER_HOST=ssh://HOST[:PORT]` for Compose and mounts
 capsule --remote buildbox:/srv/casual-capsule
 capsule --remote buildbox:2222:/srv/casual-capsule
 capsule --remote buildbox:/srv/casual-capsule --build
+capsule build --remote buildbox
+capsule list --remote buildbox
 ```
 
-The remote target must be approved first. Use an SSH config host alias when you
-need extra SSH options beyond the optional port in `HOST[:PORT]`.
+Remote run targets must be approved first. Build and read-only `list` queries
+do not need approval. Use an SSH config host alias when you need extra SSH
+options beyond the optional port in `HOST[:PORT]`.
 
 ## 🔧 Configuration reference
 
@@ -536,11 +874,18 @@ need extra SSH options beyond the optional port in `HOST[:PORT]`.
 Usage:
 
 ```
-capsule.sh [OPTIONS]
-capsule.sh [OPTIONS] -- [ARGS]
+capsule [run] [RUN_OPTIONS] [--] [COMMAND...]
+capsule build [BUILD_OPTIONS]
+capsule list [LIST_OPTIONS]
+capsule doctor
+capsule completion bash|zsh|fish
 ```
 
-Options:
+Omitting the subcommand selects `run` for backward compatibility. Use an
+explicit `run` when the container command has the same name as a Capsule
+subcommand, for example `capsule run build`.
+
+Run options:
 
 *   `-b`, `--build`: Run `docker compose build cli` before `run`.
 
@@ -551,8 +896,15 @@ Options:
     compose configuration before `run`. Requires `CAPSULE_CUSTOM_COMPOSE`.
 
 *   `-r HOST[:PORT]:/abs/path`, `--remote HOST[:PORT]:/abs/path`: Run
-    `docker compose` against `ssh://HOST[:PORT]` and
-    mount `/abs/path` as `/home/workspace` on that remote host.
+    `docker compose` against `ssh://HOST[:PORT]` and mount `/abs/path` as
+    `/home/workspace` on that remote host.
+
+*   `--runtime podman|docker|auto`: Choose the backend that runs the Capsule.
+    `auto`, the default, prefers podman and falls back to Docker with the
+    reason named.
+
+*   `--host-docker`: Bind the host's Docker socket into the Capsule. Only
+    meaningful on the podman backend, which is otherwise isolated from it.
 
 *   `--publish HOST[:CONTAINER]`: Publish a container port on the host when
     running the container. May be passed multiple times.
@@ -569,11 +921,95 @@ Options:
 *   `--`: Stop launcher option parsing; pass remaining arguments to
     `docker compose run cli`.
 
+Build options:
+
+*   `--all`: Build the base image and configured custom image. This is the
+    default.
+
+*   `--custom`: Build only the merged custom image. Requires
+    `CAPSULE_CUSTOM_COMPOSE`.
+
+*   `--no-cache`: Disable the build cache.
+
+*   `-r`, `--remote HOST[:PORT]`: Build on a remote Docker host.
+
+*   `--runtime podman|docker|auto`: Select the build backend.
+
+List options:
+
+*   `-r`, `--remote HOST[:PORT]`: Query a remote Docker host. A workdir suffix
+    is accepted but ignored.
+
+*   `--runtime podman|docker|auto`: Select local runtimes to query. `auto`
+    queries both.
+
+Other subcommands:
+
+*   `doctor`, `dr`: Check host runtime support and name repairs.
+
+*   `completion bash|zsh|fish`: Generate shell completion definitions.
+
 ### Environment variables
 
-*   `CAPSULE_DEBUG`: Enable shell xtrace for `capsule.sh`.
+Boolean options accept `1`, `true`, `yes`, or `on`. They are disabled by an
+empty value, `0`, `false`, `no`, or `off`.
 
-    Default: empty. When set to `1`, `capsule.sh` runs with `set -x`.
+*   `CAPSULE_BUILD`: Enable the run command's `--build` option.
+
+    Default: empty.
+
+*   `CAPSULE_BUILD_CUSTOM`: Enable the run command's `--build-custom` option.
+
+    Default: empty.
+
+*   `CAPSULE_NO_CACHE`: Enable `--no-cache` for builds.
+
+    Default: empty.
+
+*   `CAPSULE_PRIVATE_HOME`: Enable `--private-home`.
+
+    Default: empty.
+
+*   `CAPSULE_REMOTE`: Remote target. Run requires
+    `HOST[:PORT]:/absolute/workdir`; build and list accept `HOST[:PORT]`.
+
+    Default: empty.
+
+*   `CAPSULE_HOST_DOCKER`: Enable `--host-docker`.
+
+    Default: empty.
+
+*   `CAPSULE_RUNTIME`: Backend used by run, build, or list: `auto`, `podman`,
+    or `docker`.
+
+    Default: `auto`, which prefers podman when the host can run it rootless.
+
+*   `CAPSULE_IMAGE`: Image tag the podman backend builds and runs.
+
+    Default: `casual-capsule:local`. Set it to run a prebuilt image, which
+    also turns off the "image is not built" check.
+
+    A prebuilt image must have been built with the same
+    `CAPSULE_UID`/`CAPSULE_GID` as the host account, because keep-id
+    maps you onto that uid and nothing inside can adjust it.
+
+*   `CAPSULE_HOME_VOLUME`: podman volume mounted at `/home/user`.
+
+    Default: `casual-capsule-home`. Ignored under `--private-home`.
+
+*   `CAPSULE_INNER_VOLUME`: Volume holding the inner engine's images,
+    volumes and containers.
+
+    Default: derived from the workspace path, so each project gets its own.
+
+*   `CAPSULE_WITH_DOCKERD`: Build the image with a real Docker Engine.
+
+    Default: empty. Set to `1` at build time to make `capsule-docker
+    use-dockerd` available inside the Capsule.
+
+*   `CAPSULE_DEBUG`: Enable shell xtrace for `capsule`.
+
+    Default: empty. When set to `1`, Capsule runs with `set -x`.
 
 *   `CAPSULE_UID`: Container user UID (user ID).
 
@@ -640,13 +1076,26 @@ Options:
 Run lint checks on the host:
 
 ```bash
-$ tests/check_all.sh
+$ make check
 ```
 
 Run the test suites on the host:
 
 ```bash
-$ tests/test_all.sh
+$ make test
+```
+
+Run `make help` to list the available targets. The scripts under `tests/`
+remain directly executable.
+
+The podman backend is covered by the fast suite -- a mocked `podman` for the
+launcher, mocked engines for the in-Capsule router -- and by an end-to-end
+case that skips unless the host can run rootless containers. To exercise the
+whole chain on a real host, a Capsule with its own engine and a service
+running inside it, use the untracked operator check:
+
+```bash
+$ tmp/verify-podman-backend.sh
 ```
 
 Run checks and tests inside a Capsule:
@@ -676,14 +1125,18 @@ When one of these tools is missing, it prints a warning and skips that linter.
 The image includes utilities commonly used by coding agents, installed via
 `mise` (configured by the `MISE_SYSTEM_TOOLS` Dockerfile ARG). Set
 `MISE_SYSTEM_TOOLS` in the build environment to override the default tool list
-when building through Compose:
+when building through Compose. This replaces the entire default list. Existing
+overrides must add `python@<version>`, `ruff`, and `ty` to retain the Python
+tooling now included in that list. Include `codex`; its wrapper is configured
+during the build.
 
 ```bash
-MISE_SYSTEM_TOOLS="bat fd jq ripgrep uv" docker compose build cli
+MISE_SYSTEM_TOOLS="bat codex fd jq python@3.14 ripgrep ruff ty uv" \
+  docker compose build cli
 ```
 
 - `claude`: Claude Code agent CLI.
-- `codex`: Codex agent CLI.
+- `codex`: Codex agent CLI, always started without approvals or sandboxing.
 - `bat`: Syntax-highlighted file viewing.
 - `eza`: Enhanced directory listing.
 - `fd`: Fast file discovery.
@@ -692,13 +1145,23 @@ MISE_SYSTEM_TOOLS="bat fd jq ripgrep uv" docker compose build cli
 - `rg` (`ripgrep`): Fast content search.
 - `uv`: Python version, tool, and environment management.
 
+Container engines (see
+[Runtime backends](#runtime-backends-podman-and-docker)):
+
+- `podman`: The Capsule's own rootless engine, which also answers the Docker
+  API so `docker` and `docker compose` work against it.
+- `dockerd`: A real Docker Engine, present only when the image is built with
+  `CAPSULE_WITH_DOCKERD=1`.
+- `capsule-docker`: Selects which of the two `docker` talks to.
+
 Installed via `apt`:
 
 - `shellcheck`: Shell script linting.
 - `tree`: Directory structure visualization.
 
-Python tooling (installed via `uv`; binaries available on `PATH` via
-`~/.local/bin`):
+Python tooling (installed as system `mise` tools and available on `PATH` via
+`/usr/local/share/mise/shims`; include these tools in any
+`MISE_SYSTEM_TOOLS` override):
 
 - `python`: Python runtime (version set by `PYTHON_VERSION` ARG, default
   `3.14`).
@@ -715,8 +1178,10 @@ capsule bash -lc "rg --version && fd --version && jq --version && \
 
 ## 🔐 Security Note
 
-This setup mounts `/var/run/docker.sock` into the container, giving it
-host-level Docker access. Do not use with untrusted code or shared hosts.
+The Docker backend runs the Capsule as a privileged container and mounts the
+host Docker socket at `/var/lib/capsule/docker.sock`. Either capability can
+provide host-level access. Do not use this setup with untrusted code or on
+shared hosts.
 
 ## 📄 License
 

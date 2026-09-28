@@ -15,7 +15,7 @@ FAIL_COUNT=0
 run_suite() {
   local suite_name="$1"
 
-  printf 'Running %s\n' "$suite_name"
+  printf '%s: ' "$suite_name"
   if ! "$ROOT_DIR/tests/$suite_name"; then
     FAIL_COUNT=$((FAIL_COUNT + 1))
   fi

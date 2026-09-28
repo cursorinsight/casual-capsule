@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: capsule completion <bash|zsh|fish>
+
+Generate shell completion code on stdout.
+EOF
+}
+
+bash_completion() {
+  cat <<'EOF'
+_capsule() {
+  local command cur options prev values
+
+  COMPREPLY=()
+  cur=${COMP_WORDS[COMP_CWORD]}
+  prev=${COMP_WORDS[COMP_CWORD - 1]}
+  command=${COMP_WORDS[1]-}
+
+  if ((COMP_CWORD == 1)); then
+    values='run build list doctor dr completion -b --build -p --private-home
+      --publish -r --remote --runtime --host-docker -v --volume
+      --build-custom --no-cache -h --help --'
+    # Intentional word splitting for completion candidates.
+    # shellcheck disable=SC2207
+    COMPREPLY=($(compgen -W "$values" -- "$cur"))
+    return
+  fi
+
+  case "$prev" in
+    --runtime)
+      # shellcheck disable=SC2207
+      COMPREPLY=($(compgen -W 'auto docker podman' -- "$cur"))
+      return
+      ;;
+    --remote|--publish|--volume)
+      return
+      ;;
+  esac
+
+  case "$command" in
+    run)
+      options='-b --build -p --private-home --publish -r --remote
+        --runtime --host-docker -v --volume --build-custom --no-cache
+        -h --help --'
+      ;;
+    build)
+      options='--all --custom --no-cache -r --remote --runtime -h --help'
+      ;;
+    list)
+      options='-r --remote --runtime -h --help'
+      ;;
+    doctor|dr)
+      options='-h --help'
+      ;;
+    completion)
+      options='bash zsh fish -h --help'
+      ;;
+    *)
+      options='-b --build -p --private-home --publish -r --remote
+        --runtime --host-docker -v --volume --build-custom --no-cache
+        -h --help --'
+      ;;
+  esac
+
+  # Intentional word splitting for completion candidates.
+  # shellcheck disable=SC2207
+  COMPREPLY=($(compgen -W "$options" -- "$cur"))
+}
+
+complete -o bashdefault -o default -F _capsule capsule
+EOF
+}
+
+zsh_completion() {
+  cat <<'EOF'
+#compdef capsule
+
+_capsule_run_arguments() {
+  _arguments \
+    '(-b --build)'{-b,--build}'[build before running]' \
+    '(-p --private-home)'{-p,--private-home}'[use private home]' \
+    '--publish[map a port]:port mapping:' \
+    '(-r --remote)'{-r,--remote}'[run remotely]:remote target:' \
+    '--runtime[select runtime]:runtime:(auto docker podman)' \
+    '--host-docker[bind the host Docker socket]' \
+    '(-v --volume)'{-v,--volume}'[mount a volume]:volume mapping:' \
+    '--build-custom[build custom image before running]' \
+    '--no-cache[disable build cache]' \
+    '(-h --help)'{-h,--help}'[show help]' \
+    '*::command:_normal'
+}
+
+_capsule() {
+  local command
+  local -a commands
+  commands=(
+    'run:start a Capsule'
+    'build:build the Capsule image without starting it'
+    'list:list running Capsules'
+    'doctor:check host support and name repairs'
+    'dr:alias for doctor'
+    'completion:generate shell completion code'
+  )
+
+  if ((CURRENT == 2)); then
+    _describe 'command' commands
+  fi
+
+  command=${words[2]}
+  case $command in
+    run|build|list|doctor|dr|completion)
+      words[2]=()
+      ((CURRENT--))
+      ;;
+  esac
+  case $command in
+    run)
+      _capsule_run_arguments
+      ;;
+    build)
+      _arguments \
+        '--all[build base and configured custom image]' \
+        '--custom[build only the configured custom image]' \
+        '--no-cache[disable build cache]' \
+        '(-r --remote)'{-r,--remote}'[build remotely]:remote target:' \
+        '--runtime[select runtime]:runtime:(auto docker podman)' \
+        '(-h --help)'{-h,--help}'[show help]'
+      ;;
+    list)
+      _arguments \
+        '(-r --remote)'{-r,--remote}'[query remote host]:remote host:' \
+        '--runtime[select runtime]:runtime:(auto docker podman)' \
+        '(-h --help)'{-h,--help}'[show help]'
+      ;;
+    doctor|dr)
+      _arguments '(-h --help)'{-h,--help}'[show help]'
+      ;;
+    completion)
+      _arguments '1:shell:(bash zsh fish)' \
+        '(-h --help)'{-h,--help}'[show help]'
+      ;;
+    *)
+      _capsule_run_arguments
+      ;;
+  esac
+}
+
+_capsule "$@"
+EOF
+}
+
+fish_completion() {
+  cat <<'EOF'
+function __fish_capsule_using_run
+  set -l words (commandline -opc)
+  if test (count $words) -lt 2
+    return 0
+  end
+  not contains -- $words[2] build list doctor dr completion
+end
+
+complete -c capsule -f
+complete -c capsule -n '__fish_use_subcommand' -a run \
+  -d 'Start a Capsule'
+complete -c capsule -n '__fish_use_subcommand' -a build \
+  -d 'Build the Capsule image without starting it'
+complete -c capsule -n '__fish_use_subcommand' -a list \
+  -d 'List running Capsules'
+complete -c capsule -n '__fish_use_subcommand' -a doctor \
+  -d 'Check host support and name repairs'
+complete -c capsule -n '__fish_use_subcommand' -a dr \
+  -d 'Alias for doctor'
+complete -c capsule -n '__fish_use_subcommand' -a completion \
+  -d 'Generate shell completion code'
+
+complete -c capsule -n '__fish_capsule_using_run' -s b -l build
+complete -c capsule -n '__fish_capsule_using_run' -s p \
+  -l private-home
+complete -c capsule -n '__fish_capsule_using_run' -l publish -r
+complete -c capsule -n '__fish_capsule_using_run' -s r -l remote -r
+complete -c capsule -n '__fish_capsule_using_run' -l runtime -r \
+  -a 'auto docker podman'
+complete -c capsule -n '__fish_capsule_using_run' -l host-docker
+complete -c capsule -n '__fish_capsule_using_run' -s v -l volume -r
+complete -c capsule -n '__fish_capsule_using_run' -l build-custom
+complete -c capsule -n '__fish_capsule_using_run' -l no-cache
+
+complete -c capsule -n '__fish_seen_subcommand_from build' -l all
+complete -c capsule -n '__fish_seen_subcommand_from build' -l custom
+complete -c capsule -n '__fish_seen_subcommand_from build' -l no-cache
+complete -c capsule -n '__fish_seen_subcommand_from build' -s r -l remote -r
+complete -c capsule -n '__fish_seen_subcommand_from build' -l runtime -r \
+  -a 'auto docker podman'
+
+complete -c capsule -n '__fish_seen_subcommand_from list' -s r -l remote -r
+complete -c capsule -n '__fish_seen_subcommand_from list' -l runtime -r \
+  -a 'auto docker podman'
+
+complete -c capsule -n '__fish_seen_subcommand_from completion' \
+  -a 'bash zsh fish'
+EOF
+}
+
+if [[ $# -gt 1 ]]; then
+  printf 'capsule: error: completion accepts one shell\n\n' >&2
+  usage >&2
+  exit 2
+fi
+
+case "${1-}" in
+  bash) bash_completion ;;
+  zsh) zsh_completion ;;
+  fish) fish_completion ;;
+  -h|--help) usage ;;
+  '')
+    printf 'capsule: error: shell is required\n\n' >&2
+    usage >&2
+    exit 2
+    ;;
+  *)
+    printf 'capsule: error: unsupported shell: %s\n\n' "$1" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

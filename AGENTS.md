@@ -57,7 +57,7 @@ Assisted-by: Copilot:claude-sonnet-4.6
 4. Never hardcode secrets.
 5. Interactive shells: no auto-restart.
 6. Handle Linux and macOS Docker socket GID differences.
-7. `capsule.sh` resolves UID/GID via `id -u` / `id -g`.
+7. Capsule resolves UID/GID via `id -u` / `id -g`.
    `CAPSULE_UID` / `CAPSULE_GID` override. Fallback: `1000:100`.
 8. `docker/entrypoint.sh` adjusts UID/GID, Docker socket group,
    and home ownership, then drops privileges.
@@ -68,18 +68,36 @@ Assisted-by: Copilot:claude-sonnet-4.6
 ## Structure
 
 - `Dockerfile`: Debian-based image with dev tools, `mise`,
-  Docker CLI/Compose, Claude/Codex CLIs, Python, `ruff`, and `ty`.
-- `compose.yml`: Local `cli` service; mounts workspace, Docker socket,
-  and home volume; provides build and runtime `github_api_token` secret.
-- `capsule.sh`: Launcher; handles allowlist, UID/GID, build flags,
-  and Compose invocations.
-- `docker/entrypoint.sh`: Root entrypoint; syncs UID/GID, Docker group,
-  and home ownership, then execs as `user`.
+  Docker CLI/Compose, `podman`, Claude/Codex CLIs, Python, `ruff`, and
+  `ty`; wraps Codex for unrestricted use. `CAPSULE_WITH_DOCKERD=1` adds a
+  real Docker Engine.
+- `compose.yml`: Local privileged `cli` service; mounts workspace, Docker
+  socket, and home volume; permits nested Podman tests; provides the build
+  and runtime `github_api_token` secret.
+- `Makefile`: Help, lint/check, and test entry points.
+- `bin/capsule`: User-facing command dispatcher. Omitting a subcommand keeps
+  the legacy run behavior.
+- `capsule.sh`: Backward-compatible wrapper for `bin/capsule`.
+- `lib/capsule/common.sh`: Shared run, build, list, backend, and host-path
+  logic.
+- `libexec/capsule/`: Implementations of the `run`, `build`, `list`, `doctor`,
+  and `completion` subcommands.
+- `docker/entrypoint.sh`: Root entrypoint; syncs UID/GID, Docker socket
+  group, nested Podman ID ranges, and home ownership, then execs as `user`.
+  Under podman the container already starts as `user`, so it only refreshes
+  credentials.
+- `docker/capsule-docker.sh`: The Capsule's `docker` router and the
+  `capsule-docker` engine switch; starts the podman API socket or a
+  rootless `dockerd` on first use.
+- `docker/containers.conf`, `docker/registries.conf`,
+  `docker/storage.conf`: Configuration for the Capsule's inner engine,
+  including the per-workspace storage path.
 - `docker/setup-docker.sh`: Installs Docker APT repo, CLI, Compose,
-  and buildx.
+  buildx, and the Engine when `CAPSULE_WITH_DOCKERD=1`.
 - `docker/mise.sh`: Activates `mise` and Bash completions for
   interactive shells.
 - `tests/check_all.sh`: Repo-wide lint/check script.
 - `tests/suite_fast.sh`: Fast Bash contract tests.
-- `tests/suite_e2e.sh`: Docker-backed end-to-end test.
+- `tests/suite_e2e.sh`: Docker- and podman-backed end-to-end tests;
+  the podman case skips where the host cannot run rootless.
 - `tests/test_all.sh`: Runs fast then e2e suites.

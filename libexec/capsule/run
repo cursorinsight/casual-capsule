@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ -n "${CAPSULE_ROOT:-}" ]] || {
+  printf 'capsule: error: run this command through capsule\n' >&2
+  exit 1
+}
+
+# shellcheck source=lib/capsule/common.sh
+# shellcheck disable=SC1091
+source "$CAPSULE_ROOT/lib/capsule/common.sh"
+
+main "$@"

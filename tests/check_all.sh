@@ -25,10 +25,47 @@ hadolint_files=(
 )
 shellcheck_files=(
   *.sh
+  bin/*
   docker/*.sh
+  lib/capsule/*.sh
+  libexec/capsule/*
   tests/*.sh
   tests/fixtures/*/*.sh
 )
+
+PASS_MARK="."
+SKIP_MARK="s"
+PASS_COUNT=0
+FAIL_COUNT=0
+SKIP_COUNT=0
+SKIP_REASONS=()
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  PASS_MARK=$'\033[32m.\033[0m'
+  SKIP_MARK=$'\033[33ms\033[0m'
+fi
+
+pass() {
+  printf '%s' "$PASS_MARK"
+  PASS_COUNT=$((PASS_COUNT + 1))
+}
+
+fail() {
+  printf '\nFAIL: %s\n' "$1" >&2
+  FAIL_COUNT=$((FAIL_COUNT + 1))
+}
+
+skip() {
+  local reason="$1"
+  local recorded=""
+
+  printf '%s' "$SKIP_MARK"
+  SKIP_COUNT=$((SKIP_COUNT + 1))
+  for recorded in ${SKIP_REASONS[@]+"${SKIP_REASONS[@]}"}; do
+    [[ "$recorded" == "$reason" ]] && return
+  done
+  SKIP_REASONS+=("$reason")
+}
 
 resolve_docker_mount_root() {
   local root_dir="$1"
@@ -62,6 +99,7 @@ run_docker_linter() {
   shift 3
   local files=("$@")
   local docker_mount_root=""
+  local output=""
 
   local ep_args=()
   if [[ -n "$entrypoint" ]]; then
@@ -74,20 +112,34 @@ run_docker_linter() {
     abs_files+=("/mnt/$f")
   done
 
-  printf '%s (docker): checking %d %s files\n' \
-    "$image" "${#files[@]}" "$category"
   docker_mount_root="$(resolve_docker_mount_root "$ROOT_DIR")"
-  if docker run --rm \
-       -v "$docker_mount_root:/mnt" \
-       ${ep_args[@]+"${ep_args[@]}"} \
-       "$image" \
-       "${abs_files[@]}"; then
-    printf 'PASS: %s checks passed.\n' "$category"
+  if output="$(
+    docker run --rm \
+      -v "$docker_mount_root:/mnt" \
+      ${ep_args[@]+"${ep_args[@]}"} \
+      "$image" \
+      "${abs_files[@]}" 2>&1
+  )"; then
+    pass
     return 0
   fi
 
-  printf 'FAIL: %s checks failed.\n' "$category" >&2
+  fail "$category checks failed with $image."
+  if [[ -n "$output" ]]; then
+    printf '%s\n' "$output" >&2
+  fi
   return 1
+}
+
+# Return success when a tool is installed and can actually run. A mise shim
+# sits on PATH for every tool mise knows about, whether or not a version is
+# installed, so "command -v" alone would report a linter that errors out the
+# moment it is called.
+tool_is_usable() {
+  local tool="$1"
+
+  command -v "$tool" >/dev/null 2>&1 \
+    && "$tool" --version >/dev/null 2>&1
 }
 
 run_linter() {
@@ -97,19 +149,22 @@ run_linter() {
   local category="$4"
   shift 4
   local files=("$@")
+  local output=""
 
   if [[ "${#files[@]}" -eq 0 ]]; then
-    printf 'INFO: no %s files; skipping %s.\n' "$category" "$tool"
+    skip "no $category files; skipping $tool"
     return 0
   fi
 
-  if command -v "$tool" >/dev/null 2>&1; then
-    printf '%s: checking %d files\n' "$tool" "${#files[@]}"
-    if "$tool" "${files[@]}"; then
-      printf 'PASS: %s checks passed.\n' "$tool"
+  if tool_is_usable "$tool"; then
+    if output="$("$tool" "${files[@]}" 2>&1)"; then
+      pass
       return 0
     fi
-    printf 'FAIL: %s checks failed.\n' "$tool" >&2
+    fail "$tool checks failed."
+    if [[ -n "$output" ]]; then
+      printf '%s\n' "$output" >&2
+    fi
     return 1
   fi
 
@@ -120,22 +175,25 @@ run_linter() {
     return
   fi
 
-  printf 'WARNING: %s not found; skipping %s lint.\n' \
-    "$tool" "$category" >&2
+  skip "$tool unavailable; skipping $category lint"
   return 0
 }
 
 status=0
-printf '%s\n' 'Running lint checks...'
 run_linter dclint zavoloklom/dclint "" \
   Compose "${dclint_files[@]}" || status=1
 run_linter hadolint hadolint/hadolint /bin/hadolint \
   Dockerfile "${hadolint_files[@]}" || status=1
-run_linter shellcheck koalaman/shellcheck:stable "" \
-  shell "${shellcheck_files[@]}" || status=1
+for shellcheck_file in "${shellcheck_files[@]}"; do
+  run_linter shellcheck koalaman/shellcheck:stable "" \
+    shell "$shellcheck_file" || status=1
+done
 
-if [[ "$status" -eq 0 ]]; then
-  printf '%s\n' 'All available lint checks passed.'
+printf '\nSummary: %d passed, %d failed, %d skipped\n' \
+  "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT"
+if [[ "${#SKIP_REASONS[@]}" -gt 0 ]]; then
+  printf 'Skipped:\n'
+  printf '  - %s\n' "${SKIP_REASONS[@]}"
 fi
 
 exit "$status"

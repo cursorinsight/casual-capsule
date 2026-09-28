@@ -12,12 +12,12 @@ services:
         - github_api_token
     volumes:
       - ${CAPSULE_HOST_WORKDIR:-${CAPSULE_WORKDIR:-${PWD}}}:/home/workspace
-      - /var/run/docker.sock:/run/docker.sock
+      - /var/run/docker.sock:/var/lib/capsule/docker.sock
       - ${CAPSULE_HOME_MOUNT:-home:/home/user}
     secrets:
       - github_api_token
     environment:
-      - DOCKER_HOST=unix:///run/docker.sock
+      - DOCKER_HOST=unix:///var/lib/capsule/docker.sock
       - DOCKER_GID=${DOCKER_GID:-999}
       - CAPSULE_UID=${CAPSULE_UID:-}
       - CAPSULE_GID=${CAPSULE_GID:-}
@@ -29,6 +29,9 @@ services:
     working_dir: /home/workspace
     restart: "no"
     hostname: capsule
+    # Nested rootless Podman needs user namespaces, writable cgroups, and
+    # /dev/fuse when the repository tests run inside a Docker-backed Capsule.
+    privileged: true
 
 volumes:
   home:
