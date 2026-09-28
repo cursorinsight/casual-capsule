@@ -19,6 +19,27 @@ EXAMPLE_PROJECT_DIR="$ROOT_DIR/tests/fixtures/example-project"
 CUSTOM_CAPSULE_DIR="$ROOT_DIR/tests/fixtures/custom-capsule"
 PROFILE_CAPSULE_DIR="$ROOT_DIR/tests/fixtures/profile-capsule"
 BUILD_DIR="$ROOT_DIR/_build/tests"
+PROFILE_TEST_TOKEN="$(
+  printf '%s\n' "$PROFILE_CAPSULE_DIR" | cksum | cut -d' ' -f1
+)"
+printf -v PROFILE_TEST_TOKEN '%08x' "$PROFILE_TEST_TOKEN"
+PROFILE_TEST_IMAGE="${CAPSULE_COMPOSE_PROJECT_NAME:-casual-capsule}"
+PROFILE_TEST_IMAGE+="-p-test-profile-${PROFILE_TEST_TOKEN}:local"
+PODMAN_PROFILE_BASE="${CAPSULE_IMAGE:-casual-capsule:local}"
+PODMAN_PROFILE_BASE_TOKEN="$(
+  printf '%s\0' "$PODMAN_PROFILE_BASE" | cksum | cut -d' ' -f1
+)"
+printf -v PODMAN_PROFILE_BASE_TOKEN '%08x' "$PODMAN_PROFILE_BASE_TOKEN"
+PODMAN_PROFILE_TEST_IMAGE="${PROFILE_TEST_IMAGE%:local}"
+PODMAN_PROFILE_TEST_IMAGE+="-${PODMAN_PROFILE_BASE_TOKEN}:local"
+CONTROLLER_PROFILE_TOKEN="$(
+  printf '%s\n' '/controller/repo/tests/fixtures/profile-capsule' | \
+    cksum | cut -d' ' -f1
+)"
+printf -v CONTROLLER_PROFILE_TOKEN '%08x' "$CONTROLLER_PROFILE_TOKEN"
+CONTROLLER_PROFILE_IMAGE="casual-capsule-p-test-profile-"
+CONTROLLER_PROFILE_IMAGE+="${CONTROLLER_PROFILE_TOKEN}:local"
+CUSTOM_TEST_IMAGE="fixture-custom-capsule:local"
 
 mkdir -p "$BUILD_DIR"
 TEST_TMPDIR="$(mktemp -d "$BUILD_DIR/suite_e2e.XXXXXX")"
@@ -46,6 +67,18 @@ timestamp() {
 log_message() {
   printf '%s %s\n' "$(timestamp)" "$*" >>"$LOG_FILE"
 }
+
+# Remove images built only for this suite.
+cleanup_test_images() {
+  docker image rm -f "$PROFILE_TEST_IMAGE" >/dev/null 2>&1 || true
+  docker image rm -f "$CONTROLLER_PROFILE_IMAGE" \
+    >/dev/null 2>&1 || true
+  docker image rm -f "$CUSTOM_TEST_IMAGE" >/dev/null 2>&1 || true
+  podman image rm -f "$PODMAN_PROFILE_TEST_IMAGE" >/dev/null 2>&1 || true
+}
+
+cleanup_test_images
+trap cleanup_test_images EXIT
 
 # Prefix streamed command output with timestamps before writing the logfile.
 log_stream() {
@@ -360,7 +393,7 @@ EOF
   write_approval_config "$config_file" "$EXAMPLE_PROJECT_DIR"
   token="$(printf '%s\n' "$profile_dir" | cksum | cut -d' ' -f1)"
   printf -v token '%08x' "$token"
-  image="casual-capsule-profile-unbuilt-e2e-${token}:local"
+  image="casual-capsule-p-unbuilt-e2e-${token}:local"
   docker image rm -f "$image" >/dev/null 2>&1 || true
   real_docker="$(command -v docker)"
   : >"$command_log"
@@ -564,6 +597,8 @@ main() {
   test_unbuilt_profile_fails_before_container_creation
   test_profile_from_docker_controller_container
   test_podman_backend_end_to_end
+  cleanup_test_images
+  trap - EXIT
 
   log_message \
     "Summary: $PASS_COUNT passed, $FAIL_COUNT failed, $SKIP_COUNT skipped"

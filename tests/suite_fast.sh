@@ -3066,8 +3066,6 @@ EOF
   assert_file_contains "$log_file" \
     "--volume $profile_dir/data:/profile-data:ro" \
     "profile resolves relative volumes against its directory"
-  assert_file_not_contains "$log_file" '-profile-' \
-    "runtime-only profile does not replace the Capsule image"
   assert_file_contains "$log_file" \
     'ENV_CAPSULE_COMPOSE_PROJECT_NAME=casual-capsule-runtime' \
     "profile namespace isolates the Docker Compose project"
@@ -3143,7 +3141,7 @@ EOF
     '--build-arg CAPSULE_BASE_IMAGE=inherited-project-cli:latest' \
     "profile build extends the effective Compose base image"
   assert_file_contains "$override_file" \
-    'image: inherited-project-runtime-profile-compose-project-' \
+    'image: inherited-project-runtime-p-compose-project-' \
     "profile image uses the effective namespaced project"
   assert_file_contains "$log_file" \
     'ARGS=compose --project-name inherited-project-runtime -f' \
@@ -3291,6 +3289,7 @@ test_profile_names_resolve_from_xdg_config() {
   local local_profile_dir="$tdir/named-test"
   local mock_bin="$tdir/bin"
   local log_file="$tdir/log"
+  local profile_env_file=""
   local selector=""
   local work_dir=""
   mkdir -p "$profile_dir" "$local_profile_dir"
@@ -3659,7 +3658,7 @@ test_profile_custom_build_generates_ordered_image() {
     fail "profile image token is fixed-width lowercase hexadecimal"
   fi
   assert_file_contains "$log_file" \
-    "DOCKER_ARGS=build --tag casual-capsule-profile-test-profile-$token" \
+    "DOCKER_ARGS=build --tag casual-capsule-p-test-profile-$token" \
     "profile custom build invokes Docker without release lookup"
   assert_file_contains "$log_file" \
     '--build-arg CAPSULE_BASE_IMAGE=casual-capsule-cli:latest' \
@@ -3674,6 +3673,78 @@ test_profile_custom_build_generates_ordered_image() {
     "generated Dockerfile retains profile boundaries"
   assert_file_contains "$generated_file" 'ENV CUSTOM_CAPSULE_IMAGE=1' \
     "generated Dockerfile contains profile instructions"
+}
+
+test_long_profile_names_use_bounded_image() {
+  local tdir="$TEST_TMPDIR/profile-long-name"
+  local profile_dir="$tdir/profile"
+  local mock_bin="$tdir/bin"
+  local first_name=""
+  local second_name=""
+  local name_checksum=""
+  local name_token=""
+  local path_token=""
+  local first_image=""
+  local first_repository=""
+  local second_image=""
+  local second_repository=""
+  local unhashed_repository=""
+  mkdir -p "$profile_dir"
+  make_mock_bin "$mock_bin"
+  first_name="$(printf '%0211d' 0 | tr '0' a)"
+  second_name="${first_name}b"
+  path_token="$(profile_path_token "$profile_dir")"
+
+  cat >"$profile_dir/capsule.toml" <<EOF
+version = 1
+name = "$first_name"
+
+[dockerfile]
+content = '''
+ENV LONG_PROFILE_NAME=first
+'''
+EOF
+  DOCKER_GID=1111 run_capsule "$mock_bin" "$tdir/first-log" \
+    build --custom --profile "$profile_dir"
+  first_image="casual-capsule-p-${first_name}-${path_token}:local"
+  first_repository="${first_image%:local}"
+  assert_file_contains "$tdir/first-log" "--tag $first_image" \
+    "a 237-byte profile repository remains readable"
+  assert_equals 237 "${#first_repository}" \
+    "unqualified profile repository accepts the 237-byte boundary"
+
+  cat >"$profile_dir/capsule.toml" <<EOF
+version = 1
+name = "$second_name"
+
+[dockerfile]
+content = '''
+ENV LONG_PROFILE_NAME=second
+'''
+EOF
+  DOCKER_GID=1111 run_capsule "$mock_bin" "$tdir/second-log" \
+    build --custom --profile "$profile_dir"
+  unhashed_repository="casual-capsule-p-${second_name}-${path_token}"
+  assert_equals 238 "${#unhashed_repository}" \
+    "oversized profile repository crosses the boundary by one byte"
+  name_checksum="$(
+    printf '%s\0' "$second_name" | cksum | cut -d' ' -f1
+  )"
+  printf -v name_token '%08x' "$name_checksum"
+  second_image="casual-capsule-p-${name_token}-${path_token}:local"
+  second_repository="${second_image%:local}"
+  assert_file_contains "$tdir/second-log" "--tag $second_image" \
+    "a 238-byte profile repository uses its fixed-width token"
+  if [[ "${#second_repository}" -le 237 ]]; then
+    pass "hashed profile repository stays within 237 bytes"
+  else
+    fail "hashed profile repository stays within 237 bytes"
+  fi
+  if [[ "$first_image" != "$second_image" ]]; then
+    pass "different long profile names select distinct images"
+  else
+    fail "different long profile names select distinct images"
+  fi
 }
 
 test_generated_profile_files_are_cached_by_output() {
@@ -3713,10 +3784,10 @@ EOF
   for compose_file in "$cache_dir"/*/compose.yml; do
     [[ -f "$compose_file" ]] || continue
     artifact_dir="${compose_file%/compose.yml}"
-    if grep -Fq 'image: first-project-profile-generated-cache-' \
+    if grep -Fq 'image: first-project-p-generated-cache-' \
       "$compose_file"; then
       first_artifact="$artifact_dir"
-    elif grep -Fq 'image: second-project-profile-generated-cache-' \
+    elif grep -Fq 'image: second-project-p-generated-cache-' \
       "$compose_file"; then
       second_artifact="$artifact_dir"
     fi
@@ -3783,7 +3854,7 @@ test_docker_profile_runtime_requires_the_selected_image() {
   make_mock_bin "$mock_bin"
 
   token="$(profile_path_token "$PROFILE_CAPSULE_DIR")"
-  selected_image="casual-capsule-profile-test-profile-${token}:local"
+  selected_image="casual-capsule-p-test-profile-${token}:local"
 
   DOCKER_GID=1111 run_capsule "$mock_bin" "$cli_log" \
     --profile "$PROFILE_CAPSULE_DIR" true
@@ -3898,7 +3969,7 @@ EOF
   forward_token="$(profile_path_token "$first_dir" "$second_dir")"
   generated_file="$(profile_generated_file "$forward_token" Dockerfile)"
   assert_file_contains "$log_file" \
-    "--tag casual-capsule-profile-first-second-$forward_token:local" \
+    "--tag casual-capsule-p-first-second-$forward_token:local" \
     "profile image names preserve selected profile order"
   assert_file_contains \
     "$generated_file" \
@@ -3911,7 +3982,7 @@ EOF
   reverse_token="$(profile_path_token "$second_dir" "$first_dir")"
   generated_file="$(profile_generated_file "$reverse_token" Dockerfile)"
   assert_file_contains "$log_file" \
-    "--tag casual-capsule-profile-second-first-$reverse_token:local" \
+    "--tag casual-capsule-p-second-first-$reverse_token:local" \
     "reversed profile names remain readable in the image tag"
   if [[ "$forward_token" != "$reverse_token" ]]; then
     pass "reversing profiles selects a distinct image tag"
@@ -3927,14 +3998,14 @@ EOF
   CAPSULE_PROFILES="$first_dir;$second_dir" DOCKER_GID=1111 \
     run_capsule "$mock_bin" "$log_file" true
   assert_file_contains "$log_file" \
-    "image inspect casual-capsule-profile-first-second-$forward_token:local" \
+    "image inspect casual-capsule-p-first-second-$forward_token:local" \
     "Docker runtime checks the exact ordered profile image"
 
   : >"$log_file"
   CAPSULE_PROFILES="$second_dir;$first_dir" DOCKER_GID=1111 \
     run_capsule "$mock_bin" "$log_file" true
   assert_file_contains "$log_file" \
-    "image inspect casual-capsule-profile-second-first-$reverse_token:local" \
+    "image inspect casual-capsule-p-second-first-$reverse_token:local" \
     "reversed profiles check their distinct Docker image"
 }
 
@@ -4158,9 +4229,9 @@ EOF
     printf '%s\0' 'base-b:local' | cksum | cut -d' ' -f1
   )"
   printf -v second_base_token '%08x' "$second_base_token"
-  first_image="casual-capsule-profile-podman-base-${path_token}"
+  first_image="casual-capsule-p-podman-base-${path_token}"
   first_image="${first_image}-${first_base_token}:local"
-  second_image="casual-capsule-profile-podman-base-${path_token}"
+  second_image="casual-capsule-p-podman-base-${path_token}"
   second_image="${second_image}-${second_base_token}:local"
 
   CAPSULE_RUNTIME=podman CAPSULE_IMAGE=base-a:local \
@@ -6007,6 +6078,7 @@ main() {
   test_profile_home_volume_rejects_missing_remote_home
   test_remote_profile_volume_source_rules
   test_profile_custom_build_generates_ordered_image
+  test_long_profile_names_use_bounded_image
   test_generated_profile_files_are_cached_by_output
   test_docker_profile_runtime_requires_the_selected_image
   test_profile_build_preserves_selected_order

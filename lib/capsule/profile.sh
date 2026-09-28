@@ -699,12 +699,18 @@ profile_artifact_token() {
 
 # Create the generated Dockerfile and Compose image override.
 generate_profile_build_files() {
+  local cache_home="${XDG_CACHE_HOME:-$HOME/.cache}"
   local artifact_token=""
   local base_image_checksum=""
   local base_image_token=""
-  local cache_home="${XDG_CACHE_HOME:-$HOME/.cache}"
+  local image_prefix=""
+  local image_repository=""
+  local image_suffix=""
+  local unqualified_repository_limit=237
   local token=""
   local profile_names=""
+  local profile_names_checksum=""
+  local profile_names_token=""
   local index=0
   local complete_marker=""
   local dockerfile_tmp=""
@@ -718,16 +724,28 @@ generate_profile_build_files() {
   token="$(profile_set_token)"
   if [[ "$PROFILE_HAS_FRAGMENT" -eq 1 ]]; then
     profile_names="$(IFS=-; printf '%s' "${PROFILE_NAMES[*]}")"
-    PROFILE_IMAGE="${CAPSULE_COMPOSE_PROJECT_NAME:-casual-capsule}"
-    PROFILE_IMAGE="${PROFILE_IMAGE}-profile-${profile_names}-${token}"
+    image_prefix="${CAPSULE_COMPOSE_PROJECT_NAME:-casual-capsule}-p-"
+    image_suffix="-${token}"
     if [[ "$RUNTIME_BACKEND" == "podman" ]]; then
       base_image_checksum="$(
         printf '%s\0' "$PROFILE_BASE_IMAGE" | cksum | cut -d' ' -f1
       )"
       printf -v base_image_token '%08x' "$base_image_checksum"
-      PROFILE_IMAGE="${PROFILE_IMAGE}-${base_image_token}"
+      image_suffix="${image_suffix}-${base_image_token}"
     fi
-    PROFILE_IMAGE="${PROFILE_IMAGE}:local"
+    image_repository="${image_prefix}${profile_names}${image_suffix}"
+    # Docker normalizes unqualified names below docker.io/library/.
+    if [[ "${#image_repository}" -gt "$unqualified_repository_limit" ]]; then
+      profile_names_checksum="$(
+        printf '%s\0' "${PROFILE_NAMES[@]}" | cksum | cut -d' ' -f1
+      )"
+      printf -v profile_names_token '%08x' "$profile_names_checksum"
+      image_repository="${image_prefix}${profile_names_token}${image_suffix}"
+    fi
+    if [[ "${#image_repository}" -gt "$unqualified_repository_limit" ]]; then
+      die 'Compose project name is too long for a profile image'
+    fi
+    PROFILE_IMAGE="${image_repository}:local"
   else
     PROFILE_IMAGE="$PROFILE_BASE_IMAGE"
   fi
