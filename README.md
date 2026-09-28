@@ -400,6 +400,41 @@ CAPSULE_RUNTIME=podman capsule     # the same choice, from the environment
 Unlike the Docker backend, no AppArmor or sysctl change is needed on Ubuntu
 23.10+: podman's rootless path works there as shipped.
 
+#### When podman container startup is slow
+
+Capsule uses `--userns=keep-id` so the host user maps to `user` in the
+container. With native overlayfs, creating the first container for an image
+and UID/GID mapping can spend a long time adjusting image-layer ownership.
+This delays container creation, not the running container.
+
+Using `fuse-overlayfs` avoids that native-overlayfs penalty by applying the
+mapping dynamically. Check the active implementation first:
+
+```bash
+podman info --format \
+  '{{index .Store.GraphStatus "Native Overlay Diff"}}'
+```
+
+`true` means native overlayfs is active. Install your distribution's
+`fuse-overlayfs` package, then merge this into
+`$XDG_CONFIG_HOME/containers/storage.conf`, or
+`~/.config/containers/storage.conf` when `XDG_CONFIG_HOME` is unset:
+
+```toml
+[storage]
+driver = "overlay"
+
+[storage.options.overlay]
+mount_program = "/usr/bin/fuse-overlayfs"
+```
+
+Configure this before first use when possible. An existing Podman store may
+need `podman system reset` before the change takes effect. That command deletes
+all Podman containers, images, networks, volumes, and machines for the user,
+including Capsule's Podman volumes, so back up anything needed first. See
+Podman's performance guide for details:
+<https://github.com/containers/podman/blob/main/docs/tutorials/performance.md>
+
 #### When podman cannot start a container
 
 A build or run that dies with `Interactive authentication required`, on a
