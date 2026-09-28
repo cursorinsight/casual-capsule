@@ -68,18 +68,32 @@ Assisted-by: Copilot:claude-sonnet-4.6
 ## Structure
 
 - `Dockerfile`: Debian-based image with dev tools, `mise`,
-  Docker CLI/Compose, Claude/Codex CLIs, Python, `ruff`, and `ty`.
-- `compose.yml`: Local `cli` service; mounts workspace, Docker socket,
-  and home volume; provides build and runtime `github_api_token` secret.
-- `capsule.sh`: Launcher; handles allowlist, UID/GID, build flags,
-  and Compose invocations.
-- `docker/entrypoint.sh`: Root entrypoint; syncs UID/GID, Docker group,
-  and home ownership, then execs as `user`.
+  Docker CLI/Compose, `podman`, Claude/Codex CLIs, Python, `ruff`, and
+  `ty`. `CAPSULE_WITH_DOCKERD=1` adds a real Docker Engine.
+- `compose.yml`: Local privileged `cli` service; mounts workspace, Docker
+  socket, and home volume; permits nested Podman tests; provides the build
+  and runtime `github_api_token` secret.
+- `capsule.sh`: Launcher; selects the podman or Docker backend, and
+  handles allowlist, UID/GID, build flags, and runtime invocations.
+- `capsule-doctor.sh`: Host environment check; reports what each backend
+  needs and the command that repairs what is missing.
+- `docker/entrypoint.sh`: Root entrypoint; syncs UID/GID, Docker socket
+  group, nested Podman ID ranges, and home ownership, then execs as `user`.
+  Under podman the container already starts as `user`, so it only refreshes
+  credentials.
+- `docker/capsule-docker.sh`: The Capsule's `docker` router and the
+  `capsule-docker` engine switch; starts the podman API socket or a
+  rootless `dockerd` on first use.
+- `docker/codex.sh`: Starts Codex with approvals and sandboxing disabled.
+- `docker/containers.conf`, `docker/registries.conf`,
+  `docker/storage.conf`: Configuration for the Capsule's inner engine,
+  including the per-workspace storage path.
 - `docker/setup-docker.sh`: Installs Docker APT repo, CLI, Compose,
-  and buildx.
+  buildx, and the Engine when `CAPSULE_WITH_DOCKERD=1`.
 - `docker/mise.sh`: Activates `mise` and Bash completions for
   interactive shells.
 - `tests/check_all.sh`: Repo-wide lint/check script.
 - `tests/suite_fast.sh`: Fast Bash contract tests.
-- `tests/suite_e2e.sh`: Docker-backed end-to-end test.
+- `tests/suite_e2e.sh`: Docker- and podman-backed end-to-end tests;
+  the podman case skips where the host cannot run rootless.
 - `tests/test_all.sh`: Runs fast then e2e suites.

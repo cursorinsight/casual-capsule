@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+#-------------------------------------------------------------------------------
+# Copyright (C) 2026- Cursor Insight
+#
+# SPDX-License-Identifier: Apache-2.0
+#-------------------------------------------------------------------------------
+# Report whether this host can run Capsule, and name the fix for what it
+# cannot.
+#
+# Every check prints one line, and anything short of a pass prints the command
+# that repairs it. A warning costs a capability; a failure means something that
+# looks available cannot actually run. Exits non-zero on any failure.
+#-------------------------------------------------------------------------------
+
+set -euo pipefail
+
+PASS_COUNT=0
+WARN_COUNT=0
+FAIL_COUNT=0
+DOCKER_USABLE=0
+PODMAN_USABLE=0
+
+# Print a satisfied check.
+pass() {
+  printf 'PASS  %s\n' "$1"
+  PASS_COUNT=$((PASS_COUNT + 1))
+}
+
+# Print a check that costs a capability but leaves the host usable.
+warn() {
+  printf 'WARN  %s\n' "$1"
+  printf '      %s\n' "$2"
+  WARN_COUNT=$((WARN_COUNT + 1))
+}
+
+# Print a check that leaves the host unable to run what it advertises.
+fail() {
+  printf 'FAIL  %s\n' "$1"
+  printf '      %s\n' "$2"
+  FAIL_COUNT=$((FAIL_COUNT + 1))
+}
+
+# Print a section heading.
+section() {
+  printf '\n%s\n' "$1"
+}
+
+# Return success when a command exists.
+have() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+# Return success when a command exists and can actually run. A mise shim is
+# on PATH for every tool mise knows about, installed or not.
+usable() {
+  have "$1" && "$1" --version >/dev/null 2>&1
+}
+
+# Check the Docker backend: client, compose plugin, and a reachable daemon.
+check_docker() {
+  section 'Docker backend'
+
+  if ! have docker; then
+    warn 'docker is not installed' \
+      'install Docker Engine 24+ to use the Docker backend'
+    return 0
+  fi
+  pass 'docker is installed'
+
+  if ! docker compose version >/dev/null 2>&1; then
+    warn 'docker compose v2 is not available' \
+      'install the docker-compose-plugin package'
+    return 0
+  fi
+  pass 'docker compose v2 is available'
+
+  if ! docker info >/dev/null 2>&1; then
+    warn 'the Docker daemon does not answer' \
+      'start Docker, or point DOCKER_HOST at a daemon that runs'
+    return 0
+  fi
+  pass 'the Docker daemon answers'
+
+  DOCKER_USABLE=1
+}
+
+# Check that podman is rootless and has a sub-id range to map into.
+check_podman_engine() {
+  local info=""
+  local rootless=""
+  local id_ranges=""
+
+  info="$(podman info --format \
+    '{{.Host.Security.Rootless}} {{len .Host.IDMappings.UIDMap}}' \
+    2>/dev/null || true)"
+
+  if [[ -z "$info" ]]; then
+    fail 'podman cannot reach a working engine' \
+      'run "podman info" and fix what it reports'
+    return 1
+  fi
+
+  read -r rootless id_ranges <<<"$info"
+
+  if [[ "$rootless" != "true" ]]; then
+    fail 'podman is running rootful' \
+      'Capsule wants rootless podman; do not run it as root'
+    return 1
+  fi
+  pass 'podman is rootless'
+
+  if [[ ! "$id_ranges" =~ ^[0-9]+$ ]] || [[ "$id_ranges" -le 1 ]]; then
+    fail 'this account has no sub-id range' \
+      'install the uidmap package, then run: podman system migrate'
+    return 1
+  fi
+  pass 'this account has a sub-id range'
+}
+
+# Name why the session bus is unusable, so the remedy fits the cause. A
+# desktop dbus-launch leaves an address in /tmp that has no systemd on it,
+# and that address overrides the working default.
+session_bus_remedy() {
+  local runtime_bus="${XDG_RUNTIME_DIR:-}/bus"
+  local address="${DBUS_SESSION_BUS_ADDRESS:-}"
+
+  if [[ -e "$runtime_bus" ]] && [[ -n "$address" ]] &&
+    [[ "$address" != "unix:path=${runtime_bus}"* ]]; then
+    printf 'DBUS_SESSION_BUS_ADDRESS skips %s; unset it or point it there\n' \
+      "$runtime_bus"
+    return 0
+  fi
+
+  printf '%s\n' 'install dbus-user-session, then log out and back in'
+}
+
+# Check the bus the container runtime resolves. This is not the socket
+# systemd's own tools use: "systemctl --user" and "systemd-run --user" reach
+# the user manager through $XDG_RUNTIME_DIR/systemd/private and answer even
+# when this bus is wrong, while runc and crun go through the bus and fail.
+check_session_bus() {
+  if ! have busctl; then
+    warn 'cannot probe the session bus, because busctl is missing' \
+      'rootless podman needs systemd reachable on the session bus'
+    return 0
+  fi
+
+  if busctl --user call org.freedesktop.systemd1 \
+    /org/freedesktop/systemd1 org.freedesktop.DBus.Peer Ping \
+    >/dev/null 2>&1; then
+    pass 'systemd answers on the session bus'
+    return 0
+  fi
+
+  fail 'systemd does not answer on the session bus' \
+    "$(session_bus_remedy)"
+  return 1
+}
+
+# Check the cgroup setup rootless podman drives containers through.
+check_podman_cgroups() {
+  local uid=""
+  local controllers=""
+
+  if have systemd-run &&
+    ! systemd-run --user --scope --quiet true >/dev/null 2>&1; then
+    fail 'the systemd user manager will not create a scope' \
+      'log in through a real session; su and sudo -u create none'
+    return 1
+  fi
+
+  uid="$(id -u)"
+  controllers="/sys/fs/cgroup/user.slice/user-${uid}.slice"
+  controllers="${controllers}/user@${uid}.service/cgroup.controllers"
+
+  if [[ ! -r "$controllers" ]]; then
+    warn 'cannot read the delegated cgroup controllers' \
+      "expected them in ${controllers}"
+    return 0
+  fi
+
+  if ! grep -qw memory "$controllers"; then
+    fail 'the memory cgroup controller is not delegated' \
+      'add Delegate=memory in a user@.service drop-in, then log in again'
+    return 1
+  fi
+  pass 'the memory cgroup controller is delegated'
+}
+
+# Report the OCI runtime, since runc and crun do not fail alike.
+check_podman_runtime() {
+  local runtime=""
+
+  runtime="$(podman info --format '{{.Host.OCIRuntime.Name}}' \
+    2>/dev/null || true)"
+
+  if [[ "$runtime" == "crun" ]]; then
+    pass 'podman uses the crun runtime'
+    return 0
+  fi
+
+  warn "podman uses the ${runtime:-unknown} runtime, not crun" \
+    'if a container fails to start, install crun and set runtime = "crun"'
+}
+
+# Report lingering, which keeps the user manager alive between sessions.
+check_podman_linger() {
+  local linger=""
+
+  have loginctl || return 0
+  linger="$(loginctl show-user "$(id -un)" --property=Linger \
+    2>/dev/null || true)"
+
+  if [[ "$linger" == "Linger=yes" ]]; then
+    pass 'lingering is enabled for this account'
+    return 0
+  fi
+
+  warn 'lingering is not enabled' \
+    "run: sudo loginctl enable-linger $(id -un)"
+}
+
+# Check what a podman machine needs on macOS.
+check_podman_machine() {
+  if ! podman machine list --format '{{.Running}}' 2>/dev/null |
+    grep -q true; then
+    fail 'no podman machine is running' \
+      'run: podman machine init && podman machine start'
+    return 1
+  fi
+  pass 'a podman machine is running'
+
+  if [[ "$PWD" != "$HOME" ]] && [[ "$PWD" != "$HOME"/* ]]; then
+    warn 'this workspace is outside your home directory' \
+      'the podman machine cannot see it, so Capsule will use Docker here'
+    return 0
+  fi
+  pass 'this workspace is under the home the machine shares'
+}
+
+# Check the podman backend end to end, in the order the failures cascade.
+check_podman() {
+  section 'podman backend'
+
+  if ! have podman; then
+    warn 'podman is not installed' \
+      'install rootless podman 4.9+ to use the podman backend'
+    return 0
+  fi
+  pass 'podman is installed'
+
+  check_podman_engine || return 0
+
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    check_podman_machine || return 0
+  else
+    check_session_bus || return 0
+    check_podman_cgroups || return 0
+    check_podman_linger
+  fi
+
+  check_podman_runtime
+  PODMAN_USABLE=1
+}
+
+# Check the tools this repository's own checks and builds reach for.
+check_tooling() {
+  local tool=""
+
+  section 'Repository tooling'
+
+  for tool in shellcheck hadolint dclint; do
+    if usable "$tool"; then
+      pass "${tool} runs"
+    elif have "$tool"; then
+      warn "${tool} is on PATH but does not run" \
+        "a mise shim with no version set does this: mise use -g ${tool}@latest"
+    else
+      warn "${tool} is not installed" \
+        'checks fall back to its container image, which needs Docker'
+    fi
+  done
+
+  if [[ -n "${GITHUB_API_TOKEN:-}" ]]; then
+    pass 'GITHUB_API_TOKEN is set'
+  else
+    warn 'GITHUB_API_TOKEN is not set' \
+      'image builds and the end-to-end tests need it'
+  fi
+}
+
+main() {
+  printf 'Capsule environment check\n'
+
+  check_docker
+  check_podman
+  check_tooling
+
+  section 'Summary'
+  if [[ "$DOCKER_USABLE" -eq 1 ]] || [[ "$PODMAN_USABLE" -eq 1 ]]; then
+    pass 'at least one backend can run the Capsule'
+  else
+    fail 'no backend can run the Capsule' \
+      'fix the Docker or podman findings above'
+  fi
+
+  printf '\n%d passed, %d warnings, %d failed\n' \
+    "$PASS_COUNT" "$WARN_COUNT" "$FAIL_COUNT"
+
+  [[ "$FAIL_COUNT" -eq 0 ]]
+}
+
+main "$@"

@@ -90,6 +90,17 @@ run_docker_linter() {
   return 1
 }
 
+# Return success when a tool is installed and can actually run. A mise shim
+# sits on PATH for every tool mise knows about, whether or not a version is
+# installed, so "command -v" alone would report a linter that errors out the
+# moment it is called.
+tool_is_usable() {
+  local tool="$1"
+
+  command -v "$tool" >/dev/null 2>&1 \
+    && "$tool" --version >/dev/null 2>&1
+}
+
 run_linter() {
   local tool="$1"
   local docker_image="$2"
@@ -103,7 +114,7 @@ run_linter() {
     return 0
   fi
 
-  if command -v "$tool" >/dev/null 2>&1; then
+  if tool_is_usable "$tool"; then
     printf '%s: checking %d files\n' "$tool" "${#files[@]}"
     if "$tool" "${files[@]}"; then
       printf 'PASS: %s checks passed.\n' "$tool"
@@ -120,7 +131,7 @@ run_linter() {
     return
   fi
 
-  printf 'WARNING: %s not found; skipping %s lint.\n' \
+  printf 'WARNING: %s unavailable; skipping %s lint.\n' \
     "$tool" "$category" >&2
   return 0
 }

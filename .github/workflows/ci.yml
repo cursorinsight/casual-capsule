@@ -59,6 +59,58 @@ jobs:
           if-no-files-found: warn
           archive: false
 
+  nested-capsule:
+    name: nested-capsule (${{ matrix.runtime }})
+    needs: checks
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime:
+          - docker
+          - podman
+    env:
+      CAPSULE_CONFIG: /tmp/casual-capsule-allowlist
+      CAPSULE_HOST_WORKDIR: ${{ github.workspace }}
+      GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Pre-approve workspace
+        run: printf '%s\n' "$GITHUB_WORKSPACE" >"$CAPSULE_CONFIG"
+
+      - name: Configure rootless Podman
+        if: matrix.runtime == 'podman'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes fuse-overlayfs slirp4netns uidmap
+          runner_user="$(id -un)"
+          if ! grep -Fq "${runner_user}:" /etc/subuid; then
+            sudo usermod --add-subuids 100000-165535 "$runner_user"
+          fi
+          if ! grep -Fq "${runner_user}:" /etc/subgid; then
+            sudo usermod --add-subgids 100000-165535 "$runner_user"
+          fi
+          podman system migrate
+          podman info --format \
+            '{{.Host.Security.Rootless}} {{len .Host.IDMappings.UIDMap}}' \
+            | grep -Eq '^true ([2-9]|[1-9][0-9]+)$'
+
+      - name: Run tests inside Capsule
+        run: |
+          ./capsule.sh --runtime "${{ matrix.runtime }}" --build \
+            env CAPSULE_E2E_STRICT=1 tests/test_all.sh
+
+      - name: Upload nested e2e log artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nested-${{ matrix.runtime }}-e2e-logs
+          path: _build/tests/**/suite_e2e.log
+          if-no-files-found: warn
+          archive: false
+
   compose-build:
     name: compose-build
     needs: checks

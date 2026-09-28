@@ -12,6 +12,11 @@ readonly DEFAULT_CAPSULE_UID="1000"
 readonly DEFAULT_CAPSULE_GID="100"
 readonly DEFAULT_DOCKER_GID="999"
 readonly DEFAULT_DARWIN_DOCKER_GID="991"
+readonly DEFAULT_PODMAN_IMAGE="casual-capsule:local"
+readonly DEFAULT_PODMAN_HOME_VOLUME="casual-capsule-home"
+readonly CAPSULE_INNER_DIR="/var/lib/capsule/inner"
+readonly CAPSULE_HOST_SOCKET="/var/lib/capsule/docker.sock"
+readonly CAPSULE_SECRET_PATH="/run/secrets/github_api_token"
 
 # Mutable runtime state. main() initializes these before use.
 BUILD_MODE=""
@@ -28,6 +33,13 @@ REMOTE_SSH_PORT=""
 REMOTE_WORKDIR=""
 LOCAL_APPROVAL_PATH=""
 IN_NESTED_CAPSULE=0
+RUNTIME_SELECTION=""
+RUNTIME_BACKEND=""
+HOST_DOCKER=0
+PODMAN_RUN_ARGS=()
+PODMAN_CONTAINER_NAME=""
+PODMAN_SECRET_FILE=""
+PODMAN_INFO_OUTPUT=""
 BASE_COMPOSE_CMD=()
 COMPOSE_CMD=()
 
@@ -222,6 +234,13 @@ initialize_runtime_state() {
   REMOTE_SSH_DEST=""
   REMOTE_SSH_PORT=""
   REMOTE_WORKDIR=""
+  set_runtime_selection "${CAPSULE_RUNTIME:-auto}"
+  RUNTIME_BACKEND=""
+  HOST_DOCKER=0
+  PODMAN_RUN_ARGS=()
+  PODMAN_CONTAINER_NAME=""
+  PODMAN_SECRET_FILE=""
+  PODMAN_INFO_OUTPUT=""
   BASE_COMPOSE_CMD=()
   COMPOSE_CMD=()
   unset CAPSULE_HOME_MOUNT 2>/dev/null || true
@@ -236,6 +255,8 @@ Options:
   -p, --private-home  Bind-mount a per-user home directory.
       --publish HOST[:CONTAINER]  Publish port on host machine. Repeatable.
   -r, --remote HOST[:PORT]:/abs/path  Run on a remote Docker host over SSH.
+      --runtime podman|docker|auto  Backend to run in (default: auto).
+      --host-docker  Bind the host Docker socket into the Capsule.
   -v, --volume HOST:CONTAINER[:OPTIONS]  Bind-mount a host path. Repeatable.
       --build-custom  Run the custom compose build before runtime.
       --no-cache  Pass --no-cache to build commands run by this script.
@@ -253,6 +274,11 @@ Environment:
   CAPSULE_VOLUME   Semicolon-separated --volume specs.
   CAPSULE_WORKDIR  Workspace directory (default: cwd).
   CAPSULE_CUSTOM_COMPOSE  Optional override compose file.
+  CAPSULE_RUNTIME  Backend to run in: auto, podman, or docker.
+  CAPSULE_IMAGE    Image tag the podman backend builds and runs.
+  CAPSULE_HOME_VOLUME  podman volume mounted at /home/user.
+  CAPSULE_INNER_VOLUME  Volume holding the inner engine state.
+  CAPSULE_WITH_DOCKERD  Build the image with a real dockerd.
 EOF
 }
 
@@ -367,6 +393,20 @@ append_runtime_option_env() {
   fi
 }
 
+# Record the requested runtime backend, rejecting unknown names.
+set_runtime_selection() {
+  local selection="$1"
+
+  case "$selection" in
+    auto|docker|podman)
+      RUNTIME_SELECTION="$selection"
+      ;;
+    *)
+      die "unknown runtime: $selection (use podman, docker, or auto)"
+      ;;
+  esac
+}
+
 # Parse CLI flags and collect runtime arguments.
 parse_args() {
   while [[ $# -gt 0 ]]; do
@@ -411,6 +451,21 @@ parse_args() {
         fi
         RUNTIME_OPTS+=(--volume "$2")
         shift 2
+        ;;
+      --runtime)
+        if [[ $# -lt 2 ]] || [[ "${2:-}" == -* ]]; then
+          die '--runtime requires podman, docker, or auto'
+        fi
+        set_runtime_selection "$2"
+        shift 2
+        ;;
+      --runtime=*)
+        set_runtime_selection "${1#--runtime=}"
+        shift
+        ;;
+      --host-docker)
+        HOST_DOCKER=1
+        shift
         ;;
       -h|--help)
         usage
@@ -722,6 +777,390 @@ configure_docker_gid() {
   export DOCKER_GID
 }
 
+#------------------------------------------------------------------------------
+# podman backend
+#
+# podman runs the Capsule as a rootless container that carries its own
+# container engine:
+#
+#   host -> podman -> capsule -> its own engine -> the project's containers
+#
+# The Capsule's engine is private to the workspace it was started for, so a
+# project brought up inside one Capsule cannot see the host's containers or
+# another workspace's. What needs a Docker daemon on the host (--remote over
+# ssh://, compose overrides) stays on the Docker backend, as does a host that
+# cannot run rootless containers.
+#------------------------------------------------------------------------------
+
+# Print the reason podman cannot be launched at all, if any.
+podman_launcher_reason() {
+  if ! command -v podman >/dev/null 2>&1; then
+    printf '%s\n' 'podman is not installed'
+  fi
+}
+
+# Print the reason a path is unusable from a podman machine, if any. The
+# machine shares the user home with its guest, so a workspace outside it has
+# no path the VM can resolve.
+podman_vm_path_reason() {
+  local path="$1"
+  local label="$2"
+
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    return
+  fi
+
+  if [[ "$path" != "$HOME" ]] && [[ "$path" != "$HOME"/* ]]; then
+    printf '%s is outside %s and the podman machine cannot see it\n' \
+      "$label" "$HOME"
+  fi
+}
+
+# Capture how podman sees itself, once, for the checks that read it. One
+# call answers both questions that matter: whether it is rootless, and
+# whether this user has a sub-id range to map containers into.
+capture_podman_info() {
+  PODMAN_INFO_OUTPUT="$(
+    podman info --format \
+      '{{.Host.Security.Rootless}} {{len .Host.IDMappings.UIDMap}}' \
+      2>/dev/null
+  )" || PODMAN_INFO_OUTPUT=""
+}
+
+# Print the reason this host cannot run the Capsule under podman, if any.
+podman_host_reason() {
+  local rootless=""
+  local id_ranges=""
+
+  if [[ -z "$PODMAN_INFO_OUTPUT" ]]; then
+    printf '%s\n' 'podman cannot reach a working engine (try: podman info)'
+    return
+  fi
+
+  read -r rootless id_ranges <<<"$PODMAN_INFO_OUTPUT"
+
+  # A rootful podman would run the Capsule as real root and make keep-id
+  # meaningless, which is not the isolation this backend promises.
+  if [[ "$rootless" != "true" ]]; then
+    printf '%s\n' 'podman is running rootful; the Capsule wants rootless'
+    return
+  fi
+
+  # A single mapping means no sub-id range, and podman then cannot even
+  # unpack an image that chowns a file, let alone keep the caller's id.
+  if [[ ! "$id_ranges" =~ ^[0-9]+$ ]] || [[ "$id_ranges" -le 1 ]]; then
+    printf '%s\n' 'no sub-id range for this user (install uidmap)'
+  fi
+}
+
+# Print the reason this invocation needs the Docker backend, if any.
+podman_request_reason() {
+  if [[ -n "$REMOTE_HOST" ]]; then
+    printf '%s\n' '--remote needs a Docker daemon to reach over ssh://'
+    return
+  fi
+
+  if [[ -n "$CAPSULE_CUSTOM_COMPOSE" ]]; then
+    printf '%s\n' 'a custom compose file needs the Docker backend'
+  fi
+}
+
+# Choose the backend, preferring podman and naming the reason whenever it
+# falls back, so the runtime in use is never a surprise.
+resolve_runtime_backend() {
+  local reason=""
+  local launcher_reason=""
+
+  if [[ "$RUNTIME_SELECTION" == "docker" ]]; then
+    RUNTIME_BACKEND="docker"
+    return
+  fi
+
+  launcher_reason="$(podman_launcher_reason)"
+  reason="$(podman_request_reason)"
+
+  if [[ -z "$reason" ]]; then
+    reason="$launcher_reason"
+  fi
+
+  if [[ -z "$reason" ]]; then
+    reason="$(podman_vm_path_reason "$CAPSULE_HOST_WORKDIR" 'the workspace')"
+  fi
+
+  if [[ -z "$reason" ]]; then
+    capture_podman_info
+    reason="$(podman_host_reason)"
+  fi
+
+  if [[ -z "$reason" ]]; then
+    RUNTIME_BACKEND="podman"
+    return
+  fi
+
+  # A host with no podman installed is the ordinary case under "auto" and
+  # stays quiet; every other fallback says why podman was not used.
+  if [[ "$RUNTIME_SELECTION" == "podman" ]] || [[ -z "$launcher_reason" ]]; then
+    warn "not using podman: ${reason}"
+  fi
+
+  RUNTIME_BACKEND="docker"
+}
+
+# Return the image tag the podman backend builds and runs.
+podman_image_name() {
+  printf '%s\n' "${CAPSULE_IMAGE:-$DEFAULT_PODMAN_IMAGE}"
+}
+
+# Use the current container path when a nested Capsule selects local podman.
+# CAPSULE_HOST_WORKDIR names the outer Docker daemon's filesystem, which the
+# podman process inside this Capsule cannot see or bind-mount.
+configure_nested_podman_workdir() {
+  if [[ "$IN_NESTED_CAPSULE" -eq 1 ]]; then
+    CAPSULE_HOST_WORKDIR="$CAPSULE_WORKDIR"
+    export CAPSULE_HOST_WORKDIR
+  fi
+}
+
+# Reduce a path to a short, stable, filesystem-safe token.
+path_token() {
+  local path="$1"
+
+  printf '%s' "$path" | cksum | cut -d' ' -f1
+}
+
+# Return a container name that is readable in "podman ps" and unique per run.
+podman_container_name() {
+  local workspace_name=""
+
+  workspace_name="$(basename -- "$CAPSULE_HOST_WORKDIR")"
+  workspace_name="$(printf '%s' "$workspace_name" | tr -c 'A-Za-z0-9_-' '-')"
+
+  printf 'capsule-%s-%s\n' "${workspace_name:-workspace}" "$$"
+}
+
+# Return the volume holding this workspace's inner engine state.
+#
+# It is keyed on the workspace path, so every project gets its own images,
+# volumes and containers, and two projects never share an engine's storage.
+podman_inner_volume() {
+  local workspace_name=""
+
+  if [[ -n "${CAPSULE_INNER_VOLUME:-}" ]]; then
+    printf '%s\n' "$CAPSULE_INNER_VOLUME"
+    return
+  fi
+
+  workspace_name="$(basename -- "$CAPSULE_HOST_WORKDIR")"
+  workspace_name="$(printf '%s' "$workspace_name" | tr -c 'A-Za-z0-9_-' '-')"
+
+  printf 'capsule-inner-%s-%s\n' \
+    "${workspace_name:-workspace}" "$(path_token "$CAPSULE_HOST_WORKDIR")"
+}
+
+# Write the GitHub token where podman can mount it as the runtime secret the
+# entrypoint reads. It lives under the user home because a podman machine
+# shares that path with its guest.
+configure_podman_secret() {
+  local secret_dir="${HOME}/.capsule"
+
+  if [[ -z "${GITHUB_API_TOKEN:-}" ]]; then
+    return
+  fi
+
+  mkdir -p "$secret_dir"
+  chmod 700 "$secret_dir"
+  PODMAN_SECRET_FILE="${secret_dir}/github_api_token.$$"
+  (
+    umask 077
+    printf '%s' "$GITHUB_API_TOKEN" >"$PODMAN_SECRET_FILE"
+  )
+}
+
+# Remove the per-run token file once the container is gone.
+cleanup_podman_state() {
+  if [[ -n "$PODMAN_SECRET_FILE" ]]; then
+    rm -f "$PODMAN_SECRET_FILE"
+    PODMAN_SECRET_FILE=""
+  fi
+}
+
+# Fail early when the local image was never built, because podman would
+# otherwise try to pull a tag that exists on no registry.
+require_podman_image() {
+  local image=""
+
+  image="$(podman_image_name)"
+  if [[ -n "${CAPSULE_IMAGE:-}" ]]; then
+    return
+  fi
+
+  if podman image exists "$image" 2>/dev/null; then
+    return
+  fi
+
+  die "image ${image} is not built; run: capsule.sh --build"
+}
+
+# Build the Capsule image with podman, handing it the token as a build
+# secret so it reaches the build without reaching a layer.
+run_podman_build() {
+  local mise_version="$1"
+  local build_args=()
+
+  # Build in Docker format: the OCI format podman defaults to drops
+  # the Dockerfile SHELL directive, which would run every RUN step
+  # under /bin/sh instead of the bash the image expects.
+  build_args=(
+    build
+    --format docker
+    -t "$(podman_image_name)"
+    --build-arg "MISE_VERSION=${mise_version}"
+    --build-arg "CAPSULE_UID=${CAPSULE_UID}"
+    --build-arg "CAPSULE_GID=${CAPSULE_GID}"
+  )
+
+  if [[ "$NO_CACHE" -eq 1 ]]; then
+    build_args+=(--no-cache)
+  fi
+
+  if [[ -n "${MISE_SYSTEM_TOOLS:-}" ]]; then
+    build_args+=(--build-arg "MISE_SYSTEM_TOOLS=${MISE_SYSTEM_TOOLS}")
+  fi
+
+  if [[ -n "${CAPSULE_WITH_DOCKERD:-}" ]]; then
+    build_args+=(--build-arg "CAPSULE_WITH_DOCKERD=${CAPSULE_WITH_DOCKERD}")
+  fi
+
+  if [[ -n "${GITHUB_API_TOKEN:-}" ]]; then
+    build_args+=(
+      --secret "id=github_api_token,env=GITHUB_API_TOKEN"
+    )
+  fi
+
+  podman "${build_args[@]}" "$SCRIPT_DIR"
+}
+
+# Translate the collected --publish/--volume options into podman flags.
+append_podman_runtime_options() {
+  local index=0
+  local option=""
+  local value=""
+
+  while [[ "$index" -lt "${#RUNTIME_OPTS[@]}" ]]; do
+    option="${RUNTIME_OPTS[$index]}"
+    value="${RUNTIME_OPTS[$((index + 1))]}"
+    index=$((index + 2))
+
+    case "$option" in
+      --publish) PODMAN_RUN_ARGS+=(--publish "$value") ;;
+      --volume) PODMAN_RUN_ARGS+=(--volume "$value") ;;
+      *) die "unsupported runtime option for podman: $option" ;;
+    esac
+  done
+}
+
+# Bind the host Docker socket, but only when the run asked for it. The point
+# of this backend is an engine of the Capsule's own, so reaching the host
+# daemon is a deliberate act rather than a default.
+append_podman_host_docker() {
+  local socket_path=""
+
+  if [[ "$HOST_DOCKER" -ne 1 ]]; then
+    return
+  fi
+
+  # An explicit endpoint decides. Probing past a DOCKER_HOST the caller set
+  # would bind a different daemon than the one they named.
+  if [[ -n "${DOCKER_HOST:-}" ]]; then
+    if [[ "${DOCKER_HOST}" != unix://* ]]; then
+      die "--host-docker cannot bind a non-socket DOCKER_HOST: ${DOCKER_HOST}"
+    fi
+    socket_path="${DOCKER_HOST#unix://}"
+  else
+    socket_path="$(detect_local_docker_socket_path)"
+  fi
+
+  if [[ -z "$socket_path" ]] || [[ ! -e "$socket_path" ]]; then
+    die '--host-docker found no Docker socket on this host'
+  fi
+
+  PODMAN_RUN_ARGS+=(--volume "${socket_path}:${CAPSULE_HOST_SOCKET}")
+}
+
+# Assemble the "podman run" invocation for this run.
+#
+# The container is privileged, label-disabled and given /dev/fuse because it
+# runs an engine of its own: nesting needs to mount a proc and stack image
+# layers. Rootless, "privileged" grants only what the calling user already
+# has, so the Capsule still cannot exceed its owner on the host.
+build_podman_run_args() {
+  local home_mount="${CAPSULE_HOME_MOUNT:-}"
+
+  if [[ -z "$home_mount" ]]; then
+    home_mount="${CAPSULE_HOME_VOLUME:-$DEFAULT_PODMAN_HOME_VOLUME}"
+    home_mount="${home_mount}:/home/user"
+  fi
+
+  PODMAN_RUN_ARGS=(
+    run --rm
+    --name "$PODMAN_CONTAINER_NAME"
+    --hostname capsule
+    --privileged
+    --security-opt label=disable
+    --device /dev/fuse
+    --user user
+    --userns "keep-id:uid=${CAPSULE_UID},gid=${CAPSULE_GID}"
+    --workdir "$CAPSULE_CONTAINER_WORKDIR"
+    --volume "${CAPSULE_HOST_WORKDIR}:${CAPSULE_CONTAINER_WORKDIR}"
+    --volume "$home_mount"
+    --volume "$(podman_inner_volume):${CAPSULE_INNER_DIR}"
+    --env "CAPSULE_RUNTIME=podman"
+    --env "CAPSULE_HOST_WORKDIR=${CAPSULE_HOST_WORKDIR}"
+  )
+
+  if [[ -n "$PODMAN_SECRET_FILE" ]]; then
+    PODMAN_RUN_ARGS+=(
+      --volume "${PODMAN_SECRET_FILE}:${CAPSULE_SECRET_PATH}:ro"
+    )
+  fi
+
+  if [[ -t 0 ]] && [[ -t 1 ]]; then
+    PODMAN_RUN_ARGS+=(-it)
+  fi
+
+  append_podman_host_docker
+  append_podman_runtime_options
+
+  PODMAN_RUN_ARGS+=("$(podman_image_name)")
+
+  if [[ "${#RUNTIME_ARGS[@]}" -gt 0 ]]; then
+    PODMAN_RUN_ARGS+=("${RUNTIME_ARGS[@]}")
+  fi
+}
+
+# Run the whole podman path: build when asked, then start the Capsule.
+run_podman_backend() {
+  local mise_version=""
+  local exit_code=0
+
+  configure_nested_podman_workdir
+  PODMAN_CONTAINER_NAME="$(podman_container_name)"
+  configure_podman_secret
+  trap cleanup_podman_state EXIT INT TERM
+
+  if [[ "$BUILD_MODE" != "none" ]]; then
+    mise_version="$(fetch_mise_version)"
+    run_podman_build "$mise_version"
+  fi
+
+  require_podman_image
+  build_podman_run_args
+  podman "${PODMAN_RUN_ARGS[@]}" || exit_code=$?
+
+  cleanup_podman_state
+  return "$exit_code"
+}
+
 # Initialize base and merged docker compose command arrays.
 initialize_compose_commands() {
   BASE_COMPOSE_CMD=(
@@ -805,8 +1244,15 @@ main() {
   initialize_capsule_config
   configure_target_mode
 
+  resolve_runtime_backend
+
   if [[ "$PRIVATE_HOME" -eq 1 ]]; then
     configure_private_home
+  fi
+
+  if [[ "$RUNTIME_BACKEND" == "podman" ]]; then
+    run_podman_backend
+    return
   fi
 
   configure_docker_gid

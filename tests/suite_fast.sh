@@ -14,9 +14,14 @@ set -euo pipefail
 ROOT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
 SCRIPT_PATH="$ROOT_DIR/capsule.sh"
 CHECK_ALL_PATH="$ROOT_DIR/tests/check_all.sh"
+DOCTOR_PATH="$ROOT_DIR/capsule-doctor.sh"
+CI_PATH="$ROOT_DIR/.github/workflows/ci.yml"
 COMPOSE_PATH="$ROOT_DIR/compose.yml"
 DOCKERFILE_PATH="$ROOT_DIR/Dockerfile"
 ENTRYPOINT_PATH="$ROOT_DIR/docker/entrypoint.sh"
+ROUTER_PATH="$ROOT_DIR/docker/capsule-docker.sh"
+CODEX_WRAPPER_PATH="$ROOT_DIR/docker/codex.sh"
+STORAGE_CONF_PATH="$ROOT_DIR/docker/storage.conf"
 EXAMPLE_PROJECT_DIR="$ROOT_DIR/tests/fixtures/example-project"
 
 unset CAPSULE_CUSTOM_COMPOSE
@@ -179,12 +184,34 @@ case "${1:-}" in
 esac
 EOF
 
+  cat >"$dir/podman" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Stand in for the two queries capsule.sh makes before it commits to podman:
+# whether the engine answers at all, and how it maps ids.
+if [[ "${1:-}" == "info" ]]; then
+  if [[ -n "${MOCK_PODMAN_INFO_FAIL:-}" ]]; then
+    exit 1
+  fi
+  printf '%s\n' "${MOCK_PODMAN_INFO:-true 2}"
+  exit 0
+fi
+
+if [[ "${1:-}" == "image" ]] && [[ "${2:-}" == "exists" ]]; then
+  exit "${MOCK_PODMAN_NO_IMAGE:-0}"
+fi
+
+printf 'PODMAN_ARGS=%s\n' "$*" >>"${MOCK_LOG:?MOCK_LOG is required}"
+exit 0
+EOF
+
   cat >"$dir/curl" <<'EOF'
 #!/usr/bin/env bash
 printf '2024.1.0\n'
 EOF
 
-  chmod +x "$dir/docker" "$dir/stat" "$dir/uname" "$dir/ls" \
+  chmod +x "$dir/docker" "$dir/podman" "$dir/stat" "$dir/uname" "$dir/ls" \
     "$dir/id" "$dir/curl" "$dir/ssh"
 }
 
@@ -204,6 +231,7 @@ run_capsule() {
     CAPSULE_PUBLISH="${CAPSULE_PUBLISH-}" \
     CAPSULE_VOLUME="${CAPSULE_VOLUME-}" \
     DOCKER_HOST="${DOCKER_HOST-}" \
+    CAPSULE_RUNTIME="${CAPSULE_RUNTIME-docker}" \
     "$SCRIPT_PATH" "$@"
 }
 
@@ -244,6 +272,15 @@ test_compose_contract() {
     '${CAPSULE_HOME_MOUNT:-home:/home/user}' \
     "compose allows the home mount to be overridden"
   assert_file_contains "$COMPOSE_PATH" \
+    'privileged: true' \
+    "compose permits nested rootless podman during repository tests"
+  assert_file_contains "$COMPOSE_PATH" \
+    '/var/run/docker.sock:/var/lib/capsule/docker.sock' \
+    "compose mounts the host socket where the engine router expects it"
+  assert_file_contains "$COMPOSE_PATH" \
+    'DOCKER_HOST=unix:///var/lib/capsule/docker.sock' \
+    "compose points Docker clients at the routed host socket"
+  assert_file_contains "$COMPOSE_PATH" \
     'CAPSULE_HOME_HOST_DIR=${CAPSULE_HOME_HOST_DIR:-}' \
     "compose passes host home mount info to nested capsules"
   assert_file_contains "$COMPOSE_PATH" \
@@ -279,6 +316,41 @@ test_dockerfile_tooling_contract() {
   assert_file_not_contains "$DOCKERFILE_PATH" \
     "mise use --global \${MISE_SYSTEM_TOOLS}" \
     "image no longer activates system tools in the user home"
+  # shellcheck disable=SC2016
+  assert_file_contains "$DOCKERFILE_PATH" \
+    'mv "$codex_path" "${codex_path}-real"' \
+    "image preserves the mise-managed Codex binary behind its wrapper"
+  # shellcheck disable=SC2016
+  assert_file_contains "$DOCKERFILE_PATH" \
+    'codex_path="$(mise which codex 2>/dev/null)"' \
+    "image resolves Codex through mise before installing its wrapper"
+  assert_file_contains "$DOCKERFILE_PATH" \
+    'docker/codex.sh /usr/local/libexec/capsule/codex' \
+    "image installs the Capsule Codex wrapper"
+}
+
+# Verify that the Codex wrapper forces unrestricted mode and preserves args.
+test_codex_wrapper_forces_unrestricted_mode() {
+  local tdir="$TEST_TMPDIR/codex-wrapper"
+  local log_file="$tdir/log"
+  local expected=""
+  mkdir -p "$tdir"
+  cp "$CODEX_WRAPPER_PATH" "$tdir/codex"
+  cat >"$tdir/codex-real" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$@" >"${MOCK_LOG:?MOCK_LOG is required}"
+EOF
+  chmod +x "$tdir/codex" "$tdir/codex-real"
+
+  MOCK_LOG="$log_file" "$tdir/codex" --model gpt-test 'hello world'
+
+  expected='--dangerously-bypass-approvals-and-sandbox
+--model
+gpt-test
+hello world'
+  assert_equals "$expected" "$(cat "$log_file")" \
+    "Codex wrapper prepends unrestricted mode and forwards every argument"
 }
 
 test_dockerfile_uid_gid_contract() {
@@ -303,6 +375,7 @@ test_dockerfile_uid_gid_contract() {
     "Dockerfile uses login shell as default command"
 }
 
+# shellcheck disable=SC2016
 test_entrypoint_contract() {
   if ! bash -n "$ENTRYPOINT_PATH"; then
     fail "entrypoint.sh has valid shell syntax"
@@ -318,6 +391,15 @@ test_entrypoint_contract() {
   assert_file_contains "$ENTRYPOINT_PATH" \
     'DOCKER_GID' \
     "entrypoint handles DOCKER_GID group"
+  assert_file_contains "$ENTRYPOINT_PATH" \
+    'SUBORDINATE_ID_COUNT=65536' \
+    "entrypoint grants nested podman a complete subordinate ID range"
+  assert_file_contains "$ENTRYPOINT_PATH" \
+    '"$SUBORDINATE_UID_START" "$SUBORDINATE_ID_COUNT" >/etc/subuid' \
+    "entrypoint installs the runtime subordinate UID range"
+  assert_file_contains "$ENTRYPOINT_PATH" \
+    '"$SUBORDINATE_GID_START" "$SUBORDINATE_ID_COUNT" >/etc/subgid' \
+    "entrypoint installs the runtime subordinate GID range"
   assert_file_contains "$ENTRYPOINT_PATH" \
     'export HOME=' \
     "entrypoint sets HOME before dropping privileges"
@@ -341,7 +423,10 @@ test_entrypoint_contract() {
     "entrypoint reads github token from compose secret mount"
   assert_file_contains "$ENTRYPOINT_PATH" \
     'GH=/usr/local/bin/gh' \
-    "entrypoint resolves gh via the symlink, not a fatal mise lookup"
+    "entrypoint prefers a direct system gh binary"
+  assert_file_contains "$ENTRYPOINT_PATH" \
+    'mise --cd / which gh' \
+    "entrypoint resolves the system gh install for root and podman users"
   assert_file_contains "$ENTRYPOINT_PATH" \
     'auth login --with-token' \
     "entrypoint refreshes gh credentials from runtime secret"
@@ -566,6 +651,184 @@ EOF
     "check_all docker linters avoid container-only workdir mounts"
 }
 
+# A mise shim with no version pinned sits on PATH and fails the moment it
+# runs. Treat such a linter as absent rather than as a failing check.
+test_check_all_ignores_an_unusable_linter() {
+  local tdir="$TEST_TMPDIR/check-all-unusable-linter"
+  local mock_bin="$tdir/bin"
+  local log_file="$tdir/log"
+  mkdir -p "$mock_bin"
+  ln -s "$(command -v bash)" "$mock_bin/bash"
+  ln -s "$(command -v dirname)" "$mock_bin/dirname"
+
+  cat >"$mock_bin/docker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'DOCKER_ARGS=%s\n' "$*" >>"${MOCK_LOG:?MOCK_LOG is required}"
+EOF
+  cat >"$mock_bin/shellcheck" <<'EOF'
+#!/usr/bin/env bash
+printf 'mise ERROR No version is set for shim: shellcheck\n' >&2
+exit 1
+EOF
+  chmod +x "$mock_bin/docker" "$mock_bin/shellcheck"
+
+  if PATH="$mock_bin" MOCK_LOG="$log_file" \
+    CAPSULE_WORKDIR="$ROOT_DIR" \
+    CAPSULE_HOST_WORKDIR=/host/workspace \
+    "$CHECK_ALL_PATH" >"$tdir/out" 2>&1; then
+    pass "an unusable linter does not fail the checks"
+  else
+    fail "an unusable linter does not fail the checks"
+  fi
+
+  assert_file_contains "$log_file" \
+    'koalaman/shellcheck' \
+    "an unusable shellcheck falls through to the container image"
+}
+
+# Give the doctor a host of its own: a podman that answers rootless, a
+# systemd that grants scopes, and a shellcheck that fails the way a mise
+# shim with no version does.
+make_doctor_bin() {
+  local dir="$1"
+  local tool=""
+
+  mkdir -p "$dir"
+  for tool in bash id uname grep; do
+    ln -sf "$(command -v "$tool")" "$dir/$tool"
+  done
+
+  cat >"$dir/docker" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+
+  cat >"$dir/podman" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  *OCIRuntime.Name*) printf 'runc\n' ;;
+  *Rootless*) printf 'true 2\n' ;;
+esac
+exit 0
+EOF
+
+  cat >"$dir/systemd-run" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+
+  cat >"$dir/busctl" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+
+  cat >"$dir/shellcheck" <<'EOF'
+#!/usr/bin/env bash
+printf 'mise ERROR No version is set for shim: shellcheck\n' >&2
+exit 1
+EOF
+
+  chmod +x "$dir/docker" "$dir/podman" "$dir/systemd-run" \
+    "$dir/busctl" "$dir/shellcheck"
+}
+
+test_doctor_reports_each_backend_and_probes_by_running() {
+  local tdir="$TEST_TMPDIR/doctor"
+  local bin_dir="$tdir/bin"
+  local out_file="$tdir/out"
+  mkdir -p "$tdir"
+  make_doctor_bin "$bin_dir"
+
+  if ! bash -n "$DOCTOR_PATH"; then
+    fail "capsule-doctor.sh has valid shell syntax"
+  else
+    pass "capsule-doctor.sh has valid shell syntax"
+  fi
+
+  # The verdict depends on the host; the report does not.
+  PATH="$bin_dir" "$DOCTOR_PATH" >"$out_file" 2>&1 || true
+
+  assert_file_contains "$out_file" \
+    'Docker backend' \
+    "the doctor reports on the Docker backend"
+  assert_file_contains "$out_file" \
+    'podman backend' \
+    "the doctor reports on the podman backend"
+  assert_file_contains "$out_file" \
+    'Repository tooling' \
+    "the doctor reports on the repository's own linters"
+  assert_file_contains "$out_file" \
+    'systemd answers on the session bus' \
+    "the doctor probes the bus the container runtime resolves"
+  assert_file_contains "$out_file" \
+    'podman uses the runc runtime, not crun' \
+    "the doctor names a runtime that fails where crun does not"
+  assert_file_contains "$out_file" \
+    'shellcheck is on PATH but does not run' \
+    "the doctor tells an unrunnable shim from a missing tool"
+  assert_file_contains "$out_file" \
+    'passed,' \
+    "the doctor ends with a tally"
+}
+
+# The remedy has to fit the cause: a session bus that systemd is not on is a
+# different repair from having no user bus at all.
+test_doctor_names_a_stale_session_bus() {
+  local tdir="$TEST_TMPDIR/doctor-bus"
+  local bin_dir="$tdir/bin"
+  local out_file="$tdir/out"
+  local run_dir="$tdir/run"
+  mkdir -p "$tdir" "$run_dir"
+  make_doctor_bin "$bin_dir"
+  printf '#!/usr/bin/env bash\nexit 1\n' >"$bin_dir/busctl"
+  chmod +x "$bin_dir/busctl"
+  : >"$run_dir/bus"
+
+  PATH="$bin_dir" XDG_RUNTIME_DIR="$run_dir" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/tmp/dbus-Legacy" \
+    "$DOCTOR_PATH" >"$out_file" 2>&1 || true
+
+  assert_file_contains "$out_file" \
+    'systemd does not answer on the session bus' \
+    "the doctor fails a host whose session bus has no systemd on it"
+  assert_file_contains "$out_file" \
+    'DBUS_SESSION_BUS_ADDRESS skips' \
+    "the doctor blames the session bus address when that is the cause"
+
+  rm -f "$run_dir/bus"
+  PATH="$bin_dir" XDG_RUNTIME_DIR="$run_dir" \
+    DBUS_SESSION_BUS_ADDRESS="" \
+    "$DOCTOR_PATH" >"$out_file" 2>&1 || true
+
+  assert_file_contains "$out_file" \
+    'install dbus-user-session' \
+    "the doctor names the package when no user bus exists at all"
+}
+
+# Verify CI exercises a nested Capsule through each supported backend.
+# shellcheck disable=SC2016
+test_ci_runs_nested_capsules_for_each_backend() {
+  assert_file_contains "$CI_PATH" \
+    'name: nested-capsule (${{ matrix.runtime }})' \
+    "GitHub CI exposes separate nested backend checks"
+  assert_file_contains "$CI_PATH" \
+    'runtime:' \
+    "GitHub CI defines a nested Capsule runtime matrix"
+  assert_file_contains "$CI_PATH" \
+    '- docker' \
+    "GitHub CI tests a Docker-backed Capsule"
+  assert_file_contains "$CI_PATH" \
+    '- podman' \
+    "GitHub CI tests a Podman-backed Capsule"
+  assert_file_contains "$CI_PATH" \
+    'CAPSULE_E2E_STRICT=1 tests/test_all.sh' \
+    "nested CI rejects skipped backend prerequisites"
+  assert_file_contains "$CI_PATH" \
+    "grep -Eq '^true ([2-9]|[1-9][0-9]+)$'" \
+    "Podman CI requires rootless subordinate ID mappings"
+}
+
 test_build_flag_without_runtime_args() {
   local tdir="$TEST_TMPDIR/build-no-args"
   local mock_bin="$tdir/bin"
@@ -680,6 +943,7 @@ test_private_home_uses_host_path_map_for_home_dir() {
     CAPSULE_HOST_WORKDIR="${CAPSULE_HOST_WORKDIR-}" \
     CAPSULE_HOME_HOST_DIR="${CAPSULE_HOME_HOST_DIR-}" \
     DOCKER_HOST="${DOCKER_HOST-}" \
+    CAPSULE_RUNTIME="${CAPSULE_RUNTIME-docker}" \
     "$SCRIPT_PATH" --private-home true </dev/null; then
     pass "private-home uses host path map for home dir"
   else
@@ -719,6 +983,7 @@ test_private_home_requires_home_mapping_with_host_path_map() {
     CAPSULE_HOST_WORKDIR="${CAPSULE_HOST_WORKDIR-}" \
     CAPSULE_HOME_HOST_DIR="${CAPSULE_HOME_HOST_DIR-}" \
     DOCKER_HOST="${DOCKER_HOST-}" \
+    CAPSULE_RUNTIME="${CAPSULE_RUNTIME-docker}" \
     "$SCRIPT_PATH" --private-home true </dev/null 2>"$err_file"; then
     fail "private-home requires a home mapping with host path map"
   else
@@ -1383,6 +1648,7 @@ test_host_path_map_remaps_container_workdir() {
     CAPSULE_HOST_WORKDIR="${CAPSULE_HOST_WORKDIR-}" \
     CAPSULE_HOME_HOST_DIR="${CAPSULE_HOME_HOST_DIR-}" \
     DOCKER_HOST="${DOCKER_HOST-}" \
+    CAPSULE_RUNTIME="${CAPSULE_RUNTIME-docker}" \
     "$SCRIPT_PATH" true </dev/null; then
     pass "host path map remaps container workdir"
   else
@@ -1415,6 +1681,7 @@ test_host_path_map_uses_first_match() {
     CAPSULE_HOST_WORKDIR="${CAPSULE_HOST_WORKDIR-}" \
     CAPSULE_HOME_HOST_DIR="${CAPSULE_HOME_HOST_DIR-}" \
     DOCKER_HOST="${DOCKER_HOST-}" \
+    CAPSULE_RUNTIME="${CAPSULE_RUNTIME-docker}" \
     "$SCRIPT_PATH" true </dev/null; then
     pass "host path map uses first match"
   else
@@ -1444,6 +1711,7 @@ test_host_path_map_uses_mapped_allowlist_entry() {
     CAPSULE_HOST_WORKDIR="${CAPSULE_HOST_WORKDIR-}" \
     CAPSULE_HOME_HOST_DIR="${CAPSULE_HOME_HOST_DIR-}" \
     DOCKER_HOST="${DOCKER_HOST-}" \
+    CAPSULE_RUNTIME="${CAPSULE_RUNTIME-docker}" \
     "$SCRIPT_PATH" true </dev/null; then
     pass "host path map uses mapped allowlist entry"
   else
@@ -1586,6 +1854,666 @@ test_default_gid_when_detection_fails() {
   assert_equals "991" "$(value_from_log ENV_DOCKER_GID "$log_file")" \
     "macOS default DOCKER_GID is 991 when detection fails"
 }
+#-------------------------------------------------------------------------------
+# podman backend
+#
+# The launcher's podman path is asserted through a mocked `podman`, and the
+# in-Capsule engine router against mocked engines, because the real thing
+# needs a rootless-capable host that CI cannot be assumed to be. What neither
+# can cover -- a real engine serving a real project -- is the operator check
+# in tmp/verify-podman-backend.sh.
+#-------------------------------------------------------------------------------
+
+# Prepare a case directory with its own mock PATH, and set the paths the
+# assertions read. Keeps each case to what it is actually testing.
+setup_mock_case() {
+  CASE_DIR="$TEST_TMPDIR/$1"
+  CASE_BIN="$CASE_DIR/bin"
+  CASE_LOG="$CASE_DIR/log"
+  CASE_ERR="$CASE_DIR/err"
+
+  mkdir -p "$CASE_DIR"
+  make_mock_bin "$CASE_BIN"
+}
+
+# Assert that one of the podman invocations carried the given fragment.
+assert_podman_args_contain() {
+  local log_file="$1"
+  local needle="$2"
+  local msg="$3"
+
+  if grep -F 'PODMAN_ARGS=' "$log_file" | grep -Fq -- "$needle"; then
+    pass "$msg"
+  else
+    fail "$msg (missing: $needle)"
+  fi
+}
+
+# Assert that no podman invocation carried the given fragment.
+assert_podman_args_lack() {
+  local log_file="$1"
+  local needle="$2"
+  local msg="$3"
+
+  if grep -F 'PODMAN_ARGS=' "$log_file" | grep -Fq -- "$needle"; then
+    fail "$msg (unexpected: $needle)"
+  else
+    pass "$msg"
+  fi
+}
+
+test_podman_backend_runs_container_with_keep_id() {
+  setup_mock_case podman-run
+
+  CAPSULE_UID=1000 CAPSULE_GID=100 CAPSULE_RUNTIME=podman \
+    run_capsule "$CASE_BIN" "$CASE_LOG" claude
+
+  assert_podman_args_contain "$CASE_LOG" \
+    '--userns keep-id:uid=1000,gid=100' \
+    "podman backend maps the host user onto the image's account"
+  assert_podman_args_contain "$CASE_LOG" \
+    '--user user' \
+    "podman backend starts directly as the unprivileged image account"
+  assert_podman_args_contain "$CASE_LOG" \
+    ':/home/workspace' \
+    "podman backend mounts the workspace"
+  assert_podman_args_contain "$CASE_LOG" \
+    '--volume casual-capsule-home:/home/user' \
+    "podman backend mounts the persistent home volume"
+  assert_podman_args_contain "$CASE_LOG" \
+    '--privileged --security-opt label=disable --device /dev/fuse' \
+    "podman backend grants what a nested engine needs"
+  assert_podman_args_contain "$CASE_LOG" \
+    '--env CAPSULE_RUNTIME=podman' \
+    "podman backend tells the entrypoint which backend it is under"
+  assert_podman_args_contain "$CASE_LOG" \
+    'casual-capsule:local claude' \
+    "podman backend passes the command after the image"
+}
+
+# Verify local podman sees a nested Capsule path, not its outer Docker path.
+test_nested_capsule_podman_uses_local_workdir() {
+  local nested_dir="/home/workspace/project/subdir"
+  setup_mock_case podman-nested-workdir
+
+  CAPSULE_RUNTIME=podman \
+    CAPSULE_WORKDIR="$nested_dir" \
+    CAPSULE_HOST_WORKDIR="/host/workspace" \
+    run_capsule "$CASE_BIN" "$CASE_LOG" true
+
+  assert_podman_args_contain "$CASE_LOG" \
+    "--volume ${nested_dir}:/home/workspace" \
+    "nested podman mounts the workspace path visible inside its Capsule"
+  assert_podman_args_lack "$CASE_LOG" \
+    '/host/workspace/project/subdir:/home/workspace' \
+    "nested podman does not mount the outer Docker daemon path"
+}
+
+test_podman_inner_volume_is_per_workspace() {
+  local first_volume=""
+  local second_volume=""
+  setup_mock_case podman-inner
+  mkdir -p "$CASE_DIR/project-one" "$CASE_DIR/project-two"
+
+  CAPSULE_RUNTIME=podman CAPSULE_WORKDIR="$CASE_DIR/project-one" \
+    run_capsule "$CASE_BIN" "$CASE_LOG" true
+  CAPSULE_RUNTIME=podman CAPSULE_WORKDIR="$CASE_DIR/project-two" \
+    run_capsule "$CASE_BIN" "$CASE_DIR/second" true
+
+  first_volume="$(grep -o 'capsule-inner-[^ ]*' "$CASE_LOG" | head -n1)"
+  second_volume="$(grep -o 'capsule-inner-[^ ]*' "$CASE_DIR/second" | head -n1)"
+
+  assert_podman_args_contain "$CASE_LOG" \
+    ':/var/lib/capsule/inner' \
+    "podman backend mounts an inner engine volume"
+
+  if [[ -n "$first_volume" ]] && [[ "$first_volume" != "$second_volume" ]]; then
+    pass "each workspace gets its own inner engine storage"
+  else
+    fail "each workspace gets its own inner engine storage"
+  fi
+
+  CAPSULE_RUNTIME=podman CAPSULE_WORKDIR="$CASE_DIR/project-one" \
+    run_capsule "$CASE_BIN" "$CASE_DIR/again" true
+  if grep -Fq "$first_volume" "$CASE_DIR/again"; then
+    pass "the same workspace reuses its inner engine storage"
+  else
+    fail "the same workspace reuses its inner engine storage"
+  fi
+}
+
+test_podman_backend_translates_publish_and_volume() {
+  setup_mock_case podman-options
+
+  CAPSULE_RUNTIME=podman run_capsule "$CASE_BIN" "$CASE_LOG" \
+    --publish 8080:80 --volume /host/data:/data true
+
+  assert_podman_args_contain "$CASE_LOG" \
+    '--publish 8080:80' \
+    "podman backend forwards published ports"
+  assert_podman_args_contain "$CASE_LOG" \
+    '--volume /host/data:/data' \
+    "podman backend forwards runtime volumes"
+}
+
+test_podman_backend_mounts_the_token_secret() {
+  setup_mock_case podman-secret
+
+  CAPSULE_RUNTIME=podman GITHUB_API_TOKEN=token-value \
+    run_capsule "$CASE_BIN" "$CASE_LOG" true
+
+  assert_podman_args_contain "$CASE_LOG" \
+    ':/run/secrets/github_api_token:ro' \
+    "podman backend mounts the token where the entrypoint reads it"
+  assert_podman_args_lack "$CASE_LOG" \
+    'token-value' \
+    "podman backend passes the token as a file, never on a command line"
+}
+
+test_podman_host_docker_is_opt_in() {
+  local socket_path=""
+  setup_mock_case podman-hostdocker
+  socket_path="$CASE_DIR/docker.sock"
+  : >"$socket_path"
+
+  CAPSULE_RUNTIME=podman DOCKER_HOST="unix://$socket_path" \
+    run_capsule "$CASE_BIN" "$CASE_LOG" true
+  assert_podman_args_lack "$CASE_LOG" \
+    '/var/lib/capsule/docker.sock' \
+    "the Capsule is isolated from the host daemon by default"
+
+  CAPSULE_RUNTIME=podman DOCKER_HOST="unix://$socket_path" \
+    run_capsule "$CASE_BIN" "$CASE_DIR/with" --host-docker true
+  assert_podman_args_contain "$CASE_DIR/with" \
+    "${socket_path}:/var/lib/capsule/docker.sock" \
+    "--host-docker binds the host daemon socket deliberately"
+}
+
+test_podman_host_docker_without_a_socket_is_an_error() {
+  setup_mock_case podman-hostdocker-missing
+
+  if CAPSULE_RUNTIME=podman DOCKER_HOST="unix://$CASE_DIR/absent.sock" \
+    run_capsule "$CASE_BIN" "$CASE_LOG" --host-docker true 2>"$CASE_ERR"; then
+    fail "--host-docker without a socket is refused"
+  else
+    pass "--host-docker without a socket is refused"
+  fi
+  assert_file_contains "$CASE_ERR" \
+    'found no Docker socket' \
+    "the --host-docker error says what was missing"
+}
+
+test_podman_build_uses_docker_format_and_a_secret() {
+  setup_mock_case podman-build
+
+  CAPSULE_RUNTIME=podman GITHUB_API_TOKEN=token-value CAPSULE_WITH_DOCKERD=1 \
+    run_capsule "$CASE_BIN" "$CASE_LOG" --build --no-cache true
+
+  assert_podman_args_contain "$CASE_LOG" \
+    'build --format docker' \
+    "podman build keeps Docker format, so the SHELL directive still applies"
+  assert_podman_args_contain "$CASE_LOG" \
+    '--secret id=github_api_token,env=GITHUB_API_TOKEN' \
+    "podman build takes the token as a build secret"
+  assert_podman_args_contain "$CASE_LOG" \
+    '--build-arg CAPSULE_WITH_DOCKERD=1' \
+    "podman build forwards the dockerd build arg"
+  assert_podman_args_contain "$CASE_LOG" \
+    '--no-cache' \
+    "podman build honours --no-cache"
+  assert_podman_args_lack "$CASE_LOG" \
+    'token-value' \
+    "podman build keeps the token off the command line"
+}
+
+test_podman_backend_requires_built_image() {
+  setup_mock_case podman-noimage
+
+  if CAPSULE_RUNTIME=podman MOCK_PODMAN_NO_IMAGE=1 \
+    run_capsule "$CASE_BIN" "$CASE_LOG" true 2>"$CASE_ERR"; then
+    fail "podman backend refuses to run an image that was never built"
+  else
+    pass "podman backend refuses to run an image that was never built"
+  fi
+  assert_file_contains "$CASE_ERR" \
+    'capsule.sh --build' \
+    "podman backend names the build command in the error"
+}
+
+test_podman_falls_back_when_rootful() {
+  setup_mock_case podman-rootful
+
+  CAPSULE_RUNTIME=podman MOCK_PODMAN_INFO="false 2" \
+    run_capsule "$CASE_BIN" "$CASE_LOG" true 2>"$CASE_ERR"
+
+  assert_file_contains "$CASE_ERR" \
+    'podman is running rootful' \
+    "a rootful podman falls back rather than run the Capsule as root"
+  assert_file_contains "$CASE_LOG" \
+    'compose' \
+    "the fallback actually runs the Docker backend"
+}
+
+test_podman_falls_back_without_a_subid_range() {
+  setup_mock_case podman-nosubid
+
+  CAPSULE_RUNTIME=podman MOCK_PODMAN_INFO="true 1" \
+    run_capsule "$CASE_BIN" "$CASE_LOG" true 2>"$CASE_ERR"
+
+  assert_file_contains "$CASE_ERR" \
+    'no sub-id range' \
+    "a user with no sub-id range falls back and names the package"
+}
+
+test_podman_falls_back_when_engine_unreachable() {
+  setup_mock_case podman-unreachable
+
+  CAPSULE_RUNTIME=podman MOCK_PODMAN_INFO_FAIL=1 \
+    run_capsule "$CASE_BIN" "$CASE_LOG" true 2>"$CASE_ERR"
+
+  assert_file_contains "$CASE_ERR" \
+    'podman cannot reach a working engine' \
+    "an unreachable engine falls back with the diagnostic named"
+}
+
+test_podman_falls_back_for_remote_and_custom_compose() {
+  local compose_file=""
+  setup_mock_case podman-fallbacks
+  compose_file="$CASE_DIR/custom.yml"
+  printf 'services:\n  cli:\n    image: custom:latest\n' >"$compose_file"
+
+  CAPSULE_EXTRA_APPROVALS='ssh://remote-host/srv/project' \
+    CAPSULE_RUNTIME=podman MOCK_SSH_OUTPUT=1234 \
+    run_capsule "$CASE_BIN" "$CASE_LOG" \
+    --remote remote-host:/srv/project true 2>"$CASE_ERR"
+  assert_file_contains "$CASE_ERR" \
+    '--remote needs a Docker daemon' \
+    "--remote falls back to Docker with the reason named"
+
+  CAPSULE_RUNTIME=podman CAPSULE_CUSTOM_COMPOSE="$compose_file" \
+    run_capsule "$CASE_BIN" "$CASE_LOG" true 2>"$CASE_ERR"
+  assert_file_contains "$CASE_ERR" \
+    'custom compose file needs the Docker backend' \
+    "a compose override falls back to Docker with the reason named"
+}
+
+test_podman_on_macos_requires_workspace_under_home() {
+  setup_mock_case podman-macos
+  mkdir -p "$CASE_DIR/home" "$CASE_DIR/elsewhere"
+
+  CAPSULE_RUNTIME=podman MOCK_UNAME=Darwin HOME="$CASE_DIR/home" \
+    CAPSULE_WORKDIR="$CASE_DIR/elsewhere" \
+    run_capsule "$CASE_BIN" "$CASE_LOG" true 2>"$CASE_ERR"
+
+  assert_file_contains "$CASE_ERR" \
+    'podman machine cannot see it' \
+    "a workspace the podman machine cannot see falls back to Docker"
+}
+
+test_podman_on_macos_runs_a_workspace_under_home() {
+  setup_mock_case podman-macos-ok
+  mkdir -p "$CASE_DIR/home/project"
+
+  CAPSULE_RUNTIME=podman MOCK_UNAME=Darwin HOME="$CASE_DIR/home" \
+    CAPSULE_WORKDIR="$CASE_DIR/home/project" \
+    run_capsule "$CASE_BIN" "$CASE_LOG" true 2>"$CASE_ERR"
+
+  assert_podman_args_contain "$CASE_LOG" \
+    'run --rm' \
+    "a workspace under the home runs through podman on macOS"
+  assert_file_not_contains "$CASE_ERR" \
+    'not using podman' \
+    "nothing falls back when the machine can see the workspace"
+}
+
+test_runtime_docker_keeps_docker_with_podman_available() {
+  setup_mock_case podman-pinned-docker
+
+  CAPSULE_RUNTIME=auto run_capsule "$CASE_BIN" "$CASE_LOG" \
+    --runtime docker true 2>"$CASE_ERR"
+
+  assert_file_contains "$CASE_LOG" \
+    'compose' \
+    "--runtime docker wins over an otherwise usable podman"
+  assert_podman_args_lack "$CASE_LOG" \
+    'run --rm' \
+    "--runtime docker starts no podman container"
+  assert_file_not_contains "$CASE_ERR" \
+    'not using podman' \
+    "--runtime docker explains nothing, because nothing fell back"
+}
+
+test_runtime_flag_rejects_bad_values() {
+  setup_mock_case podman-badruntime
+
+  if run_capsule "$CASE_BIN" "$CASE_LOG" --runtime kern true 2>"$CASE_ERR"; then
+    fail "an unknown runtime is rejected"
+  else
+    pass "an unknown runtime is rejected"
+  fi
+  assert_file_contains "$CASE_ERR" \
+    'unknown runtime: kern' \
+    "the unknown runtime error names the value"
+
+  if run_capsule "$CASE_BIN" "$CASE_LOG" --runtime 2>"$CASE_ERR"; then
+    fail "a --runtime without a value is rejected"
+  else
+    pass "a --runtime without a value is rejected"
+  fi
+
+  if run_capsule "$CASE_BIN" "$CASE_LOG" --runtime= true 2>"$CASE_ERR"; then
+    fail "an empty --runtime= value is rejected"
+  else
+    pass "an empty --runtime= value is rejected"
+  fi
+
+  if CAPSULE_RUNTIME=kern run_capsule "$CASE_BIN" "$CASE_LOG" true \
+    2>"$CASE_ERR"; then
+    fail "an unknown CAPSULE_RUNTIME is rejected"
+  else
+    pass "an unknown CAPSULE_RUNTIME is rejected"
+  fi
+
+  if CAPSULE_RUNTIME='' run_capsule "$CASE_BIN" "$CASE_LOG" true \
+    2>"$CASE_ERR"; then
+    pass "an empty CAPSULE_RUNTIME falls back to the default"
+  else
+    fail "an empty CAPSULE_RUNTIME falls back to the default"
+  fi
+}
+
+#-------------------------------------------------------------------------------
+# In-Capsule engine router
+#
+# These run docker/capsule-docker.sh for real against mocked engines: a podman
+# that creates its API socket, an optional rootless dockerd that creates its
+# own, and a Docker client that answers only for a socket that exists. That is
+# enough to assert what the router decides, which is all it does.
+#-------------------------------------------------------------------------------
+
+# Build a mock engine environment for the router.
+make_router_env() {
+  local dir="$1"
+  local with_dockerd="${2:-}"
+  local tool=""
+
+  mkdir -p "$dir/bin" "$dir/real" "$dir/state"
+  ln -sf "$ROUTER_PATH" "$dir/bin/docker"
+
+  # The router runs on a PATH of its own so that a host engine cannot
+  # decide a case. A real dockerd-rootless.sh on the caller's PATH would
+  # otherwise make the missing-Engine case start that daemon and fail on
+  # its timeout instead of on the diagnostic the case asserts. Link in
+  # only the utilities the router and these mocks actually call.
+  for tool in bash basename cat chmod mkdir pkill rm sleep; do
+    ln -sf "$(command -v "$tool")" "$dir/bin/$tool"
+  done
+
+  cat >"$dir/bin/podman" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "system" ]] && [[ "${2:-}" == "service" ]]; then
+  for arg in "$@"; do
+    case "$arg" in
+      unix://*) : >"${arg#unix://}" ;;
+    esac
+  done
+  sleep 5
+fi
+exit 0
+EOF
+
+  cat >"$dir/real/docker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+socket="${DOCKER_HOST#unix://}"
+if [[ "${1:-}" == "version" ]]; then
+  [[ -e "$socket" ]] || exit 1
+  exit 0
+fi
+printf 'ROUTED=%s ARGS=%s\n' "$socket" "$*" >>"${ROUTER_LOG:?}"
+EOF
+
+  if [[ -n "$with_dockerd" ]]; then
+    cat >"$dir/bin/dockerd-rootless.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+for arg in "$@"; do
+  case "$arg" in
+    --host=unix://*) : >"${arg#--host=unix://}" ;;
+  esac
+done
+sleep 5
+EOF
+    chmod +x "$dir/bin/dockerd-rootless.sh"
+  fi
+
+  chmod +x "$dir/bin/podman" "$dir/real/docker"
+}
+
+# Run the router under one of its two names.
+run_router() {
+  local dir="$1"
+  local invoked_as="$2"
+  shift 2
+
+  if [[ "$invoked_as" == "docker" ]]; then
+    PATH="$dir/bin" CAPSULE_ENGINE_DIR="$dir/state" \
+      CAPSULE_REAL_DOCKER="$dir/real/docker" \
+      CAPSULE_HOST_SOCKET="$dir/hostsock" \
+      ROUTER_LOG="$dir/routed" \
+      "$dir/bin/docker" "$@"
+    return
+  fi
+
+  PATH="$dir/bin" CAPSULE_ENGINE_DIR="$dir/state" \
+    CAPSULE_REAL_DOCKER="$dir/real/docker" \
+    CAPSULE_HOST_SOCKET="$dir/hostsock" \
+    ROUTER_LOG="$dir/routed" \
+    bash "$ROUTER_PATH" "$@"
+}
+
+# Stop the mock engines a router case left running.
+stop_router_env() {
+  local dir="$1"
+
+  run_router "$dir" capsule-docker stop >/dev/null 2>&1 || true
+  pkill -f "$dir/bin/podman" 2>/dev/null || true
+  pkill -f "$dir/bin/dockerd-rootless.sh" 2>/dev/null || true
+}
+
+test_router_starts_the_podman_socket_on_first_use() {
+  local dir="$TEST_TMPDIR/router-lazy"
+  make_router_env "$dir"
+
+  run_router "$dir" capsule-docker status >"$dir/status" 2>&1 || true
+  assert_file_contains "$dir/status" \
+    'podman api socket: stopped' \
+    "nothing runs in the Capsule until a container command is issued"
+
+  run_router "$dir" docker ps >/dev/null 2>"$dir/err" || true
+  assert_file_contains "$dir/err" \
+    'starting podman API socket (first use)' \
+    "the first docker command starts the podman API socket"
+  assert_file_contains "$dir/routed" \
+    "ROUTED=$dir/state/podman.sock ARGS=ps" \
+    "the command is routed to the podman socket"
+
+  run_router "$dir" docker ps >/dev/null 2>"$dir/err2" || true
+  assert_file_not_contains "$dir/err2" \
+    'first use' \
+    "a second command reuses the running socket silently"
+
+  stop_router_env "$dir"
+}
+
+test_router_reports_engine_status() {
+  local dir="$TEST_TMPDIR/router-status"
+  make_router_env "$dir"
+
+  run_router "$dir" docker ps >/dev/null 2>&1 || true
+  run_router "$dir" capsule-docker status >"$dir/status" 2>&1 || true
+
+  assert_file_contains "$dir/status" \
+    'engine: podman' \
+    "status names the selected engine"
+  assert_file_contains "$dir/status" \
+    'podman api socket: running' \
+    "status reports the socket it started"
+  assert_file_contains "$dir/status" \
+    'dockerd: stopped' \
+    "status reports the Engine as stopped when it was never asked for"
+
+  stop_router_env "$dir"
+}
+
+test_router_switch_to_dockerd_sticks() {
+  local dir="$TEST_TMPDIR/router-dockerd"
+  make_router_env "$dir" with-dockerd
+
+  run_router "$dir" docker ps >/dev/null 2>&1 || true
+  run_router "$dir" capsule-docker use-dockerd >"$dir/switch" 2>&1 || true
+  assert_file_contains "$dir/switch" \
+    'engine: dockerd' \
+    "use-dockerd reports the engine it switched to"
+
+  run_router "$dir" docker ps >/dev/null 2>&1 || true
+  assert_file_contains "$dir/routed" \
+    "ROUTED=$dir/state/dockerd.sock" \
+    "later commands go to the Engine for the life of the Capsule"
+
+  run_router "$dir" capsule-docker use-podman >/dev/null 2>&1 || true
+  : >"$dir/routed"
+  run_router "$dir" docker ps >/dev/null 2>&1 || true
+  assert_file_contains "$dir/routed" \
+    "ROUTED=$dir/state/podman.sock" \
+    "use-podman switches back to the socket engine"
+
+  stop_router_env "$dir"
+}
+
+test_router_reports_a_missing_dockerd() {
+  local dir="$TEST_TMPDIR/router-nodockerd"
+  make_router_env "$dir"
+
+  if run_router "$dir" capsule-docker use-dockerd >"$dir/out" 2>&1; then
+    fail "use-dockerd fails when the image has no Engine"
+  else
+    pass "use-dockerd fails when the image has no Engine"
+  fi
+  assert_file_contains "$dir/out" \
+    'rebuild with CAPSULE_WITH_DOCKERD=1' \
+    "the missing-Engine error says how to get one"
+
+  stop_router_env "$dir"
+}
+
+test_router_prefers_a_bound_host_socket() {
+  local dir="$TEST_TMPDIR/router-hostsock"
+  make_router_env "$dir"
+  : >"$dir/hostsock"
+
+  run_router "$dir" docker ps >/dev/null 2>&1 || true
+  assert_file_contains "$dir/routed" \
+    "ROUTED=$dir/hostsock" \
+    "a deliberately bound host socket wins over the Capsule's own engine"
+  assert_file_not_contains "$dir/routed" \
+    'podman.sock' \
+    "the Capsule's own engine is not started when the host daemon is bound"
+
+  run_router "$dir" capsule-docker status >"$dir/status" 2>&1 || true
+  assert_file_contains "$dir/status" \
+    'host docker socket' \
+    "status says when the host daemon is what answers"
+
+  stop_router_env "$dir"
+}
+
+test_router_ignores_a_dead_host_socket() {
+  local dir="$TEST_TMPDIR/router-deadsock"
+  make_router_env "$dir"
+
+  run_router "$dir" docker ps >/dev/null 2>&1 || true
+  assert_file_contains "$dir/routed" \
+    "ROUTED=$dir/state/podman.sock" \
+    "an absent host socket falls through to the Capsule's own engine"
+
+  stop_router_env "$dir"
+}
+
+test_router_stop_releases_the_engines() {
+  local dir="$TEST_TMPDIR/router-stop"
+  make_router_env "$dir"
+
+  run_router "$dir" docker ps >/dev/null 2>&1 || true
+  run_router "$dir" capsule-docker stop >/dev/null 2>&1 || true
+  run_router "$dir" capsule-docker status >"$dir/status" 2>&1 || true
+
+  assert_file_contains "$dir/status" \
+    'podman api socket: stopped' \
+    "stop leaves no engine running"
+
+  stop_router_env "$dir"
+}
+
+test_entrypoint_non_root_path_execs_the_command() {
+  local dir="$TEST_TMPDIR/entrypoint-nonroot"
+  mkdir -p "$dir"
+
+  # shellcheck disable=SC2016
+  if env -u HOME -u USER -u LOGNAME \
+    "$ENTRYPOINT_PATH" bash -c \
+    'printf "ENTRYPOINT_EXEC_OK %s %s %s\n" "$HOME" "$USER" "$LOGNAME"' \
+    >"$dir/out" 2>"$dir/err"; then
+    pass "the entrypoint's non-root path runs the command"
+  else
+    fail "the entrypoint's non-root path runs the command"
+  fi
+  assert_file_contains "$dir/out" \
+    'ENTRYPOINT_EXEC_OK /home/user user user' \
+    "the non-root command receives the Capsule user environment"
+}
+
+# shellcheck disable=SC2016
+test_podman_image_contract() {
+  assert_file_contains "$DOCKERFILE_PATH" \
+    'aardvark-dns catatonit fuse-overlayfs netavark nftables passt podman' \
+    "Dockerfile installs what the inner engine needs to serve a project"
+  assert_file_contains "$DOCKERFILE_PATH" \
+    "printf 'user:%s:%s\\n' \"\${sub_start}\" \"\${sub_count}\" > /etc/subuid" \
+    "Dockerfile gives the account a sub-id range for the inner engine"
+  assert_file_contains "$DOCKERFILE_PATH" \
+    'ln -s /usr/local/bin/capsule-docker /usr/local/bin/docker' \
+    "Dockerfile puts the engine router ahead of the real client"
+  assert_file_contains "$DOCKERFILE_PATH" \
+    'ARG CAPSULE_WITH_DOCKERD=0' \
+    "Dockerfile keeps the real Engine behind a build arg"
+  assert_file_contains "$DOCKERFILE_PATH" \
+    'type=secret,id=github_api_token,required=true' \
+    "Dockerfile mounts the build token as a secret file"
+  assert_file_not_contains "$DOCKERFILE_PATH" \
+    'id=github_api_token,env=GITHUB_API_TOKEN' \
+    "Dockerfile does not replace the token file with an environment mount"
+  assert_file_contains "$DOCKERFILE_PATH" \
+    'cat /run/secrets/github_api_token' \
+    "Dockerfile reads the token from the file form both builders serve"
+  assert_file_contains "$STORAGE_CONF_PATH" \
+    'rootless_storage_path = "/var/lib/capsule/inner/containers"' \
+    "inner engine storage points at the per-workspace volume"
+}
+
+# shellcheck disable=SC2016
+test_entrypoint_non_root_contract() {
+  assert_file_contains "$ENTRYPOINT_PATH" \
+    'refresh_gh_auth' \
+    "entrypoint refreshes gh credentials on both paths"
+  assert_file_contains "$ENTRYPOINT_PATH" \
+    'if [ "$(id -u)" != "0" ]; then
+  set_user_environment
+  refresh_gh_auth
+  exec "$@"' \
+    "the non-root path initializes and authenticates before podman exec"
+}
 
 main() {
   if ! bash -n "$SCRIPT_PATH"; then
@@ -1594,18 +2522,21 @@ main() {
     pass "capsule.sh has valid shell syntax"
   fi
 
-  if command -v shellcheck >/dev/null 2>&1; then
+  # Ask shellcheck to run rather than just look it up: a mise shim with no
+  # version set is on PATH but errors out the moment it is called.
+  if shellcheck --version >/dev/null 2>&1; then
     if ! shellcheck "$SCRIPT_PATH"; then
       fail "capsule.sh has linting errors"
     else
       pass "capsule.sh is lint free"
     fi
   else
-    skip "shellcheck not installed; skipping lint check"
+    skip "shellcheck unavailable; skipping lint check"
   fi
 
   test_compose_contract
   test_dockerfile_tooling_contract
+  test_codex_wrapper_forces_unrestricted_mode
   test_dockerfile_uid_gid_contract
   test_entrypoint_contract
   test_build_flag_runs_build_then_runtime
@@ -1615,6 +2546,10 @@ main() {
   test_publish_and_volume_env_forward_to_runtime
   test_empty_optional_arrays_use_nounset_safe_expansion
   test_check_all_docker_linters_use_capsule_host_workdir
+  test_check_all_ignores_an_unusable_linter
+  test_doctor_reports_each_backend_and_probes_by_running
+  test_doctor_names_a_stale_session_bus
+  test_ci_runs_nested_capsules_for_each_backend
   test_build_custom_flag_keeps_runtime_flags
   test_build_flag_without_runtime_args
   test_build_custom_flag_requires_custom_compose
@@ -1657,6 +2592,33 @@ main() {
   test_bad_docker_host_falls_back_to_context_socket
   test_macos_staff_gid_override
   test_default_gid_when_detection_fails
+  test_podman_backend_runs_container_with_keep_id
+  test_nested_capsule_podman_uses_local_workdir
+  test_podman_inner_volume_is_per_workspace
+  test_podman_backend_translates_publish_and_volume
+  test_podman_backend_mounts_the_token_secret
+  test_podman_host_docker_is_opt_in
+  test_podman_host_docker_without_a_socket_is_an_error
+  test_podman_build_uses_docker_format_and_a_secret
+  test_podman_backend_requires_built_image
+  test_podman_falls_back_when_rootful
+  test_podman_falls_back_without_a_subid_range
+  test_podman_falls_back_when_engine_unreachable
+  test_podman_falls_back_for_remote_and_custom_compose
+  test_podman_on_macos_requires_workspace_under_home
+  test_podman_on_macos_runs_a_workspace_under_home
+  test_runtime_docker_keeps_docker_with_podman_available
+  test_runtime_flag_rejects_bad_values
+  test_router_starts_the_podman_socket_on_first_use
+  test_router_reports_engine_status
+  test_router_switch_to_dockerd_sticks
+  test_router_reports_a_missing_dockerd
+  test_router_prefers_a_bound_host_socket
+  test_router_ignores_a_dead_host_socket
+  test_router_stop_releases_the_engines
+  test_entrypoint_non_root_path_execs_the_command
+  test_podman_image_contract
+  test_entrypoint_non_root_contract
 
   printf '\nSummary: %d passed, %d failed, %d skipped\n' \
     "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT"
