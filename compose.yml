@@ -7,6 +7,7 @@ services:
       args:
         - CAPSULE_UID=${CAPSULE_UID:-1000}
         - CAPSULE_GID=${CAPSULE_GID:-100}
+        - CAPSULE_WITH_DOCKERD=${CAPSULE_WITH_DOCKERD:-0}
         - MISE_SYSTEM_TOOLS
     volumes:
       - ${CAPSULE_HOST_WORKDIR:-${CAPSULE_WORKDIR:-${PWD}}}:/home/workspace

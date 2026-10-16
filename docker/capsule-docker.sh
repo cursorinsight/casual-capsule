@@ -161,6 +161,43 @@ ensure_engine_socket() {
 # Route a docker command to the active engine.
 run_docker() {
   local socket_path=""
+  local argument=""
+  local skip_value=0
+  local context=""
+
+  if [[ -n "${DOCKER_CONTEXT:-}" ]] ||
+    [[ -n "${DOCKER_HOST:-}" &&
+       "$DOCKER_HOST" != "unix://${HOST_SOCKET}" ]]; then
+    exec "$REAL_DOCKER" "$@"
+  fi
+
+  for argument in "$@"; do
+    if [[ "$skip_value" -eq 1 ]]; then
+      skip_value=0
+      continue
+    fi
+    case "$argument" in
+      -H|--host|-H?*|--host=*|-c|--context|-c?*|--context=*)
+        exec "$REAL_DOCKER" "$@"
+        ;;
+      --config|-l|--log-level|--tlscacert|--tlscert|--tlskey)
+        skip_value=1
+        ;;
+      context|--help|--version)
+        exec "$REAL_DOCKER" "$@"
+        ;;
+      --) break ;;
+      -*) ;;
+      *) break ;;
+    esac
+  done
+
+  if [[ -z "${DOCKER_HOST:-}" ]]; then
+    context="$("$REAL_DOCKER" context show)"
+    if [[ "$context" != "default" ]]; then
+      exec "$REAL_DOCKER" "$@"
+    fi
+  fi
 
   socket_path="$(ensure_engine_socket)"
   export DOCKER_HOST="unix://${socket_path}"

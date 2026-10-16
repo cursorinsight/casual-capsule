@@ -263,6 +263,9 @@ if [[ "${1:-}" == "image" ]] && [[ "${2:-}" == "exists" ]]; then
 fi
 
 printf 'PODMAN_ARGS=%s\n' "$*" >>"${MOCK_LOG:?MOCK_LOG is required}"
+if [[ "${1:-}" == "run" && -n "${MOCK_PODMAN_STDIN_FILE:-}" ]]; then
+  cat >"$MOCK_PODMAN_STDIN_FILE"
+fi
 exit 0
 EOF
 
@@ -484,6 +487,9 @@ test_compose_contract() {
   assert_file_contains "$COMPOSE_PATH" \
     '- MISE_SYSTEM_TOOLS' \
     "compose passes MISE_SYSTEM_TOOLS from the build environment"
+  assert_file_contains "$COMPOSE_PATH" \
+    '- CAPSULE_WITH_DOCKERD=${CAPSULE_WITH_DOCKERD:-0}' \
+    "compose forwards the dockerd build option with a disabled default"
   assert_file_contains "$README_PATH" \
     'This replaces the entire default list.' \
     "docs say MISE_SYSTEM_TOOLS replaces the defaults"
@@ -2175,6 +2181,30 @@ test_debug_mode_enables_xtrace() {
     "CAPSULE_DEBUG=1 enables shell xtrace"
 }
 
+test_debug_mode_redacts_github_token() {
+  local runtime=""
+  local token='capsule-synthetic-debug-token'
+  setup_mock_case debug-token
+  mkdir -p "$CASE_DIR/home"
+
+  for runtime in docker podman; do
+    CAPSULE_DEBUG=1 CAPSULE_RUNTIME="$runtime" GITHUB_API_TOKEN="$token" \
+      HOME="$CASE_DIR/home" \
+      run_capsule "$CASE_BIN" "$CASE_DIR/$runtime-log" --build true \
+      >"$CASE_DIR/$runtime-out" 2>"$CASE_DIR/$runtime-err"
+    assert_file_not_contains "$CASE_DIR/$runtime-err" "$token" \
+      "$runtime debug trace never exposes the GitHub token"
+    assert_file_not_contains "$CASE_DIR/$runtime-out" "$token" \
+      "$runtime output never exposes the GitHub token"
+    assert_file_not_contains "$CASE_DIR/$runtime-log" "$token" \
+      "$runtime invocations never contain the GitHub token"
+    assert_file_contains "$CASE_DIR/$runtime-err" '+ set -euo pipefail' \
+      "$runtime debugging remains enabled with a token"
+  done
+  assert_file_contains "$CASE_DIR/podman-err" '+ cleanup_podman_state' \
+    "Podman restores parent tracing after writing its secret"
+}
+
 test_uid_gid_autodetect() {
   local tdir="$TEST_TMPDIR/uid-autodetect"
   local mock_bin="$tdir/bin"
@@ -2585,6 +2615,21 @@ test_podman_backend_runs_container_with_keep_id() {
   assert_podman_args_contain "$CASE_LOG" \
     'casual-capsule:local claude' \
     "podman backend passes the command after the image"
+}
+
+test_podman_preserves_piped_stdin() {
+  setup_mock_case podman-stdin
+
+  printf 'capsule piped payload\n' |
+    CAPSULE_RUNTIME=podman MOCK_PODMAN_STDIN_FILE="$CASE_DIR/stdin" \
+    run_capsule "$CASE_BIN" "$CASE_LOG" cat >"$CASE_DIR/out"
+
+  assert_podman_args_contain "$CASE_LOG" '--interactive' \
+    "Podman keeps stdin open for non-TTY commands"
+  assert_podman_args_lack "$CASE_LOG" '--tty' \
+    "Podman does not allocate a TTY for piped input"
+  assert_file_contains "$CASE_DIR/stdin" 'capsule piped payload' \
+    "piped input reaches Podman without approval or setup consuming it"
 }
 
 # Verify local podman sees a nested Capsule path, not its outer Docker path.
@@ -3071,13 +3116,20 @@ EOF
   cat >"$dir/real/docker" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-socket="${DOCKER_HOST#unix://}"
+if [[ "${1:-}" == "context" && "${2:-}" == "show" ]]; then
+  printf '%s\n' "${MOCK_ROUTER_CONTEXT:-default}"
+  exit 0
+fi
+socket="${DOCKER_HOST:-}"
+socket="${socket#unix://}"
 if [[ "${1:-}" == "version" ]]; then
   [[ -e "$socket" ]] || exit 1
   [[ "$socket" != "${ROUTER_BROKEN_SOCKET:-}" ]] || exit 1
   exit 0
 fi
 printf 'ROUTED=%s ARGS=%s\n' "$socket" "$*" >>"${ROUTER_LOG:?}"
+printf 'CLIENT_HOST=%s CLIENT_CONTEXT=%s\n' \
+  "${DOCKER_HOST:-}" "${DOCKER_CONTEXT:-}" >>"$ROUTER_LOG"
 EOF
 
   if [[ -n "$with_dockerd" ]]; then
@@ -3242,6 +3294,87 @@ test_router_prefers_a_bound_host_socket() {
     "status says when the host daemon is what answers"
 
   stop_router_env "$dir"
+}
+
+test_router_preserves_explicit_endpoints() {
+  local dir="$TEST_TMPDIR/router-endpoints"
+  local endpoint=""
+  local selection=""
+  local options=()
+  make_router_env "$dir"
+  : >"$dir/hostsock"
+
+  for endpoint in ssh://buildbox tcp://builder:2376 unix:///custom.sock; do
+    : >"$dir/routed"
+    DOCKER_HOST="$endpoint" CAPSULE_REQUIRE_HOST_DOCKER=1 \
+      run_router "$dir" docker compose ps
+    assert_file_contains "$dir/routed" "CLIENT_HOST=$endpoint " \
+      "the router preserves the explicit $endpoint endpoint"
+  done
+
+  : >"$dir/routed"
+  DOCKER_CONTEXT=remote-builder DOCKER_HOST="unix://$dir/hostsock" \
+    run_router "$dir" docker ps
+  assert_file_contains "$dir/routed" 'CLIENT_CONTEXT=remote-builder' \
+    "the router preserves an explicit context over the image endpoint"
+
+  for selection in host short-host joined-host context short-context; do
+    case "$selection" in
+      host) options=(--host ssh://buildbox) ;;
+      short-host) options=(-H ssh://buildbox) ;;
+      joined-host) options=(-Hssh://buildbox) ;;
+      context) options=(--context=remote-builder) ;;
+      short-context) options=(-c remote-builder) ;;
+    esac
+    : >"$dir/routed"
+    run_router "$dir" docker --config "$dir/config" \
+      "${options[@]}" compose ps
+    assert_file_contains "$dir/routed" 'CLIENT_HOST= CLIENT_CONTEXT=' \
+      "the router leaves native endpoint selection to $selection flags"
+    assert_file_contains "$dir/routed" "${options[*]} compose ps" \
+      "the router forwards $selection arguments unchanged"
+  done
+
+  : >"$dir/routed"
+  MOCK_ROUTER_CONTEXT=remote-builder run_router "$dir" docker ps
+  assert_file_contains "$dir/routed" 'CLIENT_HOST= CLIENT_CONTEXT=' \
+    "the router respects a non-default active Docker context"
+
+  : >"$dir/routed"
+  run_router "$dir" docker run alpine echo --host ssh://buildbox
+  assert_file_contains "$dir/routed" "CLIENT_HOST=unix://$dir/hostsock " \
+    "a container command argument is not treated as a Docker endpoint flag"
+
+  : >"$dir/routed"
+  DOCKER_HOST="unix://$dir/hostsock" run_router "$dir" docker ps
+  assert_file_contains "$dir/routed" "ROUTED=$dir/hostsock ARGS=ps" \
+    "the image's default endpoint still uses Capsule routing"
+  stop_router_env "$dir"
+}
+
+test_nested_remote_commands_use_router() {
+  local command=""
+  setup_mock_case nested-remote-router
+  mv "$CASE_BIN/docker" "$CASE_BIN/docker-real"
+  ln -s "$ROUTER_PATH" "$CASE_BIN/docker"
+
+  for command in run build list; do
+    : >"$CASE_LOG"
+    if [[ "$command" == "list" ]]; then
+      CAPSULE_REAL_DOCKER="$CASE_BIN/docker-real" \
+        run_capsule "$CASE_BIN" "$CASE_LOG" list --remote buildbox \
+        >"$CASE_DIR/list-out"
+      assert_file_contains "$CASE_LOG" 'DOCKER_PS_HOST=ssh://buildbox' \
+        "nested remote listing reaches the requested endpoint through router"
+    else
+      CAPSULE_REAL_DOCKER="$CASE_BIN/docker-real" MOCK_SSH_OUTPUT=1234 \
+        CAPSULE_EXTRA_APPROVALS=ssh://buildbox/srv/project \
+        run_capsule "$CASE_BIN" "$CASE_LOG" \
+        "$command" --remote buildbox:/srv/project
+      assert_file_contains "$CASE_LOG" 'ENV_DOCKER_HOST=ssh://buildbox' \
+        "nested remote $command reaches the requested endpoint through router"
+    fi
+  done
 }
 
 test_router_ignores_a_dead_host_socket() {
@@ -3477,6 +3610,7 @@ main() {
   test_custom_compose_requires_cli_image
   test_explicit_docker_gid_passthrough
   test_debug_mode_enables_xtrace
+  test_debug_mode_redacts_github_token
   test_uid_gid_autodetect
   test_uid_gid_fallback_when_id_fails
   test_explicit_uid_gid_passthrough
@@ -3493,6 +3627,7 @@ main() {
   test_macos_staff_gid_override
   test_default_gid_when_detection_fails
   test_podman_backend_runs_container_with_keep_id
+  test_podman_preserves_piped_stdin
   test_nested_capsule_podman_uses_local_workdir
   test_podman_inner_volume_is_per_workspace
   test_podman_backend_translates_publish_and_volume
@@ -3517,6 +3652,8 @@ main() {
   test_router_switch_to_dockerd_sticks
   test_router_reports_a_missing_dockerd
   test_router_prefers_a_bound_host_socket
+  test_router_preserves_explicit_endpoints
+  test_nested_remote_commands_use_router
   test_router_ignores_a_dead_host_socket
   test_router_requires_requested_host_socket
   test_router_stop_releases_the_engines

@@ -602,6 +602,18 @@ whatever the Capsule started. The real Engine is only present when the image
 was built with `CAPSULE_WITH_DOCKERD=1`, because it is the heavier of the
 two; the router says so if it is missing.
 
+Explicit Docker endpoints and contexts bypass the inner-engine router. This
+includes `DOCKER_HOST`, `DOCKER_CONTEXT`, `docker --host`, `docker --context`,
+and a non-default active context when `DOCKER_HOST` is unset. Nested Capsule
+commands using `--remote` therefore reach the requested remote daemon. The
+image's own default socket still uses normal Capsule routing.
+
+Both backends preserve piped and redirected stdin without allocating a TTY:
+
+```bash
+printf 'payload\n' | capsule --runtime podman cat
+```
+
 #### What differs inside a podman Capsule
 
 *   **You are still `user`, and your files are still yours.** podman's
@@ -1027,12 +1039,13 @@ empty value, `0`, `false`, `no`, or `off`.
 
 *   `CAPSULE_WITH_DOCKERD`: Build the image with a real Docker Engine.
 
-    Default: empty. Set to `1` at build time to make `capsule-docker
-    use-dockerd` available inside the Capsule.
+    Default: empty (disabled). Set to `1` at build time with either backend to
+    make `capsule-docker use-dockerd` available inside the Capsule.
 
 *   `CAPSULE_DEBUG`: Enable shell xtrace for `capsule`.
 
-    Default: empty. When set to `1`, Capsule runs with `set -x`.
+    Default: empty. When set to `1`, Capsule runs with `set -x`. GitHub token
+    checks and secret-file writes do not expose the token in these traces.
 
 *   `CAPSULE_UID`: Container user UID (user ID).
 

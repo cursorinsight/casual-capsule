@@ -1029,7 +1029,7 @@ podman_inner_volume() {
 configure_podman_secret() {
   local secret_dir="${HOME}/.capsule"
 
-  if [[ -z "${GITHUB_API_TOKEN:-}" ]]; then
+  if [[ -z "${GITHUB_API_TOKEN:+set}" ]]; then
     return
   fi
 
@@ -1037,6 +1037,7 @@ configure_podman_secret() {
   chmod 700 "$secret_dir"
   PODMAN_SECRET_FILE="${secret_dir}/github_api_token.$$"
   (
+    set +x
     umask 077
     printf '%s' "$GITHUB_API_TOKEN" >"$PODMAN_SECRET_FILE"
   )
@@ -1097,7 +1098,7 @@ run_podman_build() {
     build_args+=(--build-arg "CAPSULE_WITH_DOCKERD=${CAPSULE_WITH_DOCKERD}")
   fi
 
-  if [[ -n "${GITHUB_API_TOKEN:-}" ]]; then
+  if [[ -n "${GITHUB_API_TOKEN:+set}" ]]; then
     build_args+=(
       --secret "id=github_api_token,env=GITHUB_API_TOKEN"
     )
@@ -1178,7 +1179,7 @@ build_podman_run_args() {
   fi
 
   PODMAN_RUN_ARGS=(
-    run --rm
+    run --rm --interactive
     --name "$PODMAN_CONTAINER_NAME"
     --hostname capsule
     --privileged
@@ -1202,7 +1203,7 @@ build_podman_run_args() {
   fi
 
   if [[ -t 0 ]] && [[ -t 1 ]]; then
-    PODMAN_RUN_ARGS+=(-it)
+    PODMAN_RUN_ARGS+=(--tty)
   fi
 
   append_podman_host_docker
@@ -1249,7 +1250,7 @@ initialize_compose_commands() {
     docker compose
     -f "$SCRIPT_DIR/compose.yml"
   )
-  if [[ -n "${GITHUB_API_TOKEN:-}" ]]; then
+  if [[ -n "${GITHUB_API_TOKEN:+set}" ]]; then
     BASE_COMPOSE_CMD+=(-f "$SCRIPT_DIR/compose.github-token.yml")
   fi
 

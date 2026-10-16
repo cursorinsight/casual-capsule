@@ -173,18 +173,23 @@ test_podman_backend_end_to_end() {
 
   # The inner engine has to answer, and the workspace has to be writable as
   # the caller: those are the two properties the backend exists for.
-  check_cmd='bash ./check-env.sh'
+  # shellcheck disable=SC2016
+  check_cmd='read -r payload && [[ "$payload" == "capsule stdin ok" ]]'
+  check_cmd+=' && printf "capsule stdin ok\n" && bash ./check-env.sh'
   check_cmd="$check_cmd && touch written-by-capsule"
   check_cmd="$check_cmd && capsule-docker status"
   check_cmd="$check_cmd && docker run --rm alpine:3.20 echo capsule inner ok"
 
   log_message "Running capsule.sh --runtime podman --build"
   # shellcheck disable=SC2016
-  if run_logged bash -c '
+  if printf 'capsule stdin ok\n' | run_logged bash -c '
     unset CAPSULE_WORKDIR
     cd "$1" &&
       CAPSULE_CONFIG="$2" CAPSULE_RUNTIME=podman "$3" --build bash -lc "$4"
   ' bash "$workspace" "$config_file" "$SCRIPT_PATH" "$check_cmd"; then
+    assert_file_contains "$LOG_FILE" \
+      "capsule stdin ok" \
+      "the Podman-backed Capsule preserves piped stdin end to end"
     assert_file_contains "$LOG_FILE" \
       "capsule inner ok" \
       "the Capsule's own engine runs a container end to end"
