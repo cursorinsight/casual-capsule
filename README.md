@@ -58,15 +58,16 @@ the command that repairs whatever is missing.
 
 ## 🚀 Initial setup
 
-There is no true quick start for the first run. Capsule persists GitHub auth
-state in the home volume, so it is worth doing setup in this order: prepare the
-token first, then start Capsule, then verify the workspace and `gh` auth before
-opening Claude or Codex. These checkpoints make later troubleshooting much
-easier.
+`GITHUB_API_TOKEN` is optional for builds, runtime, diagnostics, and tests.
+Without it, tool downloads use unauthenticated GitHub access and may encounter
+rate limits. Private repository access still needs suitable credentials.
+Capsule persists GitHub auth in the home volume; prepare a token before the
+first run only if you want automatic `gh` login. Claude and Codex authenticate
+separately.
 
 | Phase | What it proves |
 | --- | --- |
-| Prepare credentials | The first Capsule run can persist working GitHub auth. |
+| Prepare credentials (optional) | Capsule can persist working GitHub auth. |
 | Start Capsule | The image builds and the container starts successfully. |
 | Verify the container | The workspace mount and persistent home volume work. |
 | Verify GitHub auth | `gh` is already logged in before agent startup. |
@@ -76,7 +77,8 @@ easier.
 
 1.  Decide if you want to use Claude, Codex, or both.
 
-2.  Generate a GitHub access token.
+2.  Optionally generate a GitHub access token. Skip this step and step 5 if
+    you do not need automatic GitHub authentication.
 
     1.  Open <https://github.com/settings/personal-access-tokens>.
 
@@ -124,11 +126,11 @@ easier.
     `~/.zshrc`). The existing `capsule.sh` entry point remains available for
     backward compatibility.
 
-5.  Set `GITHUB_API_TOKEN` to the value you received from GitHub (replace
+5.  If you generated a token, set `GITHUB_API_TOKEN` to its value (replace
     `[GITHUB_API_TOKEN]`).
 
-    Set this before the first build/run so the persistent home volume starts
-    with working GitHub auth.
+    Capsule passes a supplied token as a build and runtime secret, never as
+    an image environment variable. Leaving it unset or empty skips both.
 
     ```
     $ export GITHUB_API_TOKEN=[GITHUB_API_TOKEN]
@@ -184,16 +186,11 @@ easier.
     **Checkpoint:** the workspace bind mount is correct before you start an
     agent.
 
-2.  Check the user home directory:
+2.  Check that the persistent user home exists:
 
     ```
-    user@capsule:/home/workspace$ cat /home/user/.config/gh/hosts.yml
-    github.com:
-        users:
-            myuser:
-                oauth_token: [GITHUB_API_TOKEN]
-        oauth_token: [GITHUB_API_TOKEN]
-        user: myuser
+    user@capsule:/home/workspace$ test -w "$HOME" && echo 'home is writable'
+    home is writable
     ```
 
     The Docker daemon created a `casual-capsule_home` Docker volume when it
@@ -201,13 +198,13 @@ easier.
     is persistent and shared between Capsule instances. Use `-p` or
     `--private-home` to bind-mount `~/.capsule-home` instead.
 
-    The `/home/user/.config/gh/hosts.yml` file should contain your GitHub API
-    token.
-
-    **Checkpoint:** the persistent home volume contains the expected GitHub
-    auth configuration.
+    **Checkpoint:** the persistent home volume is writable. If you supplied a
+    token, the next phase verifies its authentication without printing it.
 
 ### Phase 4: Verify GitHub auth
+
+Skip this phase if you do not need GitHub authentication. An absent token does
+not clear credentials already stored in the persistent home.
 
 1.  Check that you are logged in to GitHub.
 
@@ -408,15 +405,20 @@ capsule --runtime docker           # keep using docker compose
 CAPSULE_RUNTIME=podman capsule     # the same choice, from the environment
 ```
 
+`auto` prefers usable rootless podman and otherwise falls back to Docker,
+naming the reason. Explicit `podman` selection fails instead of falling back:
+it never silently exchanges the private engine for host-daemon access.
+
 #### What the podman backend needs
 
 *   **Rootless podman**, which is how it runs by default. Capsule refuses a
     rootful podman rather than run your Capsule as real root.
 
-*   **A sub-id range** for your account, from the `uidmap` package. podman
-    reports it as a second entry in its id map; without one it cannot even
-    unpack an image that chowns a file. Capsule reads the same report and
-    falls back to the Docker backend, naming the reason.
+*   **At least 65536 subordinate UIDs and GIDs** for your account, with the
+    `uidmap` package installed. Capsule checks the total capacity of both
+    mappings reported by podman, including split ranges. Smaller allocations
+    cannot support the image's nested engine. After editing `/etc/subuid` or
+    `/etc/subgid`, run `podman system migrate` to refresh existing mappings.
 
 *   **A reachable systemd user bus** on Linux, because rootless podman asks
     your own `systemd --user` manager to create a cgroup scope for every
@@ -610,12 +612,18 @@ two; the router says so if it is missing.
 *   **The inner engine's storage is per workspace.** Images, volumes and
     containers live in a volume keyed to the workspace path and mounted at
     `/var/lib/capsule/inner`, so two projects never share an image cache or
-    see each other's containers. `CAPSULE_INNER_VOLUME` overrides the name.
+    see each other's containers. This applies to both podman (`containers/`)
+    and the optional dockerd (`docker/`). `CAPSULE_INNER_VOLUME` overrides the
+    volume name. Existing dockerd data under `~/.local/share/docker` is left
+    untouched, but is no longer used automatically.
 
 *   **The host's Docker daemon is out of reach unless you ask for it.**
     `--host-docker` binds the host socket into the Capsule for the cases
     where you deliberately want it; without the flag the Capsule only has
-    its own engine.
+    its own engine. On Linux this requires crun. Capsule uses
+    `--group-add keep-groups` to preserve supplementary socket group access.
+    If a requested host socket does not answer, commands fail instead of
+    silently starting a private engine.
 
 *   **Publishing a port takes two hops.** The project publishes to the
     Capsule, and `capsule --publish` publishes the Capsule to the host, so
@@ -627,7 +635,8 @@ two; the router says so if it is missing.
     own account already has: the Capsule still cannot exceed you on the host.
 
 *   **`--remote` and custom compose files need a Docker daemon**, so those
-    invocations use the Docker backend and say so.
+    invocations use the Docker backend under `auto` and say so. Explicit
+    `--runtime podman` rejects them.
 
 ### Listing running Capsules
 
@@ -773,9 +782,9 @@ still build and start in one invocation.
 
 ### Updating your GitHub token
 
-The entrypoint reads the `GITHUB_API_TOKEN` secret on every container
-start and calls `gh auth login --with-token` automatically.  To rotate
-your token:
+When `GITHUB_API_TOKEN` is nonempty, Capsule supplies it as a secret and the
+entrypoint calls `gh auth login --with-token` on every container start. To
+rotate your token:
 
 1. Export the new token in your shell:
 
@@ -791,6 +800,20 @@ your token:
 
 The updated credentials are written to the persistent home volume and
 survive subsequent restarts.  No rebuild is required.
+
+Leaving the variable unset or empty skips secret wiring and automatic login;
+it does not log out existing sessions. Builds and tests do not require it.
+
+The Capsule CLI adds `compose.github-token.yml` automatically when a token is
+supplied. When invoking Compose directly, opt into the same secret wiring:
+
+```bash
+docker compose -f compose.yml -f compose.github-token.yml build cli
+docker compose -f compose.yml -f compose.github-token.yml run --rm cli
+```
+
+Without that override, `docker compose build` and `docker compose run --rm cli`
+work without a token.
 
 ### Port publishing
 
@@ -901,7 +924,7 @@ Run options:
 
 *   `--runtime podman|docker|auto`: Choose the backend that runs the Capsule.
     `auto`, the default, prefers podman and falls back to Docker with the
-    reason named.
+    reason named. Explicit `podman` fails if unavailable or incompatible.
 
 *   `--host-docker`: Bind the host's Docker socket into the Capsule. Only
     meaningful on the podman backend, which is otherwise isolated from it.
@@ -1069,7 +1092,8 @@ empty value, `0`, `false`, `no`, or `off`.
     remote workspace path.
 
 *   `GITHUB_API_TOKEN`: Passed as a build secret for `gh` auth and for `mise`
-    tool downloads from GitHub.
+    tool downloads from GitHub, and as a runtime secret for automatic `gh`
+    login. Optional; unset or empty means no secret is supplied.
 
 ## 🧪 Run checks and tests
 
@@ -1124,6 +1148,7 @@ runner clears inherited `CAPSULE_RUNTIME` so each suite chooses its backend.
 
 *   The end-to-end suite builds and runs the real capsule image when Docker and
     Compose are available. It skips cleanly when the daemon is unavailable.
+    No GitHub token is required; a supplied token is used normally.
 
     The end-to-end suite also prints the path to a per-run logfile under
     `_build/tests/`. The logfile is kept after the run and records suite events

@@ -12,6 +12,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
+# shellcheck disable=SC1091
+source "$ROOT_DIR/lib/capsule/podman.sh"
 SCRIPT_PATH="$ROOT_DIR/capsule.sh"
 EXAMPLE_PROJECT_DIR="$ROOT_DIR/tests/fixtures/example-project"
 CUSTOM_CAPSULE_DIR="$ROOT_DIR/tests/fixtures/custom-capsule"
@@ -128,19 +130,10 @@ require_docker_prereqs() {
   return 0
 }
 
-# Return success when Capsule's required GitHub secret is available.
-require_github_token() {
-  if [[ -z "${GITHUB_API_TOKEN:-}" ]]; then
-    skip "$1 requires GITHUB_API_TOKEN"
-    return 1
-  fi
-
-  return 0
-}
-
 # Return success when this host can run the Capsule under rootless podman.
 require_podman_prereqs() {
   local info=""
+  local reason=""
 
   if ! command -v podman >/dev/null 2>&1; then
     skip "$1 requires podman"
@@ -148,23 +141,12 @@ require_podman_prereqs() {
   fi
 
   log_message "Checking rootless podman and its id mappings"
-  info="$(podman info \
-    --format '{{.Host.Security.Rootless}} {{len .Host.IDMappings.UIDMap}}' \
-    2>/dev/null || true)"
-
-  case "$info" in
-    'true 1')
-      skip "$1 requires a sub-id range for this user (uidmap)"
-      return 1
-      ;;
-    'true '*)
-      return 0
-      ;;
-    *)
-      skip "$1 requires a usable rootless podman"
-      return 1
-      ;;
-  esac
+  info="$(podman_info_summary || true)"
+  reason="$(podman_host_reason "$info")"
+  if [[ -n "$reason" ]]; then
+    skip "$1: $reason"
+    return 1
+  fi
 }
 
 # Verify that the podman backend runs the example project, that the Capsule
@@ -180,9 +162,6 @@ test_podman_backend_end_to_end() {
   log_message "Starting test_podman_backend_end_to_end"
 
   if ! require_podman_prereqs "podman e2e"; then
-    return
-  fi
-  if ! require_github_token "podman e2e"; then
     return
   fi
 
@@ -233,9 +212,6 @@ test_example_project_end_to_end() {
   if ! require_docker_prereqs "example project e2e"; then
     return
   fi
-  if ! require_github_token "example project e2e"; then
-    return
-  fi
 
   printf '%s\n' "$EXAMPLE_PROJECT_DIR" >"$config_file"
   printf '%s\n' "$token" >"$token_file"
@@ -269,9 +245,6 @@ test_custom_compose_end_to_end() {
   if ! require_docker_prereqs "custom compose e2e"; then
     return
   fi
-  if ! require_github_token "custom compose e2e"; then
-    return
-  fi
 
   printf '%s\n' "$EXAMPLE_PROJECT_DIR" >"$config_file"
   # shellcheck disable=SC2016
@@ -284,7 +257,7 @@ test_custom_compose_end_to_end() {
   if run_logged bash -c '
     unset CAPSULE_WORKDIR
     cd "$1" &&
-      CAPSULE_CONFIG="$2" CAPSULE_CUSTOM_COMPOSE="$3" \
+      CAPSULE_CONFIG="$2" CAPSULE_CUSTOM_COMPOSE="$3" CAPSULE_RUNTIME=docker \
       "$4" --build bash -lc "$5"
   ' bash "$EXAMPLE_PROJECT_DIR" "$config_file" "$custom_compose" \
     "$SCRIPT_PATH" "$check_cmd"; then
@@ -308,9 +281,6 @@ test_custom_compose_build_custom_end_to_end() {
   if ! require_docker_prereqs "custom compose build-custom e2e"; then
     return
   fi
-  if ! require_github_token "custom compose build-custom e2e"; then
-    return
-  fi
 
   printf '%s\n' "$EXAMPLE_PROJECT_DIR" >"$config_file"
   # shellcheck disable=SC2016
@@ -323,7 +293,7 @@ test_custom_compose_build_custom_end_to_end() {
   if run_logged bash -c '
     unset CAPSULE_WORKDIR
     cd "$1" &&
-      CAPSULE_CONFIG="$2" CAPSULE_CUSTOM_COMPOSE="$3" \
+      CAPSULE_CONFIG="$2" CAPSULE_CUSTOM_COMPOSE="$3" CAPSULE_RUNTIME=docker \
       "$4" --build-custom bash -lc "$5"
   ' bash "$EXAMPLE_PROJECT_DIR" "$config_file" "$custom_compose" \
     "$SCRIPT_PATH" "$check_cmd"; then

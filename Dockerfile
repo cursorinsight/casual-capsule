@@ -102,9 +102,11 @@ ARG MISE_SYSTEM_TOOLS="antigravity-cli bat codex claude eza fd \
 # file form is what podman's build understands, and BuildKit serves it the
 # same way, so one Dockerfile builds on either backend and the token still
 # reaches no layer.
-RUN --mount=type=secret,id=github_api_token,required=true \
-    GITHUB_API_TOKEN="$(cat /run/secrets/github_api_token)" && \
-    export GITHUB_API_TOKEN && \
+RUN --mount=type=secret,id=github_api_token \
+    if [ -s /run/secrets/github_api_token ]; then \
+      GITHUB_API_TOKEN="$(cat /run/secrets/github_api_token)" && \
+      export GITHUB_API_TOKEN; \
+    fi && \
     mise install --system ${MISE_SYSTEM_TOOLS} && \
     mise use --path /etc/mise/config.toml --pin ${MISE_SYSTEM_TOOLS}
 

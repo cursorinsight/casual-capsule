@@ -14,6 +14,9 @@
 
 set -euo pipefail
 
+# shellcheck disable=SC1091
+source "$(dirname -- "${BASH_SOURCE[0]}")/../../lib/capsule/podman.sh"
+
 PASS_COUNT=0
 WARN_COUNT=0
 FAIL_COUNT=0
@@ -96,34 +99,25 @@ check_docker() {
 # Check that podman is rootless and has a sub-id range to map into.
 check_podman_engine() {
   local info=""
-  local rootless=""
-  local id_ranges=""
+  local reason=""
 
-  info="$(podman info --format \
-    '{{.Host.Security.Rootless}} {{len .Host.IDMappings.UIDMap}}' \
-    2>/dev/null || true)"
+  info="$(podman_info_summary || true)"
+  reason="$(podman_host_reason "$info")"
 
-  if [[ -z "$info" ]]; then
-    fail 'podman cannot reach a working engine' \
-      'run "podman info" and fix what it reports'
-    return 1
-  fi
-
-  read -r rootless id_ranges <<<"$info"
-
-  if [[ "$rootless" != "true" ]]; then
-    fail 'podman is running rootful' \
-      'Capsule wants rootless podman; do not run it as root'
+  if [[ -n "$reason" ]]; then
+    case "$reason" in
+      *subordinate*)
+        fail "$reason" \
+          'check /etc/subuid and /etc/subgid; run: podman system migrate'
+        ;;
+      *)
+        fail "$reason" 'run "podman info" as non-root and fix what it reports'
+        ;;
+    esac
     return 1
   fi
   pass 'podman is rootless'
-
-  if [[ ! "$id_ranges" =~ ^[0-9]+$ ]] || [[ "$id_ranges" -le 1 ]]; then
-    fail 'this account has no sub-id range' \
-      'install the uidmap package, then run: podman system migrate'
-    return 1
-  fi
-  pass 'this account has a sub-id range'
+  pass 'this account has at least 65536 subordinate UIDs and GIDs'
 }
 
 # Name why the session bus is unusable, so the remedy fits the cause. A
@@ -293,8 +287,7 @@ check_tooling() {
   if [[ -n "${GITHUB_API_TOKEN:-}" ]]; then
     pass 'GITHUB_API_TOKEN is set'
   else
-    warn 'GITHUB_API_TOKEN is not set' \
-      'image builds and the end-to-end tests need it'
+    pass 'GITHUB_API_TOKEN is optional; no token supplied'
   fi
 }
 

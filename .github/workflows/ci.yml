@@ -100,9 +100,13 @@ jobs:
             sudo usermod --add-subgids 100000-165535 "$runner_user"
           fi
           podman system migrate
-          podman info --format \
-            '{{.Host.Security.Rootless}} {{len .Host.IDMappings.UIDMap}}' \
-            | grep -Eq '^true ([2-9]|[1-9][0-9]+)$'
+          source lib/capsule/podman.sh
+          info="$(podman_info_summary)"
+          reason="$(podman_host_reason "$info")"
+          if [[ -n "$reason" ]]; then
+            printf '%s\n' "$reason" >&2
+            exit 1
+          fi
 
       - name: Run tests inside Capsule
         run: |
@@ -133,7 +137,5 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Build image via Docker Compose
-        env:
-          GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build image via Docker Compose without a token
         run: docker compose -f compose.yml build cli

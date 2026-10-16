@@ -19,6 +19,7 @@ CHECK_ALL_PATH="$ROOT_DIR/tests/check_all.sh"
 DOCTOR_PATH="$ROOT_DIR/libexec/capsule/doctor"
 CI_PATH="$ROOT_DIR/.github/workflows/ci.yml"
 COMPOSE_PATH="$ROOT_DIR/compose.yml"
+TOKEN_COMPOSE_PATH="$ROOT_DIR/compose.github-token.yml"
 DOCKERFILE_PATH="$ROOT_DIR/Dockerfile"
 README_PATH="$ROOT_DIR/README.md"
 ENTRYPOINT_PATH="$ROOT_DIR/docker/entrypoint.sh"
@@ -46,6 +47,8 @@ unset CAPSULE_WORKDIR
 unset DOCKER_GID
 unset DOCKER_CONTEXT
 unset DOCKER_HOST
+unset GITHUB_API_TOKEN
+unset CAPSULE_REQUIRE_HOST_DOCKER
 
 TEST_TMPDIR="$(mktemp -d)"
 # Resolve symlinks so paths match what capsule.sh produces via pwd -P.
@@ -235,7 +238,9 @@ if [[ "${1:-}" == "info" ]]; then
   if [[ -n "${MOCK_PODMAN_INFO_FAIL:-}" ]]; then
     exit 1
   fi
-  printf '%s\n' "${MOCK_PODMAN_INFO:-true 2}"
+  printf '%s\n' "${MOCK_PODMAN_INFO:-true ${MOCK_PODMAN_RUNTIME:-crun}}"
+  printf 'uid %s\ngid %s\n' \
+    "${MOCK_PODMAN_UID_COUNT:-65537}" "${MOCK_PODMAN_GID_COUNT:-65537}"
   exit 0
 fi
 
@@ -466,12 +471,16 @@ test_compose_contract() {
   assert_file_contains "$COMPOSE_PATH" \
     'CAPSULE_HOST_WORKDIR=${CAPSULE_HOST_WORKDIR:-}' \
     "compose passes host workdir to nested capsule"
-  assert_file_contains "$COMPOSE_PATH" \
+  assert_file_contains "$TOKEN_COMPOSE_PATH" \
     'environment: GITHUB_API_TOKEN' \
     "compose sources github token from GITHUB_API_TOKEN env"
-  assert_file_contains "$COMPOSE_PATH" \
+  assert_file_contains "$TOKEN_COMPOSE_PATH" \
     '- github_api_token' \
     "compose mounts github token as a runtime secret"
+  assert_file_not_contains "$COMPOSE_PATH" 'github_api_token' \
+    "base compose runs without a GitHub token"
+  assert_file_contains "$COMPOSE_PATH" 'CAPSULE_REQUIRE_HOST_DOCKER=1' \
+    "Docker backend requires the mounted host socket"
   assert_file_contains "$COMPOSE_PATH" \
     '- MISE_SYSTEM_TOOLS' \
     "compose passes MISE_SYSTEM_TOOLS from the build environment"
@@ -1068,7 +1077,7 @@ make_doctor_bin() {
   local tool=""
 
   mkdir -p "$dir"
-  for tool in bash id uname grep; do
+  for tool in bash dirname id uname grep awk; do
     ln -sf "$(command -v "$tool")" "$dir/$tool"
   done
 
@@ -1080,8 +1089,11 @@ EOF
   cat >"$dir/podman" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
+  *Rootless*)
+    printf 'true runc\nuid %s\ngid %s\n' \
+      "${MOCK_PODMAN_UID_COUNT:-65537}" "${MOCK_PODMAN_GID_COUNT:-65537}"
+    ;;
   *OCIRuntime.Name*) printf 'runc\n' ;;
-  *Rootless*) printf 'true 2\n' ;;
 esac
 exit 0
 EOF
@@ -1228,7 +1240,7 @@ test_ci_runs_nested_capsules_for_each_backend() {
     'CAPSULE_E2E_STRICT=1 tests/test_all.sh' \
     "nested CI rejects skipped backend prerequisites"
   assert_file_contains "$CI_PATH" \
-    "grep -Eq '^true ([2-9]|[1-9][0-9]+)$'" \
+    'reason="$(podman_host_reason "$info")"' \
     "Podman CI requires rootless subordinate ID mappings"
   assert_file_contains "$CI_PATH" \
     'capsule_args+=(--host-docker)' \
@@ -2666,11 +2678,24 @@ test_podman_host_docker_is_opt_in() {
     '/var/lib/capsule/docker.sock' \
     "the Capsule is isolated from the host daemon by default"
 
+  CAPSULE_RUNTIME=podman CAPSULE_REQUIRE_HOST_DOCKER=1 \
+    DOCKER_HOST="unix://$socket_path" \
+    run_capsule "$CASE_BIN" "$CASE_DIR/nested" true
+  assert_podman_args_lack "$CASE_DIR/nested" '/var/lib/capsule/docker.sock' \
+    "an outer Capsule's socket requirement does not expose it to children"
+  assert_podman_args_lack "$CASE_DIR/nested" 'CAPSULE_REQUIRE_HOST_DOCKER' \
+    "an isolated child does not inherit the outer socket requirement"
+
   CAPSULE_RUNTIME=podman DOCKER_HOST="unix://$socket_path" \
     run_capsule "$CASE_BIN" "$CASE_DIR/with" --host-docker true
   assert_podman_args_contain "$CASE_DIR/with" \
     "${socket_path}:/var/lib/capsule/docker.sock" \
     "--host-docker binds the host daemon socket deliberately"
+  assert_podman_args_contain "$CASE_DIR/with" '--group-add keep-groups' \
+    "--host-docker preserves supplementary socket groups"
+  assert_podman_args_contain "$CASE_DIR/with" \
+    '--env CAPSULE_REQUIRE_HOST_DOCKER=1' \
+    "--host-docker requires the selected socket inside the Capsule"
 
   CAPSULE_RUNTIME=podman CAPSULE_HOST_DOCKER=1 \
     DOCKER_HOST="unix://$socket_path" \
@@ -2734,7 +2759,7 @@ test_podman_backend_requires_built_image() {
 test_podman_falls_back_when_rootful() {
   setup_mock_case podman-rootful
 
-  CAPSULE_RUNTIME=podman MOCK_PODMAN_INFO="false 2" \
+  CAPSULE_RUNTIME=auto MOCK_PODMAN_INFO="false crun" \
     run_capsule "$CASE_BIN" "$CASE_LOG" true 2>"$CASE_ERR"
 
   assert_file_contains "$CASE_ERR" \
@@ -2745,21 +2770,150 @@ test_podman_falls_back_when_rootful() {
     "the fallback actually runs the Docker backend"
 }
 
+test_explicit_podman_does_not_fall_back() {
+  local selection=""
+  setup_mock_case podman-explicit-failure
+
+  for selection in env flag; do
+    : >"$CASE_LOG"
+    if [[ "$selection" == "env" ]]; then
+      if CAPSULE_RUNTIME=podman MOCK_PODMAN_INFO_FAIL=1 \
+        run_capsule "$CASE_BIN" "$CASE_LOG" true 2>"$CASE_ERR"; then
+        fail "explicit Podman environment refuses fallback"
+      else
+        pass "explicit Podman environment refuses fallback"
+      fi
+    elif CAPSULE_RUNTIME=auto MOCK_PODMAN_INFO_FAIL=1 \
+      run_capsule "$CASE_BIN" "$CASE_LOG" --runtime podman true \
+      2>"$CASE_ERR"; then
+      fail "explicit Podman flag refuses fallback"
+    else
+      pass "explicit Podman flag refuses fallback"
+    fi
+    assert_file_contains "$CASE_ERR" 'cannot use podman' \
+      "explicit $selection selection explains why Podman cannot run"
+    assert_file_not_contains "$CASE_LOG" 'compose' \
+      "explicit $selection selection never exposes host Docker"
+  done
+}
+
+test_podman_checks_uid_and_gid_capacity() {
+  local count=""
+  setup_mock_case podman-id-capacity
+
+  for count in 1 32769 65536; do
+    : >"$CASE_LOG"
+    CAPSULE_RUNTIME=auto MOCK_PODMAN_GID_COUNT="$count" \
+      run_capsule "$CASE_BIN" "$CASE_LOG" true 2>"$CASE_ERR"
+    assert_file_contains "$CASE_ERR" 'insufficient subordinate GIDs' \
+      "Podman rejects a GID allocation of $count total IDs"
+    assert_file_contains "$CASE_LOG" 'compose' \
+      "auto uses Docker when GID capacity is $count"
+  done
+
+  if CAPSULE_RUNTIME=podman MOCK_PODMAN_UID_COUNT=65536 \
+    run_capsule "$CASE_BIN" "$CASE_LOG" true 2>"$CASE_ERR"; then
+    fail "explicit Podman rejects an undersized UID allocation"
+  else
+    pass "explicit Podman rejects an undersized UID allocation"
+  fi
+  assert_file_contains "$CASE_ERR" 'insufficient subordinate UIDs' \
+    "the UID allocation error names the missing capacity"
+
+  CAPSULE_RUNTIME=podman \
+    MOCK_PODMAN_UID_COUNT=$'1\nuid 32768\nuid 32768' \
+    MOCK_PODMAN_GID_COUNT=$'1\ngid 32768\ngid 32768' \
+    run_capsule "$CASE_BIN" "$CASE_DIR/fragmented" true
+  assert_podman_args_contain "$CASE_DIR/fragmented" 'run --rm' \
+    "Podman accepts sufficient capacity across multiple ID ranges"
+}
+
+test_doctor_checks_gid_capacity() {
+  local tdir="$TEST_TMPDIR/doctor-gids"
+  mkdir -p "$tdir"
+  make_doctor_bin "$tdir/bin"
+
+  if MOCK_PODMAN_GID_COUNT=1 PATH="$tdir/bin" \
+    "$DOCTOR_PATH" >"$tdir/out" 2>&1; then
+    fail "doctor rejects missing subordinate GIDs"
+  else
+    pass "doctor rejects missing subordinate GIDs"
+  fi
+  assert_file_contains "$tdir/out" 'insufficient subordinate GIDs' \
+    "doctor diagnoses a GID-only mapping failure"
+}
+
+test_github_token_is_optional() {
+  local compose_file=""
+  setup_mock_case optional-github-token
+  compose_file="$CASE_DIR/custom.yml"
+  printf 'services:\n  cli:\n    image: custom:latest\n' >"$compose_file"
+
+  GITHUB_API_TOKEN='' CAPSULE_RUNTIME=docker \
+    run_capsule "$CASE_BIN" "$CASE_LOG" --build true
+  assert_file_not_contains "$CASE_LOG" 'compose.github-token.yml' \
+    "Docker builds and runs without a token override"
+
+  GITHUB_API_TOKEN=token-value CAPSULE_RUNTIME=docker \
+    run_capsule "$CASE_BIN" "$CASE_DIR/docker-token" --build true
+  assert_file_contains "$CASE_DIR/docker-token" \
+    "-f $TOKEN_COMPOSE_PATH" \
+    "Docker adds the token secret override when supplied"
+  assert_file_not_contains "$CASE_DIR/docker-token" 'token-value' \
+    "Docker keeps the token off its command line"
+
+  GITHUB_API_TOKEN=token-value CAPSULE_RUNTIME=docker \
+    CAPSULE_CUSTOM_COMPOSE="$compose_file" \
+    run_capsule "$CASE_BIN" "$CASE_DIR/custom-token" --build true
+  assert_file_contains "$CASE_DIR/custom-token" \
+    "-f $TOKEN_COMPOSE_PATH -f $compose_file" \
+    "custom Compose builds and runs retain the supplied token override"
+
+  GITHUB_API_TOKEN='' CAPSULE_RUNTIME=podman \
+    run_capsule "$CASE_BIN" "$CASE_DIR/podman" --build true
+  assert_podman_args_lack "$CASE_DIR/podman" '--secret' \
+    "Podman builds without a GitHub secret"
+  assert_podman_args_lack "$CASE_DIR/podman" '/run/secrets/github_api_token' \
+    "Podman runs without a GitHub secret mount"
+
+  make_doctor_bin "$CASE_DIR/doctor-bin"
+  GITHUB_API_TOKEN='' PATH="$CASE_DIR/doctor-bin" \
+    "$DOCTOR_PATH" >"$CASE_DIR/doctor" 2>&1 || true
+  assert_file_contains "$CASE_DIR/doctor" 'GITHUB_API_TOKEN is optional' \
+    "doctor explains tokenless operation"
+}
+
+test_host_docker_requires_group_support() {
+  setup_mock_case podman-hostdocker-groups
+  : >"$CASE_DIR/docker.sock"
+
+  if CAPSULE_RUNTIME=podman MOCK_PODMAN_RUNTIME=runc \
+    DOCKER_HOST="unix://$CASE_DIR/docker.sock" \
+    run_capsule "$CASE_BIN" "$CASE_LOG" --host-docker true \
+    2>"$CASE_ERR"; then
+    fail "host Docker refuses a runtime that cannot preserve groups"
+  else
+    pass "host Docker refuses a runtime that cannot preserve groups"
+  fi
+  assert_file_contains "$CASE_ERR" '--host-docker requires crun' \
+    "host Docker explains how to retain socket group access"
+}
+
 test_podman_falls_back_without_a_subid_range() {
   setup_mock_case podman-nosubid
 
-  CAPSULE_RUNTIME=podman MOCK_PODMAN_INFO="true 1" \
+  CAPSULE_RUNTIME=auto MOCK_PODMAN_UID_COUNT=1 \
     run_capsule "$CASE_BIN" "$CASE_LOG" true 2>"$CASE_ERR"
 
   assert_file_contains "$CASE_ERR" \
-    'no sub-id range' \
+    'insufficient subordinate UIDs' \
     "a user with no sub-id range falls back and names the package"
 }
 
 test_podman_falls_back_when_engine_unreachable() {
   setup_mock_case podman-unreachable
 
-  CAPSULE_RUNTIME=podman MOCK_PODMAN_INFO_FAIL=1 \
+  CAPSULE_RUNTIME=auto MOCK_PODMAN_INFO_FAIL=1 \
     run_capsule "$CASE_BIN" "$CASE_LOG" true 2>"$CASE_ERR"
 
   assert_file_contains "$CASE_ERR" \
@@ -2774,14 +2928,14 @@ test_podman_falls_back_for_remote_and_custom_compose() {
   printf 'services:\n  cli:\n    image: custom:latest\n' >"$compose_file"
 
   CAPSULE_EXTRA_APPROVALS='ssh://remote-host/srv/project' \
-    CAPSULE_RUNTIME=podman MOCK_SSH_OUTPUT=1234 \
+    CAPSULE_RUNTIME=auto MOCK_SSH_OUTPUT=1234 \
     run_capsule "$CASE_BIN" "$CASE_LOG" \
     --remote remote-host:/srv/project true 2>"$CASE_ERR"
   assert_file_contains "$CASE_ERR" \
     '--remote needs a Docker daemon' \
     "--remote falls back to Docker with the reason named"
 
-  CAPSULE_RUNTIME=podman CAPSULE_CUSTOM_COMPOSE="$compose_file" \
+  CAPSULE_RUNTIME=auto CAPSULE_CUSTOM_COMPOSE="$compose_file" \
     run_capsule "$CASE_BIN" "$CASE_LOG" true 2>"$CASE_ERR"
   assert_file_contains "$CASE_ERR" \
     'custom compose file needs the Docker backend' \
@@ -2792,7 +2946,7 @@ test_podman_on_macos_requires_workspace_under_home() {
   setup_mock_case podman-macos
   mkdir -p "$CASE_DIR/home" "$CASE_DIR/elsewhere"
 
-  CAPSULE_RUNTIME=podman MOCK_UNAME=Darwin HOME="$CASE_DIR/home" \
+  CAPSULE_RUNTIME=auto MOCK_UNAME=Darwin HOME="$CASE_DIR/home" \
     CAPSULE_WORKDIR="$CASE_DIR/elsewhere" \
     run_capsule "$CASE_BIN" "$CASE_LOG" true 2>"$CASE_ERR"
 
@@ -2920,6 +3074,7 @@ set -euo pipefail
 socket="${DOCKER_HOST#unix://}"
 if [[ "${1:-}" == "version" ]]; then
   [[ -e "$socket" ]] || exit 1
+  [[ "$socket" != "${ROUTER_BROKEN_SOCKET:-}" ]] || exit 1
   exit 0
 fi
 printf 'ROUTED=%s ARGS=%s\n' "$socket" "$*" >>"${ROUTER_LOG:?}"
@@ -2934,6 +3089,7 @@ for arg in "$@"; do
     --host=unix://*) : >"${arg#--host=unix://}" ;;
   esac
 done
+printf 'DOCKERD_ARGS=%s\n' "$*" >>"${ROUTER_LOG:?}"
 sleep 5
 EOF
     chmod +x "$dir/bin/dockerd-rootless.sh"
@@ -2950,6 +3106,7 @@ run_router() {
 
   if [[ "$invoked_as" == "docker" ]]; then
     PATH="$dir/bin" CAPSULE_ENGINE_DIR="$dir/state" \
+      CAPSULE_INNER_DIR="$dir/inner" \
       CAPSULE_REAL_DOCKER="$dir/real/docker" \
       CAPSULE_HOST_SOCKET="$dir/hostsock" \
       ROUTER_LOG="$dir/routed" \
@@ -2958,6 +3115,7 @@ run_router() {
   fi
 
   PATH="$dir/bin" CAPSULE_ENGINE_DIR="$dir/state" \
+    CAPSULE_INNER_DIR="$dir/inner" \
     CAPSULE_REAL_DOCKER="$dir/real/docker" \
     CAPSULE_HOST_SOCKET="$dir/hostsock" \
     ROUTER_LOG="$dir/routed" \
@@ -3027,6 +3185,12 @@ test_router_switch_to_dockerd_sticks() {
   assert_file_contains "$dir/switch" \
     'engine: dockerd' \
     "use-dockerd reports the engine it switched to"
+  assert_file_contains "$dir/routed" "--data-root=$dir/inner/docker" \
+    "dockerd stores persistent state in the workspace engine volume"
+  assert_file_contains "$dir/routed" "--exec-root=$dir/state/docker-exec" \
+    "dockerd keeps execution state private to this Capsule"
+  assert_file_contains "$dir/routed" "--pidfile=$dir/state/docker.pid" \
+    "dockerd keeps its PID file private to this Capsule"
 
   run_router "$dir" docker ps >/dev/null 2>&1 || true
   assert_file_contains "$dir/routed" \
@@ -3088,6 +3252,34 @@ test_router_ignores_a_dead_host_socket() {
   assert_file_contains "$dir/routed" \
     "ROUTED=$dir/state/podman.sock" \
     "an absent host socket falls through to the Capsule's own engine"
+
+  stop_router_env "$dir"
+}
+
+test_router_requires_requested_host_socket() {
+  local state=""
+  local dir="$TEST_TMPDIR/router-required-host"
+  make_router_env "$dir"
+
+  for state in missing inaccessible; do
+    if [[ "$state" == "inaccessible" ]]; then
+      : >"$dir/hostsock"
+    fi
+    if CAPSULE_REQUIRE_HOST_DOCKER=1 ROUTER_BROKEN_SOCKET="$dir/hostsock" \
+      run_router "$dir" docker ps >"$dir/out" 2>&1; then
+      fail "a requested $state host socket fails closed"
+    else
+      pass "a requested $state host socket fails closed"
+    fi
+    assert_file_contains "$dir/out" \
+      'requested host Docker socket is unavailable' \
+      "a requested $state host socket reports its failure"
+    if [[ -e "$dir/state/podman.sock" || -e "$dir/routed" ]]; then
+      fail "a requested $state host socket never starts an inner engine"
+    else
+      pass "a requested $state host socket never starts an inner engine"
+    fi
+  done
 
   stop_router_env "$dir"
 }
@@ -3179,8 +3371,10 @@ test_podman_image_contract() {
     'ARG CAPSULE_WITH_DOCKERD=0' \
     "Dockerfile keeps the real Engine behind a build arg"
   assert_file_contains "$DOCKERFILE_PATH" \
-    'type=secret,id=github_api_token,required=true' \
+    'type=secret,id=github_api_token' \
     "Dockerfile mounts the build token as a secret file"
+  assert_file_not_contains "$DOCKERFILE_PATH" 'required=true' \
+    "Dockerfile accepts a missing GitHub token secret"
   assert_file_not_contains "$DOCKERFILE_PATH" \
     'id=github_api_token,env=GITHUB_API_TOKEN' \
     "Dockerfile does not replace the token file with an environment mount"
@@ -3247,6 +3441,8 @@ main() {
   test_check_all_reports_skip_reasons
   test_doctor_reports_each_backend_and_probes_by_running
   test_doctor_names_a_stale_session_bus
+  test_doctor_checks_gid_capacity
+  test_github_token_is_optional
   test_ci_runs_nested_capsules_for_each_backend
   test_build_custom_flag_keeps_runtime_flags
   test_build_flag_without_runtime_args
@@ -3303,9 +3499,12 @@ main() {
   test_podman_backend_mounts_the_token_secret
   test_podman_host_docker_is_opt_in
   test_podman_host_docker_without_a_socket_is_an_error
+  test_host_docker_requires_group_support
   test_podman_build_uses_docker_format_and_a_secret
   test_podman_backend_requires_built_image
   test_podman_falls_back_when_rootful
+  test_explicit_podman_does_not_fall_back
+  test_podman_checks_uid_and_gid_capacity
   test_podman_falls_back_without_a_subid_range
   test_podman_falls_back_when_engine_unreachable
   test_podman_falls_back_for_remote_and_custom_compose
@@ -3319,6 +3518,7 @@ main() {
   test_router_reports_a_missing_dockerd
   test_router_prefers_a_bound_host_socket
   test_router_ignores_a_dead_host_socket
+  test_router_requires_requested_host_socket
   test_router_stop_releases_the_engines
   test_entrypoint_non_root_path_execs_the_command
   test_podman_image_contract

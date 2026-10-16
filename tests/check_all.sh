@@ -16,7 +16,7 @@ cd "$ROOT_DIR"
 shopt -s nullglob
 
 dclint_files=(
-  compose.y*ml
+  compose*.y*ml
   tests/fixtures/*/compose.y*ml
 )
 hadolint_files=(

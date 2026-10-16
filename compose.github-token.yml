@@ -1,0 +1,11 @@
+services:
+  cli:
+    build:
+      secrets:
+        - github_api_token
+    secrets:
+      - github_api_token
+
+secrets:
+  github_api_token:
+    environment: GITHUB_API_TOKEN

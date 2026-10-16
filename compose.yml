@@ -8,15 +8,12 @@ services:
         - CAPSULE_UID=${CAPSULE_UID:-1000}
         - CAPSULE_GID=${CAPSULE_GID:-100}
         - MISE_SYSTEM_TOOLS
-      secrets:
-        - github_api_token
     volumes:
       - ${CAPSULE_HOST_WORKDIR:-${CAPSULE_WORKDIR:-${PWD}}}:/home/workspace
       - /var/run/docker.sock:/var/lib/capsule/docker.sock
       - ${CAPSULE_HOME_MOUNT:-home:/home/user}
-    secrets:
-      - github_api_token
     environment:
+      - CAPSULE_REQUIRE_HOST_DOCKER=1
       - DOCKER_HOST=unix:///var/lib/capsule/docker.sock
       - DOCKER_GID=${DOCKER_GID:-999}
       - CAPSULE_UID=${CAPSULE_UID:-}
@@ -35,7 +32,3 @@ services:
 
 volumes:
   home:
-
-secrets:
-  github_api_token:
-    environment: GITHUB_API_TOKEN

@@ -72,14 +72,17 @@ Assisted-by: Copilot:claude-sonnet-4.6
   `ty`; wraps Codex for unrestricted use. `CAPSULE_WITH_DOCKERD=1` adds a
   real Docker Engine.
 - `compose.yml`: Local privileged `cli` service; mounts workspace, Docker
-  socket, and home volume; permits nested Podman tests; provides the build
-  and runtime `github_api_token` secret.
+  socket, and home volume; permits nested Podman tests.
+- `compose.github-token.yml`: Optional build and runtime GitHub token secret;
+  the CLI includes this override only when `GITHUB_API_TOKEN` is nonempty.
 - `Makefile`: Help, lint/check, and test entry points.
 - `bin/capsule`: User-facing command dispatcher. Omitting a subcommand keeps
   the legacy run behavior.
 - `capsule.sh`: Backward-compatible wrapper for `bin/capsule`.
 - `lib/capsule/common.sh`: Shared run, build, list, backend, and host-path
   logic.
+- `lib/capsule/podman.sh`: Shared rootless UID/GID capacity checks for the
+  launcher, doctor, E2E tests, and CI.
 - `libexec/capsule/`: Implementations of the `run`, `build`, `list`, `doctor`,
   and `completion` subcommands.
 - `docker/entrypoint.sh`: Root entrypoint; syncs UID/GID, Docker socket

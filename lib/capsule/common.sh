@@ -11,6 +11,8 @@ if [[ -z "${CAPSULE_ROOT:-}" ]]; then
   )"
   export CAPSULE_ROOT
 fi
+# shellcheck disable=SC1091
+source "$CAPSULE_ROOT/lib/capsule/podman.sh"
 SCRIPT_DIR="$CAPSULE_ROOT"
 readonly SCRIPT_DIR
 readonly CAPSULE_CONTAINER_WORKDIR="/home/workspace"
@@ -911,37 +913,7 @@ podman_vm_path_reason() {
 # call answers both questions that matter: whether it is rootless, and
 # whether this user has a sub-id range to map containers into.
 capture_podman_info() {
-  PODMAN_INFO_OUTPUT="$(
-    podman info --format \
-      '{{.Host.Security.Rootless}} {{len .Host.IDMappings.UIDMap}}' \
-      2>/dev/null
-  )" || PODMAN_INFO_OUTPUT=""
-}
-
-# Print the reason this host cannot run the Capsule under podman, if any.
-podman_host_reason() {
-  local rootless=""
-  local id_ranges=""
-
-  if [[ -z "$PODMAN_INFO_OUTPUT" ]]; then
-    printf '%s\n' 'podman cannot reach a working engine (try: podman info)'
-    return
-  fi
-
-  read -r rootless id_ranges <<<"$PODMAN_INFO_OUTPUT"
-
-  # A rootful podman would run the Capsule as real root and make keep-id
-  # meaningless, which is not the isolation this backend promises.
-  if [[ "$rootless" != "true" ]]; then
-    printf '%s\n' 'podman is running rootful; the Capsule wants rootless'
-    return
-  fi
-
-  # A single mapping means no sub-id range, and podman then cannot even
-  # unpack an image that chowns a file, let alone keep the caller's id.
-  if [[ ! "$id_ranges" =~ ^[0-9]+$ ]] || [[ "$id_ranges" -le 1 ]]; then
-    printf '%s\n' 'no sub-id range for this user (install uidmap)'
-  fi
+  PODMAN_INFO_OUTPUT="$(podman_info_summary)" || PODMAN_INFO_OUTPUT=""
 }
 
 # Print the reason this invocation needs the Docker backend, if any.
@@ -980,7 +952,7 @@ resolve_runtime_backend() {
 
   if [[ -z "$reason" ]]; then
     capture_podman_info
-    reason="$(podman_host_reason)"
+    reason="$(podman_host_reason "$PODMAN_INFO_OUTPUT")"
   fi
 
   if [[ -z "$reason" ]]; then
@@ -988,9 +960,12 @@ resolve_runtime_backend() {
     return
   fi
 
+  if [[ "$RUNTIME_SELECTION" == "podman" ]]; then
+    die "cannot use podman: ${reason}; choose --runtime auto or docker"
+  fi
   # A host with no podman installed is the ordinary case under "auto" and
   # stays quiet; every other fallback says why podman was not used.
-  if [[ "$RUNTIME_SELECTION" == "podman" ]] || [[ -z "$launcher_reason" ]]; then
+  if [[ -z "$launcher_reason" ]]; then
     warn "not using podman: ${reason}"
   fi
 
@@ -1175,7 +1150,17 @@ append_podman_host_docker() {
     die '--host-docker found no Docker socket on this host'
   fi
 
-  PODMAN_RUN_ARGS+=(--volume "${socket_path}:${CAPSULE_HOST_SOCKET}")
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    if [[ "${PODMAN_INFO_OUTPUT##* }" != "crun" ]]; then
+      die '--host-docker requires crun to preserve supplementary groups;' \
+        'set runtime = "crun" in containers.conf'
+    fi
+    PODMAN_RUN_ARGS+=(--group-add keep-groups)
+  fi
+  PODMAN_RUN_ARGS+=(
+    --volume "${socket_path}:${CAPSULE_HOST_SOCKET}"
+    --env CAPSULE_REQUIRE_HOST_DOCKER=1
+  )
 }
 
 # Assemble the "podman run" invocation for this run.
@@ -1264,14 +1249,13 @@ initialize_compose_commands() {
     docker compose
     -f "$SCRIPT_DIR/compose.yml"
   )
+  if [[ -n "${GITHUB_API_TOKEN:-}" ]]; then
+    BASE_COMPOSE_CMD+=(-f "$SCRIPT_DIR/compose.github-token.yml")
+  fi
 
   COMPOSE_CMD=("${BASE_COMPOSE_CMD[@]}")
   if [[ -n "$CAPSULE_CUSTOM_COMPOSE" ]]; then
-    COMPOSE_CMD=(
-      docker compose
-      -f "$SCRIPT_DIR/compose.yml"
-      -f "$CAPSULE_CUSTOM_COMPOSE"
-    )
+    COMPOSE_CMD+=(-f "$CAPSULE_CUSTOM_COMPOSE")
   fi
 }
 

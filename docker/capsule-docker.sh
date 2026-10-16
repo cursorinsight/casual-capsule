@@ -28,6 +28,7 @@ readonly PODMAN_SOCKET="${STATE_DIR}/podman.sock"
 readonly PODMAN_LOG="${STATE_DIR}/podman.log"
 readonly DOCKERD_SOCKET="${STATE_DIR}/dockerd.sock"
 readonly DOCKERD_LOG="${STATE_DIR}/dockerd.log"
+readonly DOCKERD_DATA_ROOT="${CAPSULE_INNER_DIR:-/var/lib/capsule/inner}/docker"
 readonly START_TIMEOUT=30
 
 # Print a message on stderr, where it cannot corrupt command output.
@@ -119,6 +120,8 @@ start_dockerd() {
   rm -f "$DOCKERD_SOCKET"
   XDG_RUNTIME_DIR="$STATE_DIR" \
     dockerd-rootless.sh --host="unix://${DOCKERD_SOCKET}" \
+    --data-root="$DOCKERD_DATA_ROOT" \
+    --exec-root="${STATE_DIR}/docker-exec" --pidfile="${STATE_DIR}/docker.pid" \
     >"$DOCKERD_LOG" 2>&1 &
 
   if ! wait_for_socket "$DOCKERD_SOCKET"; then
@@ -131,13 +134,16 @@ start_dockerd() {
 ensure_engine_socket() {
   local engine=""
 
-  # A bound host socket wins, but only when it answers: a stale mount
-  # should fall through to the Capsule's own engine, not fail every
-  # command.
   if socket_responds "$HOST_SOCKET"; then
     printf '%s\n' "$HOST_SOCKET"
     return
   fi
+
+  case "${CAPSULE_REQUIRE_HOST_DOCKER:-0}" in
+    1|true|yes|on)
+      die "requested host Docker socket is unavailable: $HOST_SOCKET"
+      ;;
+  esac
 
   engine="$(current_engine)"
   case "$engine" in
