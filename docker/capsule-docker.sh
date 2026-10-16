@@ -163,6 +163,8 @@ run_docker() {
   local socket_path=""
   local argument=""
   local skip_value=0
+  local config_value=0
+  local config_args=()
   local context=""
 
   if [[ -n "${DOCKER_CONTEXT:-}" ]] ||
@@ -173,6 +175,10 @@ run_docker() {
 
   for argument in "$@"; do
     if [[ "$skip_value" -eq 1 ]]; then
+      if [[ "$config_value" -eq 1 ]]; then
+        config_args=(--config "$argument")
+        config_value=0
+      fi
       skip_value=0
       continue
     fi
@@ -180,7 +186,14 @@ run_docker() {
       -H|--host|-H?*|--host=*|-c|--context|-c?*|--context=*)
         exec "$REAL_DOCKER" "$@"
         ;;
-      --config|-l|--log-level|--tlscacert|--tlscert|--tlskey)
+      --config)
+        config_value=1
+        skip_value=1
+        ;;
+      --config=*)
+        config_args=("$argument")
+        ;;
+      -l|--log-level|--tlscacert|--tlscert|--tlskey)
         skip_value=1
         ;;
       context|--help|--version)
@@ -192,8 +205,13 @@ run_docker() {
     esac
   done
 
+  if [[ "$skip_value" -eq 1 ]]; then
+    exec "$REAL_DOCKER" "$@"
+  fi
+
   if [[ -z "${DOCKER_HOST:-}" ]]; then
-    context="$("$REAL_DOCKER" context show)"
+    context="$("$REAL_DOCKER" \
+      ${config_args[@]+"${config_args[@]}"} context show)"
     if [[ "$context" != "default" ]]; then
       exec "$REAL_DOCKER" "$@"
     fi

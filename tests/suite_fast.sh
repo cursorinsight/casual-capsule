@@ -45,6 +45,7 @@ unset CAPSULE_UID
 unset CAPSULE_VOLUME
 unset CAPSULE_WORKDIR
 unset DOCKER_GID
+unset DOCKER_CONFIG
 unset DOCKER_CONTEXT
 unset DOCKER_HOST
 unset GITHUB_API_TOKEN
@@ -265,6 +266,15 @@ fi
 printf 'PODMAN_ARGS=%s\n' "$*" >>"${MOCK_LOG:?MOCK_LOG is required}"
 if [[ "${1:-}" == "run" && -n "${MOCK_PODMAN_STDIN_FILE:-}" ]]; then
   cat >"$MOCK_PODMAN_STDIN_FILE"
+fi
+if [[ "${1:-}" == "run" && -n "${MOCK_PODMAN_ENV_FILE:-}" ]]; then
+  while [[ "$#" -gt 0 ]]; do
+    if [[ "$1" == "--env" ]]; then
+      printf '%s\n' "$2" >>"$MOCK_PODMAN_ENV_FILE"
+      shift
+    fi
+    shift
+  done
 fi
 exit 0
 EOF
@@ -2606,9 +2616,8 @@ test_podman_backend_runs_container_with_keep_id() {
   assert_podman_args_contain "$CASE_LOG" \
     '--privileged --security-opt label=disable --device /dev/fuse' \
     "podman backend grants what a nested engine needs"
-  assert_podman_args_contain "$CASE_LOG" \
-    '--env CAPSULE_RUNTIME=podman' \
-    "podman backend tells the entrypoint which backend it is under"
+  assert_podman_args_lack "$CASE_LOG" 'CAPSULE_RUNTIME=' \
+    "podman backend leaves nested backend selection automatic"
   assert_podman_args_contain "$CASE_LOG" \
     '--env CAPSULE_UID=1000' \
     "podman backend records the host UID for Capsule queries"
@@ -3095,7 +3104,7 @@ make_router_env() {
   # otherwise make the missing-Engine case start that daemon and fail on
   # its timeout instead of on the diagnostic the case asserts. Link in
   # only the utilities the router and these mocks actually call.
-  for tool in bash basename cat chmod mkdir pkill rm sleep; do
+  for tool in bash basename cat chmod mkdir rm sleep; do
     ln -sf "$(command -v "$tool")" "$dir/bin/$tool"
   done
 
@@ -3116,8 +3125,21 @@ EOF
   cat >"$dir/real/docker" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+original_args="$*"
+config="${DOCKER_CONFIG:-}"
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --config) config="$2"; shift 2 ;;
+    --config=*) config="${1#--config=}"; shift ;;
+    *) break ;;
+  esac
+done
 if [[ "${1:-}" == "context" && "${2:-}" == "show" ]]; then
-  printf '%s\n' "${MOCK_ROUTER_CONTEXT:-default}"
+  if [[ -n "$config" && -f "$config/current-context" ]]; then
+    cat "$config/current-context"
+  else
+    printf '%s\n' "${MOCK_ROUTER_CONTEXT:-default}"
+  fi
   exit 0
 fi
 socket="${DOCKER_HOST:-}"
@@ -3127,9 +3149,15 @@ if [[ "${1:-}" == "version" ]]; then
   [[ "$socket" != "${ROUTER_BROKEN_SOCKET:-}" ]] || exit 1
   exit 0
 fi
-printf 'ROUTED=%s ARGS=%s\n' "$socket" "$*" >>"${ROUTER_LOG:?}"
+printf 'ROUTED=%s ARGS=%s\n' "$socket" "$original_args" >>"${ROUTER_LOG:?}"
 printf 'CLIENT_HOST=%s CLIENT_CONTEXT=%s\n' \
   "${DOCKER_HOST:-}" "${DOCKER_CONTEXT:-}" >>"$ROUTER_LOG"
+EOF
+
+  # Record shutdown requests; cleanup below only matches fixture paths.
+  cat >"$dir/bin/pkill" <<'EOF'
+#!/usr/bin/env bash
+printf 'STOP_REQUEST=%s\n' "$*" >>"${ROUTER_LOG:?}"
 EOF
 
   if [[ -n "$with_dockerd" ]]; then
@@ -3147,7 +3175,7 @@ EOF
     chmod +x "$dir/bin/dockerd-rootless.sh"
   fi
 
-  chmod +x "$dir/bin/podman" "$dir/real/docker"
+  chmod +x "$dir/bin/podman" "$dir/bin/pkill" "$dir/real/docker"
 }
 
 # Run the router under one of its two names.
@@ -3375,6 +3403,153 @@ test_nested_remote_commands_use_router() {
         "nested remote $command reaches the requested endpoint through router"
     fi
   done
+}
+
+test_nested_commands_use_generated_podman_environment() {
+  local assignment=""
+  local command=""
+  local selection=""
+  local runtime=""
+  local child_env=()
+  local options=()
+  setup_mock_case nested-generated-env
+
+  CAPSULE_RUNTIME=auto MOCK_PODMAN_ENV_FILE="$CASE_DIR/child-env" \
+    run_capsule "$CASE_BIN" "$CASE_LOG" true
+  assert_file_not_contains "$CASE_DIR/child-env" 'CAPSULE_RUNTIME=' \
+    "an automatically selected Podman capsule does not force its children"
+  while IFS= read -r assignment; do
+    child_env+=("$assignment")
+  done <"$CASE_DIR/child-env"
+  printf '%s\n' "$(pwd -P)" 'ssh://buildbox/srv/project' >"$CASE_DIR/config"
+
+  for command in run build; do
+    options=("$command" --remote buildbox:/srv/project)
+    [[ "$command" != "run" ]] || options+=(true)
+    : >"$CASE_LOG"
+    env -u CAPSULE_RUNTIME "${child_env[@]}" PATH="$CASE_BIN:$PATH" \
+      MOCK_LOG="$CASE_LOG" MOCK_SSH_OUTPUT=1234 \
+      CAPSULE_CONFIG="$CASE_DIR/config" \
+      "$SCRIPT_PATH" "${options[@]}" 2>"$CASE_ERR"
+    assert_file_contains "$CASE_LOG" 'ENV_DOCKER_HOST=ssh://buildbox' \
+      "a real generated Podman environment permits nested remote $command"
+  done
+
+  printf 'services:\n  cli:\n    image: custom:latest\n' >"$CASE_DIR/custom.yml"
+  for command in run build; do
+    options=("$command")
+    if [[ "$command" == "build" ]]; then
+      options+=(--custom)
+    else
+      options+=(true)
+    fi
+    : >"$CASE_LOG"
+    env -u CAPSULE_RUNTIME "${child_env[@]}" PATH="$CASE_BIN:$PATH" \
+      MOCK_LOG="$CASE_LOG" CAPSULE_CONFIG="$CASE_DIR/config" \
+      CAPSULE_CUSTOM_COMPOSE="$CASE_DIR/custom.yml" \
+      "$SCRIPT_PATH" "${options[@]}" 2>"$CASE_ERR"
+    assert_file_contains "$CASE_LOG" "-f $CASE_DIR/custom.yml" \
+      "a real generated Podman environment permits nested custom $command"
+  done
+
+  for selection in env flag; do
+    options=(build --remote buildbox:/srv/project)
+    runtime=auto
+    if [[ "$selection" == "env" ]]; then
+      runtime=podman
+    else
+      options+=(--runtime podman)
+    fi
+    if env "${child_env[@]}" CAPSULE_RUNTIME="$runtime" PATH="$CASE_BIN:$PATH" \
+      MOCK_LOG="$CASE_LOG" "$SCRIPT_PATH" "${options[@]}" \
+      2>"$CASE_ERR"; then
+      fail "an explicit nested Podman $selection selection still fails closed"
+    else
+      pass "an explicit nested Podman $selection selection still fails closed"
+    fi
+  done
+}
+
+test_router_honors_alternate_config() {
+  local dir="$TEST_TMPDIR/router-config"
+  local context=""
+  local ordinary_context=""
+  local syntax=""
+  local options=()
+  make_router_env "$dir"
+  mkdir -p "$dir/alternate config"
+  : >"$dir/hostsock"
+
+  for context in default remote-builder; do
+    ordinary_context=default
+    if [[ "$context" == "default" ]]; then
+      ordinary_context=remote-ordinary
+    fi
+    printf '%s\n' "$context" >"$dir/alternate config/current-context"
+    for syntax in split joined; do
+      if [[ "$syntax" == "split" ]]; then
+        options=(--config "$dir/alternate config")
+      else
+        options=("--config=$dir/alternate config")
+      fi
+      : >"$dir/routed"
+      MOCK_ROUTER_CONTEXT="$ordinary_context" \
+        run_router "$dir" docker "${options[@]}" ps
+      if [[ "$context" == "default" ]]; then
+        assert_file_contains "$dir/routed" \
+          "CLIENT_HOST=unix://$dir/hostsock " \
+          "a $syntax config using default context keeps local routing"
+      else
+        assert_file_contains "$dir/routed" 'CLIENT_HOST= CLIENT_CONTEXT=' \
+          "a $syntax config using a remote context bypasses local routing"
+      fi
+      assert_file_contains "$dir/routed" "${options[*]} ps" \
+        "the final command preserves the $syntax config option unchanged"
+    done
+  done
+
+  : >"$dir/routed"
+  DOCKER_CONFIG="$dir/alternate config" MOCK_ROUTER_CONTEXT=default \
+    run_router "$dir" docker ps
+  assert_file_contains "$dir/routed" 'CLIENT_HOST= CLIENT_CONTEXT=' \
+    "the router also honors DOCKER_CONFIG context selection"
+  stop_router_env "$dir"
+}
+
+test_router_cleanup_preserves_unrelated_services() {
+  local dir="$TEST_TMPDIR/router-safe-cleanup"
+  local podman_pid=""
+  local dockerd_pid=""
+  local service_pid=""
+  make_router_env "$dir" with-dockerd
+
+  bash -c 'while :; do sleep 1; done' \
+    'podman system service capsule-unrelated' &
+  podman_pid=$!
+  bash -c 'while :; do sleep 1; done' \
+    'dockerd-rootless capsule-unrelated' &
+  dockerd_pid=$!
+
+  run_router "$dir" docker ps >/dev/null 2>&1 || true
+  run_router "$dir" capsule-docker use-dockerd >/dev/null 2>&1 || true
+  run_router "$dir" capsule-docker stop >/dev/null 2>&1 || true
+  stop_router_env "$dir"
+
+  for service_pid in "$podman_pid" "$dockerd_pid"; do
+    if kill -0 "$service_pid" 2>/dev/null; then
+      pass "router fixtures leave an unrelated service process alive"
+    else
+      fail "router fixtures leave an unrelated service process alive"
+    fi
+  done
+  assert_file_contains "$dir/routed" 'STOP_REQUEST=-f podman system service' \
+    "router tests record the Podman shutdown request without host signalling"
+  assert_file_contains "$dir/routed" 'STOP_REQUEST=-f dockerd-rootless' \
+    "router tests record the dockerd shutdown request without host signalling"
+
+  kill "$podman_pid" "$dockerd_pid" 2>/dev/null || true
+  wait "$podman_pid" 2>/dev/null || true
+  wait "$dockerd_pid" 2>/dev/null || true
 }
 
 test_router_ignores_a_dead_host_socket() {
@@ -3653,7 +3828,10 @@ main() {
   test_router_reports_a_missing_dockerd
   test_router_prefers_a_bound_host_socket
   test_router_preserves_explicit_endpoints
+  test_router_honors_alternate_config
   test_nested_remote_commands_use_router
+  test_nested_commands_use_generated_podman_environment
+  test_router_cleanup_preserves_unrelated_services
   test_router_ignores_a_dead_host_socket
   test_router_requires_requested_host_socket
   test_router_stop_releases_the_engines

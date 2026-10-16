@@ -1191,7 +1191,6 @@ build_podman_run_args() {
     --volume "${CAPSULE_HOST_WORKDIR}:${CAPSULE_CONTAINER_WORKDIR}"
     --volume "$home_mount"
     --volume "$(podman_inner_volume):${CAPSULE_INNER_DIR}"
-    --env "CAPSULE_RUNTIME=podman"
     --env "CAPSULE_UID=${CAPSULE_UID}"
     --env "CAPSULE_HOST_WORKDIR=${CAPSULE_HOST_WORKDIR}"
   )

@@ -409,6 +409,11 @@ CAPSULE_RUNTIME=podman capsule     # the same choice, from the environment
 naming the reason. Explicit `podman` selection fails instead of falling back:
 it never silently exchanges the private engine for host-daemon access.
 
+The selected backend applies only to the current invocation. Podman does not
+set `CAPSULE_RUNTIME` inside the Capsule: nested commands default to `auto`,
+so remote and custom-Compose requests can use Docker. Set a nested command's
+`--runtime` or `CAPSULE_RUNTIME` explicitly when you want to override that.
+
 #### What the podman backend needs
 
 *   **Rootless podman**, which is how it runs by default. Capsule refuses a
@@ -606,7 +611,8 @@ Explicit Docker endpoints and contexts bypass the inner-engine router. This
 includes `DOCKER_HOST`, `DOCKER_CONTEXT`, `docker --host`, `docker --context`,
 and a non-default active context when `DOCKER_HOST` is unset. Nested Capsule
 commands using `--remote` therefore reach the requested remote daemon. The
-image's own default socket still uses normal Capsule routing.
+context lookup honors `--config DIR`, `--config=DIR`, and `DOCKER_CONFIG`.
+The image's own default socket still uses normal Capsule routing.
 
 Both backends preserve piped and redirected stdin without allocating a TTY:
 
