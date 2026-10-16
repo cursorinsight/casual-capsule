@@ -620,6 +620,11 @@ Both backends preserve piped and redirected stdin without allocating a TTY:
 printf 'payload\n' | capsule --runtime podman cat
 ```
 
+`docker compose version`, `docker compose config`, and help are client-only:
+they run without checking or starting an engine. They also work
+when a requested host socket is unavailable. Commands that require a daemon
+still enforce the selected endpoint and fail if it cannot be reached.
+
 #### What differs inside a podman Capsule
 
 *   **You are still `user`, and your files are still yours.** podman's
@@ -699,6 +704,22 @@ Capsule auto-detects the host user's UID/GID via `id -u`/`id -g` and
 `999` on Linux). If UID/GID detection fails (e.g. `id` is unavailable), it falls
 back to `1000:100` and prints a warning. The entrypoint handles UID/GID
 adjustment and Docker socket group membership at startup.
+
+On the Docker backend, the entrypoint also migrates inner-engine storage
+owned by the previous runtime account to the selected UID/GID. Subordinate
+image-layer ownership, set-ID permissions, and file capabilities are preserved.
+Namespaced capability root IDs follow the runtime UID change; unrelated root
+IDs stay unchanged. Storage symlinks are not followed. A native helper built
+with the image performs the migration without extra runtime dependencies.
+Failed or interrupted migrations leave `.capsule-owner-migration` in the
+storage root and block subsequent starts. Inspect or restore the storage
+before removing that marker; do not clear it blindly to bypass the check.
+Retained, nonempty storage cannot move to a different subordinate UID/GID
+range. Capsule rejects such identity changes before updating account or
+subordinate-ID configuration. Reuse the previous `CAPSULE_UID`/`CAPSULE_GID`,
+or select new, empty inner-engine storage; do not delete retained data just
+to bypass the check. Empty storage and changes that keep both ranges are
+supported, including repeated launches with the same high UID/GID.
 
 This mechanism ensures that the user inside the container can access the
 `/home/workspace` directory and the host's Docker daemon.
@@ -1163,7 +1184,10 @@ The native Podman end-to-end test still uses its own private engine. The test
 runner clears inherited `CAPSULE_RUNTIME` so each suite chooses its backend.
 
 *   The fast suite uses command stubs, so it does not require a running Docker
-    daemon.
+    daemon. Its temporary fixtures live under `_build/tests/` and are removed
+    after the run. Native capability checks need a filesystem that permits
+    file-capability execution; they deliberately avoid the system temporary
+    directory, which is often mounted with `nosuid`.
 
 *   The end-to-end suite builds and runs the real capsule image when Docker and
     Compose are available. It skips cleanly when the daemon is unavailable.

@@ -166,6 +166,7 @@ run_docker() {
   local config_value=0
   local config_args=()
   local context=""
+  local compose=0
 
   if [[ -n "${DOCKER_CONTEXT:-}" ]] ||
     [[ -n "${DOCKER_HOST:-}" &&
@@ -182,6 +183,20 @@ run_docker() {
       skip_value=0
       continue
     fi
+    if [[ "$compose" -eq 1 ]]; then
+      case "$argument" in
+        config|version|help|--help|-h|--version)
+          exec "$REAL_DOCKER" "$@"
+          ;;
+        -f|--file|-p|--project-name|--env-file|--profile|--project-directory|\
+        --ansi|--parallel|--progress)
+          skip_value=1
+          ;;
+        -*) ;;
+        *) compose=0; break ;;
+      esac
+      continue
+    fi
     case "$argument" in
       -H|--host|-H?*|--host=*|-c|--context|-c?*|--context=*)
         exec "$REAL_DOCKER" "$@"
@@ -196,7 +211,10 @@ run_docker() {
       -l|--log-level|--tlscacert|--tlscert|--tlskey)
         skip_value=1
         ;;
-      context|--help|--version)
+      compose)
+        compose=1
+        ;;
+      context|help|--help|-h|--version|-v)
         exec "$REAL_DOCKER" "$@"
         ;;
       --) break ;;
@@ -205,7 +223,7 @@ run_docker() {
     esac
   done
 
-  if [[ "$skip_value" -eq 1 ]]; then
+  if [[ "$skip_value" -eq 1 || "$compose" -eq 1 || "$#" -eq 0 ]]; then
     exec "$REAL_DOCKER" "$@"
   fi
 

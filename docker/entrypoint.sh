@@ -55,6 +55,75 @@ set_user_environment() {
   export LOGNAME=user
 }
 
+subordinate_id_start() {
+  local account_id="$1"
+  local range_start=100000
+
+  if [ "$account_id" -ge "$range_start" ] &&
+    [ "$account_id" -lt $((range_start + SUBORDINATE_ID_COUNT)) ]; then
+    range_start=$((10#$account_id + 1))
+  fi
+  printf '%s\n' "$range_start"
+}
+
+check_inner_storage_mapping() {
+  local storage_dir="$1"
+  local entry=""
+  local owner_uid=""
+  local owner_gid=""
+
+  [ -d "$storage_dir" ] || return 0
+  entry="$(find "$storage_dir" -mindepth 1 -maxdepth 1 \
+    ! -name .capsule-owner-migration -print -quit)" || return
+  [ -n "$entry" ] || return 0
+  owner_uid="$(stat -c '%u' "$storage_dir")" || return
+  owner_gid="$(stat -c '%g' "$storage_dir")" || return
+  if [ "$(subordinate_id_start "$owner_uid")" != \
+       "$(subordinate_id_start "$TARGET_UID")" ] ||
+    [ "$(subordinate_id_start "$owner_gid")" != \
+      "$(subordinate_id_start "$TARGET_GID")" ]; then
+    printf 'capsule: cannot change subordinate ID ranges for %s\n' \
+      "$storage_dir" >&2
+    printf 'capsule: use CAPSULE_UID=%s CAPSULE_GID=%s or empty storage\n' \
+      "$owner_uid" "$owner_gid" >&2
+    return 1
+  fi
+}
+
+prepare_inner_storage() {
+  local storage_dir="$1"
+  local owner_uid=""
+  local owner_gid=""
+  local remap="/usr/local/libexec/capsule/remap-storage"
+  local marker="$storage_dir/.capsule-owner-migration"
+
+  mkdir -p "$storage_dir"
+  if [ -e "$marker" ] || [ -L "$marker" ]; then
+    printf 'capsule: unfinished storage migration: %s\n' "$marker" >&2
+    printf 'capsule: inspect or restore storage before removing it\n' >&2
+    return 1
+  fi
+  check_inner_storage_mapping "$storage_dir" || return
+  owner_uid="$(stat -c '%u' "$storage_dir")"
+  owner_gid="$(stat -c '%g' "$storage_dir")"
+  if [ "$owner_uid" != "$TARGET_UID" ] ||
+    [ "$owner_gid" != "$TARGET_GID" ]; then
+    (umask 077; mkdir "$marker") || return
+    owner_uid="$(stat -c '%u' "$storage_dir")"
+    owner_gid="$(stat -c '%g' "$storage_dir")"
+    if ! check_inner_storage_mapping "$storage_dir"; then
+      rmdir "$marker"
+      return 1
+    fi
+    find "$storage_dir" -xdev -mindepth 1 \
+      -samefile "$marker" -prune -o -exec "$remap" \
+      "$owner_uid" "$owner_gid" "$TARGET_UID" "$TARGET_GID" {} + || return
+    "$remap" "$owner_uid" "$owner_gid" \
+      "$TARGET_UID" "$TARGET_GID" "$storage_dir" || return
+    rmdir "$marker"
+  fi
+}
+
 if [ "$(id -u)" != "0" ]; then
   set_user_environment
   refresh_gh_auth
@@ -71,16 +140,9 @@ CHANGED=0
 # 65534 nobody account. Image-time ranges must fit inside an outer rootless
 # Podman namespace; Docker's root entrypoint can use a separate host-ID range.
 SUBORDINATE_ID_COUNT=65536
-SUBORDINATE_UID_START=100000
-SUBORDINATE_GID_START=100000
-if [ "$TARGET_UID" -ge "$SUBORDINATE_UID_START" ] && \
-   [ "$TARGET_UID" -lt $((SUBORDINATE_UID_START + SUBORDINATE_ID_COUNT)) ]; then
-  SUBORDINATE_UID_START=$((TARGET_UID + 1))
-fi
-if [ "$TARGET_GID" -ge "$SUBORDINATE_GID_START" ] && \
-   [ "$TARGET_GID" -lt $((SUBORDINATE_GID_START + SUBORDINATE_ID_COUNT)) ]; then
-  SUBORDINATE_GID_START=$((TARGET_GID + 1))
-fi
+SUBORDINATE_UID_START="$(subordinate_id_start "$TARGET_UID")"
+SUBORDINATE_GID_START="$(subordinate_id_start "$TARGET_GID")"
+check_inner_storage_mapping /var/lib/capsule/inner
 printf 'user:%s:%s\n' \
   "$SUBORDINATE_UID_START" "$SUBORDINATE_ID_COUNT" >/etc/subuid
 printf 'user:%s:%s\n' \
@@ -122,6 +184,8 @@ if [ "$CHANGED" = "1" ] || \
   printf 'capsule: adjusting file ownership...\n' >&2
   chown -Rh user: "$TARGET_HOME" 2>/dev/null || true
 fi
+
+prepare_inner_storage /var/lib/capsule/inner
 
 # setpriv does not update environment variables, so initialize them before
 # dropping privileges instead of leaving root's values in place.

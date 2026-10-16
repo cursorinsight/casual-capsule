@@ -122,6 +122,12 @@ ENV PATH="/usr/local/share/mise/shims:$PATH"
 # Activate mise in interactive shells
 COPY --chmod=644 docker/mise.sh /etc/profile.d/
 
+COPY --chmod=644 docker/remap-storage.c /tmp/capsule-remap-storage.c
+RUN mkdir -p /usr/local/libexec/capsule && \
+    cc -std=c11 -O2 -Wall -Wextra -Werror /tmp/capsule-remap-storage.c \
+      -o /usr/local/libexec/capsule/remap-storage && \
+    rm /tmp/capsule-remap-storage.c
+
 # Copy entrypoint (owned by root for security)
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/
 

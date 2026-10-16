@@ -51,10 +51,10 @@ unset DOCKER_HOST
 unset GITHUB_API_TOKEN
 unset CAPSULE_REQUIRE_HOST_DOCKER
 
-TEST_TMPDIR="$(mktemp -d)"
+BUILD_DIR="$ROOT_DIR/_build/tests"
+mkdir -p "$BUILD_DIR"
+TEST_TMPDIR="$(mktemp -d "$BUILD_DIR/suite_fast.XXXXXX")"
 # Resolve symlinks so paths match what capsule.sh produces via pwd -P.
-# On macOS mktemp -d returns /var/folders/… which resolves to
-# /private/var/folders/… — without this the path comparisons fail.
 TEST_TMPDIR="$(CDPATH='' cd -- "$TEST_TMPDIR" && pwd -P)"
 trap 'rm -rf "$TEST_TMPDIR"' EXIT
 
@@ -565,6 +565,12 @@ test_dockerfile_uid_gid_contract() {
     'COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/' \
     "Dockerfile copies entrypoint script"
   assert_file_contains "$DOCKERFILE_PATH" \
+    'COPY --chmod=644 docker/remap-storage.c /tmp/capsule-remap-storage.c' \
+    "Dockerfile includes the native storage migration source"
+  assert_file_contains "$DOCKERFILE_PATH" \
+    '-o /usr/local/libexec/capsule/remap-storage' \
+    "Dockerfile builds the native storage migration helper"
+  assert_file_contains "$DOCKERFILE_PATH" \
     'ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]' \
     "Dockerfile sets entrypoint for runtime UID/GID"
   assert_file_contains "$DOCKERFILE_PATH" \
@@ -574,6 +580,9 @@ test_dockerfile_uid_gid_contract() {
 
 # shellcheck disable=SC2016
 test_entrypoint_contract() {
+  local mapping_guard_line=""
+  local configuration_line=""
+
   if ! bash -n "$ENTRYPOINT_PATH"; then
     fail "entrypoint.sh has valid shell syntax"
   else
@@ -614,6 +623,20 @@ test_entrypoint_contract() {
   assert_file_contains "$ENTRYPOINT_PATH" \
     'stat -c' \
     "entrypoint checks home dir ownership for stale volumes"
+  assert_file_contains "$ENTRYPOINT_PATH" \
+    'prepare_inner_storage /var/lib/capsule/inner' \
+    "entrypoint repairs inner storage before dropping privileges"
+  mapping_guard_line="$(awk \
+    '/^check_inner_storage_mapping \/var\/lib\/capsule\/inner$/ \
+      {print NR; exit}' "$ENTRYPOINT_PATH")"
+  configuration_line="$(awk '/>\/etc\/subuid/ {print NR; exit}' \
+    "$ENTRYPOINT_PATH")"
+  if [[ -n "$mapping_guard_line" && -n "$configuration_line" &&
+    "$mapping_guard_line" -lt "$configuration_line" ]]; then
+    pass "storage range guard runs before runtime configuration changes"
+  else
+    fail "storage range guard runs before runtime configuration changes"
+  fi
   assert_file_contains "$ENTRYPOINT_PATH" \
     'exec "$@"' \
     "entrypoint has non-root fast path"
@@ -3552,6 +3575,447 @@ test_router_cleanup_preserves_unrelated_services() {
   wait "$dockerd_pid" 2>/dev/null || true
 }
 
+test_router_client_only_compose_without_engine() {
+  local dir="$TEST_TMPDIR/router-offline-compose"
+  local required=""
+  local command=""
+  local options=()
+  make_router_env "$dir"
+
+  for required in 0 1; do
+    for command in version config configured joined help bare empty missing; do
+      case "$command" in
+        version) options=(compose version --short) ;;
+        config) options=(compose config --services) ;;
+        configured)
+          options=(compose -f "$dir/project.yml" -p project --profile dev
+            --env-file "$dir/env" --project-directory "$dir"
+            --ansi never --parallel 2 --progress plain config)
+          ;;
+        joined) options=(compose "--file=$dir/project.yml" config) ;;
+        help) options=(compose --help) ;;
+        bare) options=(compose) ;;
+        empty) options=(compose --file '' config) ;;
+        missing) options=(compose --file) ;;
+      esac
+      : >"$dir/routed"
+      if DOCKER_HOST="unix://$dir/hostsock" \
+        CAPSULE_REQUIRE_HOST_DOCKER="$required" \
+        run_router "$dir" docker "${options[@]}" \
+        >"$dir/out" 2>"$dir/err"; then
+        pass "Compose $command reaches its client with host required=$required"
+      else
+        fail "Compose $command reaches its client with host required=$required"
+      fi
+      assert_file_contains "$dir/routed" "ARGS=${options[*]}" \
+        "offline Compose $command preserves its arguments"
+      if [[ -e "$dir/state/podman.sock" || -e "$dir/state/dockerd.sock" ]]; then
+        fail "offline Compose $command never starts an engine"
+      else
+        pass "offline Compose $command never starts an engine"
+      fi
+    done
+  done
+
+  for command in up ps build run; do
+    : >"$dir/routed"
+    options=(compose --profile config "$command")
+    [[ "$command" != run ]] || options+=(service echo config)
+    if CAPSULE_REQUIRE_HOST_DOCKER=1 \
+      run_router "$dir" docker "${options[@]}" \
+      >"$dir/out" 2>"$dir/err"; then
+      fail "Compose $command still refuses an unavailable required engine"
+    else
+      pass "Compose $command still refuses an unavailable required engine"
+    fi
+    assert_file_contains "$dir/err" \
+      'requested host Docker socket is unavailable' \
+      "Compose $command keeps daemon operations fail-closed"
+  done
+  stop_router_env "$dir"
+}
+
+test_entrypoint_inner_storage_ownership() {
+  local dir="$TEST_TMPDIR/inner-storage-ownership"
+  local namespace=()
+  local uid_start=""
+  local gid_start=""
+  local account=""
+  local function_name=""
+  if ! command -v unshare >/dev/null 2>&1; then
+    skip "inner-storage capability checks need unshare"
+    return
+  fi
+  if ! command -v setpriv >/dev/null 2>&1; then
+    skip "inner-storage permission checks need setpriv"
+    return
+  fi
+  if [[ "$(id -u)" != 0 ]]; then
+    namespace=(unshare --user --map-auto --map-root-user)
+    if command -v getsubids >/dev/null 2>&1; then
+      account="$(id -un)"
+      uid_start="$(getsubids "$account" 2>/dev/null |
+        awk '$4 >= 30018 {print $3; exit}' || true)"
+      gid_start="$(getsubids -g "$account" 2>/dev/null |
+        awk '$4 >= 30018 {print $3; exit}' || true)"
+      if [[ -n "$uid_start" && -n "$gid_start" ]]; then
+        namespace=(unshare --user --map-root-user
+          "--map-users=$uid_start,1,30000"
+          "--map-users=$((uid_start + 30000)),100000,16"
+          "--map-users=$((uid_start + 30016)),165535,2"
+          "--map-groups=$gid_start,1,30000"
+          "--map-groups=$((gid_start + 30000)),100000,16"
+          "--map-groups=$((gid_start + 30016)),165535,2")
+      fi
+    fi
+    if ! "${namespace[@]}" setpriv --reuid=23456 --regid=23456 \
+      --clear-groups true 2>/dev/null; then
+      skip "inner-storage permission checks need a mapped user namespace"
+      return
+    fi
+  elif ! unshare --user --map-root-user true 2>/dev/null; then
+    skip "inner-storage capability checks need user namespaces"
+    return
+  fi
+  if ! command -v cc >/dev/null 2>&1; then
+    skip "inner-storage metadata checks need a C compiler"
+    return
+  fi
+
+  mkdir -p "$dir"
+  if ! cc -std=c11 -O2 -Wall -Wextra -Werror \
+    "$ROOT_DIR/docker/remap-storage.c" -o "$dir/remap-storage" \
+    >"$dir/compile-log" 2>&1 ||
+    ! cc -std=c11 -O2 -Wall -Wextra -Werror \
+      "$ROOT_DIR/tests/fixtures/storage-capabilities.c" -o "$dir/cap-probe" \
+      >>"$dir/compile-log" 2>&1 ||
+    ! cc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC \
+      -DFAIL_CAPABILITY_RESTORE \
+      "$ROOT_DIR/tests/fixtures/storage-capabilities.c" \
+      -o "$dir/cap-failure.so" \
+      >>"$dir/compile-log" 2>&1; then
+    fail "inner-storage native helpers compile without warnings"
+    cat "$dir/compile-log" >&2
+    return
+  fi
+  printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail' >"$dir/check"
+  sed -n '/^SUBORDINATE_ID_COUNT=/p' "$ENTRYPOINT_PATH" >>"$dir/check"
+  for function_name in subordinate_id_start check_inner_storage_mapping \
+    prepare_inner_storage; do
+    sed -n "/^$function_name() {/,/^}/p" "$ENTRYPOINT_PATH" |
+      sed "s|/usr/local/libexec/capsule/remap-storage|$dir/remap-storage|g" \
+      >>"$dir/check"
+  done
+  cat >>"$dir/check" <<'EOF'
+root="$1"
+umask 077
+trap 'chown -Rh 0:0 "$root"' EXIT
+trap 'printf "ownership check failed at line %s\n" "$LINENO" >&2' ERR
+mkdir -p "$root/storage/containers/layers" "$root/storage/docker"
+chmod 755 "$root/storage/containers" "$root/storage/containers/layers"
+touch "$root/storage/containers/layers/subordinate"
+touch "$root/storage/containers/user-owned" "$root/storage/docker/group-owned"
+touch "$root/storage/containers/setuid" "$root/storage/containers/setgid"
+touch "$root/storage/docker/group-setuid"
+touch "$root/storage/containers/layers/subordinate-setid"
+touch "$root/storage/containers/"$'setid\nwith spaces'
+ln "$root/storage/containers/setuid" "$root/storage/containers/hardlink"
+touch "$root/guard"
+ln -s "$root/guard" "$root/storage/link"
+ln -s "$root/missing" "$root/storage/dangling"
+chown -Rh 1000:100 "$root/storage"
+chown 12345:23456 "$root/storage/containers/layers/subordinate"
+chown 1000:23456 "$root/storage/containers/user-owned"
+chown 12345:100 "$root/storage/docker/group-owned"
+chown 1000:23456 "$root/storage/containers/setgid"
+chown 12345:100 "$root/storage/docker/group-setuid"
+chown 12345:23456 "$root/storage/containers/layers/subordinate-setid"
+chown 1000:100 "$root/guard"
+chmod 4755 "$root/storage/containers/setuid"
+chmod 2755 "$root/storage/containers/setgid"
+chmod 4755 "$root/storage/docker/group-setuid"
+chmod 6755 "$root/storage/containers/layers/subordinate-setid"
+chmod 6755 "$root/storage/containers/"$'setid\nwith spaces'
+chmod 2775 "$root/storage" "$root/storage/docker"
+chmod 6755 "$root/guard"
+
+for name in cap-plain cap-namespaced cap-subordinate cap-foreign cap-setid; do
+  cp "$root/cap-probe" "$root/storage/containers/$name"
+done
+touch "$root/storage/containers/cap-empty" "$root/storage/containers/cap-rich"
+chown 1000:100 "$root/storage/containers/"cap-*
+chown 12345:23456 "$root/storage/containers/cap-subordinate"
+chmod 755 "$root/storage/containers/"cap-*
+chmod 4755 "$root/storage/containers/cap-setid"
+"$root/cap-probe" set "$root/storage/containers/cap-plain" 0
+"$root/cap-probe" set "$root/storage/containers/cap-namespaced" 1000
+"$root/cap-probe" set "$root/storage/containers/cap-subordinate" 1000
+"$root/cap-probe" set "$root/storage/containers/cap-foreign" 12345
+"$root/cap-probe" set "$root/storage/containers/cap-setid" 1000
+"$root/cap-probe" empty "$root/storage/containers/cap-empty" 1000
+"$root/cap-probe" set-rich "$root/storage/containers/cap-rich" 1000
+ln "$root/storage/containers/cap-namespaced" \
+  "$root/storage/containers/cap-hardlink"
+"$root/cap-probe" set "$root/guard" 1000
+cd "$root/storage"
+setpriv --reuid=1000 --regid=100 --clear-groups containers/cap-plain
+
+execute_with_namespace() {
+  unshare --user --map-users="$2,0,1" --map-users=5000,1,1 \
+    --map-groups="$3,0,1" --map-groups=5000,1,1 \
+    --setuid=1 --setgid=1 "$1"
+}
+execute_with_namespace containers/cap-namespaced 1000 100
+
+check_storage_capabilities() {
+  "$root/cap-probe" check containers/cap-plain 0
+  "$root/cap-probe" check containers/cap-namespaced "$1"
+  "$root/cap-probe" check containers/cap-hardlink "$1"
+  "$root/cap-probe" check containers/cap-subordinate "$1"
+  "$root/cap-probe" check containers/cap-foreign 12345
+  "$root/cap-probe" check containers/cap-setid "$1"
+  "$root/cap-probe" check-empty containers/cap-empty "$1"
+  "$root/cap-probe" check-rich containers/cap-rich "$1"
+  "$root/cap-probe" check "$root/guard" 1000
+  [[ "$(stat -c '%u:%g:%a' containers/cap-setid)" == "$1:$2:4755" ]]
+  [[ "$(stat -c '%u:%g' containers/cap-subordinate)" == 12345:23456 ]]
+  cmp "$root/cap-probe" containers/cap-namespaced
+  setpriv --reuid="$1" --regid="$2" --clear-groups containers/cap-plain
+  execute_with_namespace containers/cap-namespaced "$1" "$2"
+  execute_with_namespace containers/cap-subordinate "$1" "$2"
+  if execute_with_namespace containers/cap-foreign "$1" "$2" \
+    >"$root/foreign-log" 2>&1; then
+    printf 'foreign namespace capabilities must not be granted\n' >&2
+    exit 1
+  fi
+  grep -Fxq 'effective CAP_NET_RAW is missing' "$root/foreign-log"
+}
+
+check_storage_modes() {
+  check_storage_capabilities "$1" "$2"
+  [[ "$(stat -c '%u:%g:%a' \
+    "$root/storage/containers/setuid")" == "$1:$2:4755" ]]
+  [[ "$(stat -c '%u:%g:%a' \
+    "$root/storage/containers/hardlink")" == "$1:$2:4755" ]]
+  [[ "$(stat -c '%u:%g:%a' \
+    "$root/storage/containers/setgid")" == "$1:23456:2755" ]]
+  [[ "$(stat -c '%u:%g:%a' \
+    "$root/storage/docker/group-setuid")" == "12345:$2:4755" ]]
+  [[ "$(stat -c '%u:%g:%a' \
+    "$root/storage/containers/layers/subordinate-setid")" == 12345:23456:6755 ]]
+  [[ "$(stat -c '%u:%g:%a' \
+    "$root/storage/containers/"$'setid\nwith spaces')" == "$1:$2:6755" ]]
+  [[ "$(stat -c '%u:%g:%a' "$root/storage")" == "$1:$2:2775" ]]
+  [[ "$(stat -c '%u:%g:%a' "$root/storage/docker")" == "$1:$2:2775" ]]
+  [[ "$(stat -c '%u:%g:%a' "$root/guard")" == 1000:100:6755 ]]
+  [[ "$(stat -c '%u:%g' "$root/storage/dangling")" == "$1:$2" ]]
+  [[ "$(readlink "$root/storage/dangling")" == "$root/missing" ]]
+  [[ ! -e "$root/storage/.capsule-owner-migration" ]]
+}
+
+TARGET_UID=2000 TARGET_GID=2000 prepare_inner_storage "$root/storage"
+check_storage_modes 2000 2000
+[[ "$(stat -c '%u:%g' "$root/storage")" == 2000:2000 ]]
+[[ "$(stat -c '%u:%g' "$root/storage/containers/user-owned")" == 2000:23456 ]]
+[[ "$(stat -c '%u:%g' "$root/storage/docker/group-owned")" == 12345:2000 ]]
+[[ "$(stat -c '%u:%g' "$root/storage/containers/layers/subordinate")" == \
+  12345:23456 ]]
+[[ "$(stat -c '%u:%g' "$root/guard")" == 1000:100 ]]
+[[ "$(stat -c '%u:%g' "$root/storage/link")" == 2000:2000 ]]
+cd "$root/storage"
+setpriv --reuid=2000 --regid=2000 --clear-groups \
+  sh -c 'mkdir containers/runtime-write docker/runtime-write'
+printf 'remapped runtime can write both engine roots\n'
+
+TARGET_UID=3000 TARGET_GID=3000 prepare_inner_storage "$root/storage"
+check_storage_modes 3000 3000
+[[ "$(stat -c '%u:%g' "$root/storage/containers/runtime-write")" == 3000:3000 ]]
+[[ "$(stat -c '%u:%g' "$root/storage/containers/layers/subordinate")" == \
+  12345:23456 ]]
+[[ "$(stat -c '%u:%g' "$root/guard")" == 1000:100 ]]
+setpriv --reuid=3000 --regid=3000 --clear-groups \
+  sh -c 'mkdir containers/second-write docker/second-write'
+TARGET_UID=3000 TARGET_GID=3000 prepare_inner_storage "$root/storage"
+check_storage_modes 3000 3000
+TARGET_UID=3000 TARGET_GID=4000 prepare_inner_storage "$root/storage"
+check_storage_modes 3000 4000
+TARGET_UID=4000 TARGET_GID=4000 prepare_inner_storage "$root/storage"
+check_storage_modes 4000 4000
+printf 'storage remapping preserves set-ID file and directory modes\n'
+printf 'storage remapping preserves capabilities and namespace root IDs\n'
+printf 'existing runtime state migrates without changing subordinate owners\n'
+
+TARGET_UID=2000 TARGET_GID=2000 prepare_inner_storage "$root/fresh"
+[[ "$(stat -c '%u:%g' "$root/fresh")" == 2000:2000 ]]
+printf 'missing storage root is created with the runtime identity\n'
+
+[[ "$(subordinate_id_start 99999)" == 100000 ]]
+[[ "$(subordinate_id_start 100000)" == 100001 ]]
+[[ "$(subordinate_id_start 0100001)" == 100002 ]]
+[[ "$(subordinate_id_start 165535)" == 165536 ]]
+[[ "$(subordinate_id_start 165536)" == 100000 ]]
+
+read_range_data() {
+  local storage_dir="$1"
+  local uid_start="$(subordinate_id_start "$2")"
+  local gid_start="$(subordinate_id_start "$3")"
+  (cd "$storage_dir" &&
+    unshare --user --map-users="$2,0,1" --map-users="$uid_start,1,1" \
+      --map-groups="$3,0,1" --map-groups="$gid_start,1,1" \
+      --setuid=1 --setgid=1 cat containers/volumes/app/_data/data)
+}
+
+reject_range_change() {
+  local storage_dir="$root/ranges-$1-$2-$3-$4"
+  local uid_start="$(subordinate_id_start "$1")"
+  local gid_start="$(subordinate_id_start "$2")"
+  mkdir -p "$storage_dir/containers/volumes/app/_data"
+  find "$storage_dir" -type d -exec chmod 755 {} +
+  printf 'application-data\n' >"$storage_dir/containers/volumes/app/_data/data"
+  chown "$1:$2" "$storage_dir"
+  chown "$uid_start:$gid_start" \
+    "$storage_dir/containers/volumes/app/_data/data"
+  chmod 600 "$storage_dir/containers/volumes/app/_data/data"
+  [[ "$(read_range_data "$storage_dir" "$1" "$2")" == application-data ]]
+  if TARGET_UID="$3" TARGET_GID="$4" \
+    prepare_inner_storage "$storage_dir" >"$root/range-log" 2>&1; then
+    printf 'unsafe subordinate range change was accepted\n' >&2
+    exit 1
+  fi
+  grep -Fq 'cannot change subordinate ID ranges' "$root/range-log"
+  grep -Fq "CAPSULE_UID=$1 CAPSULE_GID=$2" "$root/range-log"
+  [[ "$(stat -c '%u:%g' "$storage_dir")" == "$1:$2" ]]
+  [[ "$(stat -c '%u:%g:%a' \
+    "$storage_dir/containers/volumes/app/_data/data")" == \
+    "$uid_start:$gid_start:600" ]]
+  [[ ! -e "$storage_dir/.capsule-owner-migration" ]]
+  TARGET_UID="$1" TARGET_GID="$2" prepare_inner_storage "$storage_dir"
+  [[ "$(read_range_data "$storage_dir" "$1" "$2")" == application-data ]]
+}
+
+if setpriv --reuid=165536 --regid=165536 --clear-groups true 2>/dev/null; then
+  reject_range_change 1000 100 100001 2000
+  reject_range_change 100001 2000 1000 100
+  reject_range_change 100001 2000 100002 2000
+  reject_range_change 1000 100 1000 100001
+  reject_range_change 1000 100001 1000 100
+  reject_range_change 1000 100001 1000 100002
+  reject_range_change 1000 100 100000 100
+  reject_range_change 165535 100 165536 100
+  reject_range_change 1000 165535 1000 165536
+  TARGET_UID=100001 TARGET_GID=100 \
+    prepare_inner_storage "$root/empty-high-storage"
+  [[ "$(stat -c '%u:%g' "$root/empty-high-storage")" == 100001:100 ]]
+  touch "$root/empty-high-storage/retained"
+  TARGET_UID=100001 TARGET_GID=2000 \
+    prepare_inner_storage "$root/empty-high-storage"
+  [[ "$(stat -c '%u:%g' "$root/empty-high-storage")" == 100001:2000 ]]
+  mkdir "$root/empty-existing-storage"
+  chown 1000:100 "$root/empty-existing-storage"
+  TARGET_UID=100001 TARGET_GID=100001 \
+    prepare_inner_storage "$root/empty-existing-storage"
+  [[ "$(stat -c '%u:%g' "$root/empty-existing-storage")" == 100001:100001 ]]
+  touch "$root/empty-existing-storage/retained"
+  TARGET_UID=100001 TARGET_GID=100001 \
+    prepare_inner_storage "$root/empty-existing-storage"
+  mkdir "$root/upper-bound-storage"
+  chown 1000:100 "$root/upper-bound-storage"
+  touch "$root/upper-bound-storage/retained"
+  TARGET_UID=165536 TARGET_GID=165536 \
+    prepare_inner_storage "$root/upper-bound-storage"
+  [[ "$(stat -c '%u:%g' "$root/upper-bound-storage")" == 165536:165536 ]]
+  printf 'retained storage refuses range changes without changing data\n'
+else
+  printf 'high-ID range checks need additional user-namespace mappings\n'
+fi
+
+if "$root/remap-storage" >"$root/error-log" 2>&1; then
+  printf 'missing migration arguments were accepted\n' >&2
+  exit 1
+fi
+grep -Fq 'usage:' "$root/error-log"
+for invalid in '' -1 +1 1x 4294967295 4294967296 999999999999999999999; do
+  if "$root/remap-storage" "$invalid" 100 2000 2000 "$root/guard" \
+    >"$root/error-log" 2>&1; then
+    printf 'invalid owner ID was accepted: %s\n' "$invalid" >&2
+    exit 1
+  fi
+  grep -Fq 'invalid storage owner ID' "$root/error-log"
+done
+if "$root/remap-storage" 1000 100 2000 2000 "$root/missing" \
+  >"$root/error-log" 2>&1; then
+  printf 'missing storage entry was accepted\n' >&2
+  exit 1
+fi
+mkdir "$root/failed-storage"
+chown 1000:100 "$root/failed-storage"
+failure_script="SUBORDINATE_ID_COUNT=$SUBORDINATE_ID_COUNT"
+failure_script+=$'\n'"$(declare -f subordinate_id_start \
+  check_inner_storage_mapping prepare_inner_storage)"
+failure_script+=$'\nfind() {\n'
+failure_script+=$'case " $* " in *" -xdev "*) return 1;; esac'
+failure_script+=$'\ncommand find "$@"\n}\nprepare_inner_storage "$1"'
+if TARGET_UID=2000 TARGET_GID=2000 bash -ec "$failure_script" \
+  bash "$root/failed-storage" >"$root/error-log" 2>&1; then
+  printf 'failed traversal was accepted\n' >&2
+  exit 1
+fi
+[[ "$(stat -c '%u:%g' "$root/failed-storage")" == 1000:100 ]]
+[[ -d "$root/failed-storage/.capsule-owner-migration" ]]
+if TARGET_UID=1000 TARGET_GID=100 \
+  prepare_inner_storage "$root/failed-storage" >"$root/error-log" 2>&1; then
+  printf 'unfinished migration was accepted with unchanged IDs\n' >&2
+  exit 1
+fi
+grep -Fq 'unfinished storage migration' "$root/error-log"
+
+mkdir "$root/rollback-storage"
+cp "$root/cap-probe" "$root/rollback-storage/cap"
+chown -R 1000:100 "$root/rollback-storage"
+chmod 4755 "$root/rollback-storage/cap"
+"$root/cap-probe" set "$root/rollback-storage/cap" 1000
+if LD_PRELOAD="$root/cap-failure.so" TARGET_UID=2000 TARGET_GID=2000 \
+  prepare_inner_storage "$root/rollback-storage" >"$root/error-log" 2>&1; then
+  printf 'capability restore failure was accepted\n' >&2
+  exit 1
+fi
+[[ "$(stat -c '%u:%g' "$root/rollback-storage")" == 1000:100 ]]
+[[ "$(stat -c '%u:%g:%a' "$root/rollback-storage/cap")" == 1000:100:4755 ]]
+"$root/cap-probe" check "$root/rollback-storage/cap" 1000
+[[ -d "$root/rollback-storage/.capsule-owner-migration" ]]
+rmdir "$root/rollback-storage/.capsule-owner-migration"
+TARGET_UID=2000 TARGET_GID=2000 prepare_inner_storage "$root/rollback-storage"
+[[ "$(stat -c '%u:%g:%a' "$root/rollback-storage/cap")" == 2000:2000:4755 ]]
+"$root/cap-probe" check "$root/rollback-storage/cap" 2000
+printf 'storage migration errors fail closed without advancing root owners\n'
+EOF
+
+  if ${namespace[@]+"${namespace[@]}"} bash "$dir/check" "$dir" \
+    >"$dir/out" 2>"$dir/err"; then
+    assert_file_contains "$dir/out" 'remapped runtime can write' \
+      "runtime UID/GID remapping keeps both engine roots writable"
+    assert_file_contains "$dir/out" 'existing runtime state migrates' \
+      "storage migrations preserve subordinate ownership and symlink targets"
+    assert_file_contains "$dir/out" 'storage remapping preserves set-ID' \
+      "storage migrations preserve set-ID modes across UID/GID changes"
+    assert_file_contains "$dir/out" 'storage remapping preserves capabilities' \
+      "storage migrations preserve file and effective namespaced capabilities"
+    assert_file_contains "$dir/out" 'missing storage root is created' \
+      "a new storage directory receives the runtime identity"
+    assert_file_contains "$dir/out" 'storage migration errors fail closed' \
+      "failed storage migrations cannot silently resume with damaged metadata"
+    if grep -Fq 'high-ID range checks need' "$dir/out"; then
+      skip "high-ID range checks need additional user-namespace mappings"
+    else
+      assert_file_contains "$dir/out" 'retained storage refuses range changes' \
+        "unsafe UID/GID range changes preserve container-user data access"
+    fi
+  else
+    fail "inner-storage runtime ownership checks"
+    cat "$dir/err" >&2
+  fi
+}
+
 test_router_ignores_a_dead_host_socket() {
   local dir="$TEST_TMPDIR/router-deadsock"
   make_router_env "$dir"
@@ -3832,10 +4296,12 @@ main() {
   test_nested_remote_commands_use_router
   test_nested_commands_use_generated_podman_environment
   test_router_cleanup_preserves_unrelated_services
+  test_router_client_only_compose_without_engine
   test_router_ignores_a_dead_host_socket
   test_router_requires_requested_host_socket
   test_router_stop_releases_the_engines
   test_entrypoint_non_root_path_execs_the_command
+  test_entrypoint_inner_storage_ownership
   test_podman_image_contract
   test_entrypoint_non_root_contract
 
