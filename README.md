@@ -941,6 +941,11 @@ GitHub CI runs the same two nested checks as separate matrix jobs. It enables
 strict e2e mode there, so a missing Docker or rootless Podman prerequisite
 fails the corresponding job instead of silently skipping its cases.
 
+Both matrix jobs use host Docker for Compose tests. The Podman job explicitly
+binds that socket and preserves the runner's supplementary groups with crun.
+The native Podman end-to-end test still uses its own private engine. The test
+runner clears inherited `CAPSULE_RUNTIME` so each suite chooses its backend.
+
 *   The fast suite uses command stubs, so it does not require a running Docker
     daemon.
 

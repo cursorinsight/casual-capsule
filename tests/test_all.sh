@@ -10,6 +10,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
+unset CAPSULE_RUNTIME
 FAIL_COUNT=0
 
 run_suite() {

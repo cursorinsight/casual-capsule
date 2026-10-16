@@ -84,7 +84,14 @@ jobs:
         if: matrix.runtime == 'podman'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes fuse-overlayfs slirp4netns uidmap
+          sudo apt-get install --yes crun fuse-overlayfs slirp4netns uidmap
+          mkdir -p ~/.config/containers
+          cat >~/.config/containers/containers.conf <<'EOF'
+          [containers]
+          annotations = ["run.oci.keep_original_groups=1"]
+          [engine]
+          runtime = "crun"
+          EOF
           runner_user="$(id -un)"
           if ! grep -Fq "${runner_user}:" /etc/subuid; then
             sudo usermod --add-subuids 100000-165535 "$runner_user"
@@ -99,7 +106,14 @@ jobs:
 
       - name: Run tests inside Capsule
         run: |
+          capsule_args=(
+            --volume /var/run/docker.sock:/var/run/docker.sock
+          )
+          if [[ "${{ matrix.runtime }}" == "podman" ]]; then
+            capsule_args+=(--host-docker)
+          fi
           ./capsule.sh --runtime "${{ matrix.runtime }}" --build \
+            ${capsule_args[@]+"${capsule_args[@]}"} \
             env CAPSULE_E2E_STRICT=1 tests/test_all.sh
 
       - name: Upload nested e2e log artifact

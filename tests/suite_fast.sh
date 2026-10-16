@@ -806,9 +806,35 @@ test_doctor_names_a_stale_session_bus() {
     "the doctor names the package when no user bus exists at all"
 }
 
+test_test_runner_clears_inherited_runtime() {
+  local tdir="$TEST_TMPDIR/test-runner-runtime"
+  local suite_name=""
+  local runtime=""
+  mkdir -p "$tdir/tests"
+  cp "$ROOT_DIR/tests/test_all.sh" "$tdir/tests/test_all.sh"
+  for suite_name in suite_fast.sh suite_e2e.sh; do
+    cat >"$tdir/tests/$suite_name" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ -z "${CAPSULE_RUNTIME+x}" && "${CAPSULE_E2E_STRICT:-}" == "1" ]]
+EOF
+    chmod +x "$tdir/tests/$suite_name"
+  done
+
+  for runtime in docker podman; do
+    if CAPSULE_RUNTIME="$runtime" CAPSULE_E2E_STRICT=1 \
+      "$tdir/tests/test_all.sh" >/dev/null; then
+      pass "test runner clears inherited $runtime while keeping strict mode"
+    else
+      fail "test runner clears inherited $runtime while keeping strict mode"
+    fi
+  done
+}
+
 # Verify CI exercises a nested Capsule through each supported backend.
 # shellcheck disable=SC2016
 test_ci_runs_nested_capsules_for_each_backend() {
+  test_test_runner_clears_inherited_runtime
   assert_file_contains "$CI_PATH" \
     'name: nested-capsule (${{ matrix.runtime }})' \
     "GitHub CI exposes separate nested backend checks"
@@ -827,6 +853,12 @@ test_ci_runs_nested_capsules_for_each_backend() {
   assert_file_contains "$CI_PATH" \
     "grep -Eq '^true ([2-9]|[1-9][0-9]+)$'" \
     "Podman CI requires rootless subordinate ID mappings"
+  assert_file_contains "$CI_PATH" \
+    'capsule_args+=(--host-docker)' \
+    "Podman CI uses host Docker for Compose-specific tests"
+  assert_file_contains "$CI_PATH" \
+    'run.oci.keep_original_groups=1' \
+    "Podman CI preserves group access to the host Docker socket"
 }
 
 test_build_flag_without_runtime_args() {
@@ -2474,14 +2506,47 @@ test_entrypoint_non_root_path_execs_the_command() {
     "the non-root command receives the Capsule user environment"
 }
 
+test_nested_subordinate_id_ranges() {
+  local tdir="$TEST_TMPDIR/subordinate-ids"
+  local setup_script=""
+  local account_id=""
+  local id_type=""
+  mkdir -p "$tdir"
+
+  setup_script="$(awk '
+    /^RUN for id_type in uid gid; do/ { copying = 1 }
+    copying && /    done &&/ { print "done"; exit }
+    copying { sub(/^RUN /, ""); sub(/\\$/, ""); print }
+  ' "$DOCKERFILE_PATH")"
+  setup_script="${setup_script//\/etc\/sub/$tdir/sub}"
+
+  for account_id in 0 100 1000 65534 65536 70000; do
+    CAPSULE_UID="$account_id" CAPSULE_GID="$account_id" \
+      bash -ec "$setup_script"
+    for id_type in uid gid; do
+      if [[ -s "$tdir/sub$id_type" ]] && \
+        awk -F: -v account_id="$account_id" '
+          $1 != "user" || $2 < 0 || $3 <= 0 { invalid = 1 }
+          $2 + $3 > 65537 { invalid = 1 }
+          $2 <= account_id && account_id < $2 + $3 { invalid = 1 }
+          NR > 1 && $2 < previous_end { invalid = 1 }
+          { total += $3; previous_end = $2 + $3 }
+          END { exit invalid || total != 65536 }
+        ' "$tdir/sub$id_type"; then
+        pass "nested $id_type ranges fit keep-id for account $account_id"
+      else
+        fail "nested $id_type ranges fit keep-id for account $account_id"
+      fi
+    done
+  done
+}
+
 # shellcheck disable=SC2016
 test_podman_image_contract() {
   assert_file_contains "$DOCKERFILE_PATH" \
     'aardvark-dns catatonit fuse-overlayfs netavark nftables passt podman' \
     "Dockerfile installs what the inner engine needs to serve a project"
-  assert_file_contains "$DOCKERFILE_PATH" \
-    "printf 'user:%s:%s\\n' \"\${sub_start}\" \"\${sub_count}\" > /etc/subuid" \
-    "Dockerfile gives the account a sub-id range for the inner engine"
+  test_nested_subordinate_id_ranges
   assert_file_contains "$DOCKERFILE_PATH" \
     'ln -s /usr/local/bin/capsule-docker /usr/local/bin/docker' \
     "Dockerfile puts the engine router ahead of the real client"

@@ -67,19 +67,22 @@ RUN if ! getent group "${CAPSULE_GID}" >/dev/null 2>&1; then \
 # Give "user" a sub-id range for the Capsule's inner engine, and a mountpoint
 # for the per-workspace storage volume.
 #
-# A nested rootless engine maps its containers into sub-ids of the account it
-# runs as, so those ids must exist inside the Capsule's own user namespace and
-# must not collide with the account's own id -- an overlapping map is refused
-# by the kernel with EINVAL. The range is therefore placed above both ids.
-RUN sub_start=3000; \
-    if [ "${CAPSULE_UID}" -ge "${sub_start}" ] || \
-       [ "${CAPSULE_GID}" -ge "${sub_start}" ]; then \
-      sub_start=$((CAPSULE_UID > CAPSULE_GID ? CAPSULE_UID : CAPSULE_GID)); \
-      sub_start=$((sub_start + 1)); \
-    fi; \
-    sub_count=$((63000 - sub_start)); \
-    printf 'user:%s:%s\n' "${sub_start}" "${sub_count}" > /etc/subuid; \
-    printf 'user:%s:%s\n' "${sub_start}" "${sub_count}" > /etc/subgid; \
+# Keep 65536 subordinate IDs inside keep-id's 0..65536 namespace, excluding
+# the account's own ID. Split ranges retain IDs such as Debian's 65534 while
+# avoiding overlaps at every nesting level.
+RUN for id_type in uid gid; do \
+      case "$id_type" in \
+        uid) account_id="${CAPSULE_UID}" ;; \
+        gid) account_id="${CAPSULE_GID}" ;; \
+      esac; \
+      awk -v account_id="$account_id" 'BEGIN { \
+        low_count = account_id < 65536 ? account_id : 65536; \
+        if (low_count > 0) printf "user:0:%d\n", low_count; \
+        high_start = account_id + 1; \
+        if (high_start <= 65536) \
+          printf "user:%d:%d\n", high_start, 65537 - high_start; \
+      }' >"/etc/sub${id_type}"; \
+    done && \
     install -d -o "${CAPSULE_UID}" -g "${CAPSULE_GID}" \
       /var/lib/capsule/inner
 

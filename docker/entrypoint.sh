@@ -68,9 +68,8 @@ TARGET_GID="${CAPSULE_GID:-$CUR_GID}"
 CHANGED=0
 
 # Give nested rootless Podman every ordinary container ID, including Debian's
-# 65534 nobody account. The smaller image-time range must fit inside an outer
-# rootless Podman namespace; the Docker backend has no such parent mapping, so
-# its root entrypoint can safely replace that range with the standard size.
+# 65534 nobody account. Image-time ranges must fit inside an outer rootless
+# Podman namespace; Docker's root entrypoint can use a separate host-ID range.
 SUBORDINATE_ID_COUNT=65536
 SUBORDINATE_UID_START=100000
 SUBORDINATE_GID_START=100000
