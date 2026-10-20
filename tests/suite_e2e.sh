@@ -17,7 +17,29 @@ source "$ROOT_DIR/lib/capsule/podman.sh"
 SCRIPT_PATH="$ROOT_DIR/capsule.sh"
 EXAMPLE_PROJECT_DIR="$ROOT_DIR/tests/fixtures/example-project"
 CUSTOM_CAPSULE_DIR="$ROOT_DIR/tests/fixtures/custom-capsule"
+PROFILE_CAPSULE_DIR="$ROOT_DIR/tests/fixtures/profile-capsule"
 BUILD_DIR="$ROOT_DIR/_build/tests"
+PROFILE_TEST_TOKEN="$(
+  printf '%s\n' "$PROFILE_CAPSULE_DIR" | cksum | cut -d' ' -f1
+)"
+printf -v PROFILE_TEST_TOKEN '%08x' "$PROFILE_TEST_TOKEN"
+PROFILE_TEST_IMAGE="${CAPSULE_COMPOSE_PROJECT_NAME:-casual-capsule}"
+PROFILE_TEST_IMAGE+="-p-test-profile-${PROFILE_TEST_TOKEN}:local"
+PODMAN_PROFILE_BASE="${CAPSULE_IMAGE:-casual-capsule:local}"
+PODMAN_PROFILE_BASE_TOKEN="$(
+  printf '%s\0' "$PODMAN_PROFILE_BASE" | cksum | cut -d' ' -f1
+)"
+printf -v PODMAN_PROFILE_BASE_TOKEN '%08x' "$PODMAN_PROFILE_BASE_TOKEN"
+PODMAN_PROFILE_TEST_IMAGE="${PROFILE_TEST_IMAGE%:local}"
+PODMAN_PROFILE_TEST_IMAGE+="-${PODMAN_PROFILE_BASE_TOKEN}:local"
+CONTROLLER_PROFILE_TOKEN="$(
+  printf '%s\n' '/controller/repo/tests/fixtures/profile-capsule' | \
+    cksum | cut -d' ' -f1
+)"
+printf -v CONTROLLER_PROFILE_TOKEN '%08x' "$CONTROLLER_PROFILE_TOKEN"
+CONTROLLER_PROFILE_IMAGE="casual-capsule-p-test-profile-"
+CONTROLLER_PROFILE_IMAGE+="${CONTROLLER_PROFILE_TOKEN}:local"
+CUSTOM_TEST_IMAGE="fixture-custom-capsule:local"
 
 mkdir -p "$BUILD_DIR"
 TEST_TMPDIR="$(mktemp -d "$BUILD_DIR/suite_e2e.XXXXXX")"
@@ -46,6 +68,18 @@ log_message() {
   printf '%s %s\n' "$(timestamp)" "$*" >>"$LOG_FILE"
 }
 
+# Remove images built only for this suite.
+cleanup_test_images() {
+  docker image rm -f "$PROFILE_TEST_IMAGE" >/dev/null 2>&1 || true
+  docker image rm -f "$CONTROLLER_PROFILE_IMAGE" \
+    >/dev/null 2>&1 || true
+  docker image rm -f "$CUSTOM_TEST_IMAGE" >/dev/null 2>&1 || true
+  podman image rm -f "$PODMAN_PROFILE_TEST_IMAGE" >/dev/null 2>&1 || true
+}
+
+cleanup_test_images
+trap cleanup_test_images EXIT
+
 # Prefix streamed command output with timestamps before writing the logfile.
 log_stream() {
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -56,6 +90,35 @@ log_stream() {
 # Run a command and capture its combined output in the timestamped logfile.
 run_logged() {
   "$@" 2>&1 | log_stream
+}
+
+# Resolve the approval path with Capsule's own workdir logic.
+resolve_approval_path() (
+  export CAPSULE_ROOT="$ROOT_DIR"
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/lib/capsule/common.sh"
+  export CAPSULE_WORKDIR="$1"
+  initialize_workdir_state
+  printf '%s\n' "$LOCAL_APPROVAL_PATH"
+)
+
+# Return a repository root visible to the daemon running a controller.
+resolve_controller_host_root() {
+  local root="$1"
+
+  if [[ -n "${CAPSULE_HOST_WORKDIR:-}" ]]; then
+    printf '%s\n' "$CAPSULE_HOST_WORKDIR"
+    return
+  fi
+  resolve_approval_path "$root"
+}
+
+# Write one non-interactive Capsule approval using its daemon-visible path.
+write_approval_config() {
+  local config_file="$1"
+  local path="$2"
+
+  resolve_approval_path "$path" >"$config_file"
 }
 
 # Record a failed assertion and print it to stderr.
@@ -106,6 +169,63 @@ assert_file_contains() {
   else
     fail "$msg (missing: $needle)"
   fi
+}
+
+# Assert that a file does not contain a fixed string.
+assert_file_not_contains() {
+  local file="$1"
+  local needle="$2"
+  local msg="$3"
+  if grep -Fq -- "$needle" "$file"; then
+    fail "$msg (unexpected: $needle)"
+  else
+    pass "$msg"
+  fi
+}
+
+# Assert equality for path-resolution checks.
+assert_equals() {
+  local expected="$1"
+  local actual="$2"
+  local msg="$3"
+  if [[ "$expected" == "$actual" ]]; then
+    pass "$msg"
+  else
+    fail "$msg (expected=$expected actual=$actual)"
+  fi
+}
+
+# Verify E2E approvals use the same mapped path Capsule checks.
+test_approval_path_resolution() {
+  local controller_root=""
+  local mapped=""
+  local nested_root=""
+
+  mapped="$(
+    CAPSULE_HOST_WORKDIR='' \
+      CAPSULE_HOST_PATH_MAP='/workspace=/var/lib/docker/workspace' \
+      resolve_approval_path '/workspace/tests/fixtures/example-project'
+  )"
+  assert_equals \
+    '/var/lib/docker/workspace/tests/fixtures/example-project' \
+    "$mapped" \
+    "E2E approvals use daemon-visible host paths"
+
+  controller_root="$(
+    CAPSULE_HOST_WORKDIR='' \
+      CAPSULE_HOST_PATH_MAP='/workspace=/var/lib/docker/workspace' \
+      resolve_controller_host_root '/workspace'
+  )"
+  assert_equals '/var/lib/docker/workspace' "$controller_root" \
+    "controller root uses mapped resolution as a fallback"
+
+  nested_root="$(
+    CAPSULE_HOST_WORKDIR='/host/workspace' \
+      CAPSULE_HOST_PATH_MAP='/home/workspace=/wrong/path' \
+      resolve_controller_host_root '/home/workspace'
+  )"
+  assert_equals '/host/workspace' "$nested_root" \
+    "nested controller root preserves the daemon-visible path"
 }
 
 # Check whether Docker, Compose, and the daemon are available for e2e tests.
@@ -169,13 +289,15 @@ test_podman_backend_end_to_end() {
     "$EXAMPLE_PROJECT_DIR/check-env.sh" \
     "$EXAMPLE_PROJECT_DIR/fixture.txt" \
     "$workspace/"
-  printf '%s\n' "$workspace" >"$config_file"
+  write_approval_config "$config_file" "$workspace"
 
   # The inner engine has to answer, and the workspace has to be writable as
   # the caller: those are the two properties the backend exists for.
   # shellcheck disable=SC2016
   check_cmd='read -r payload && [[ "$payload" == "capsule stdin ok" ]]'
   check_cmd+=' && printf "capsule stdin ok\n" && bash ./check-env.sh'
+  check_cmd="$check_cmd && [[ \"\${CUSTOM_CAPSULE_IMAGE:-}\" == \"1\" ]]"
+  check_cmd="$check_cmd && [[ \"\${CUSTOM_CAPSULE_PROFILE:-}\" == \"1\" ]]"
   check_cmd="$check_cmd && touch written-by-capsule"
   check_cmd="$check_cmd && capsule-docker status"
   check_cmd="$check_cmd && docker run --rm alpine:3.20 echo capsule inner ok"
@@ -185,8 +307,10 @@ test_podman_backend_end_to_end() {
   if printf 'capsule stdin ok\n' | run_logged bash -c '
     unset CAPSULE_WORKDIR
     cd "$1" &&
-      CAPSULE_CONFIG="$2" CAPSULE_RUNTIME=podman "$3" --build bash -lc "$4"
-  ' bash "$workspace" "$config_file" "$SCRIPT_PATH" "$check_cmd"; then
+      CAPSULE_CONFIG="$2" CAPSULE_RUNTIME=podman \
+      "$3" --build --profile "$4" bash -lc "$5"
+  ' bash "$workspace" "$config_file" "$SCRIPT_PATH" \
+    "$PROFILE_CAPSULE_DIR" "$check_cmd"; then
     assert_file_contains "$LOG_FILE" \
       "capsule stdin ok" \
       "the Podman-backed Capsule preserves piped stdin end to end"
@@ -204,6 +328,158 @@ test_podman_backend_end_to_end() {
   fi
 }
 
+# Verify profile image and runtime settings through the Docker backend.
+test_profile_end_to_end() {
+  local tdir="$TEST_TMPDIR/profile-e2e"
+  local config_file="$tdir/config"
+  mkdir -p "$tdir"
+  log_message "Starting test_profile_end_to_end"
+
+  if ! require_docker_prereqs "profile e2e"; then
+    return
+  fi
+
+  write_approval_config "$config_file" "$EXAMPLE_PROJECT_DIR"
+  log_message "Building and running the Docker profile through both selectors"
+  # shellcheck disable=SC2016
+  if run_logged bash -c '
+    unset CAPSULE_WORKDIR CAPSULE_PROFILES
+    cd "$1" &&
+      CAPSULE_CONFIG="$2" CAPSULE_RUNTIME=docker \
+      "$3" build --custom --profile "$4" &&
+      CAPSULE_CONFIG="$2" CAPSULE_RUNTIME=docker \
+      "$3" --profile "$4" capsule-profile-sentinel cli &&
+      CAPSULE_CONFIG="$2" CAPSULE_RUNTIME=docker CAPSULE_PROFILES="$4" \
+      "$3" capsule-profile-sentinel env
+  ' bash "$EXAMPLE_PROJECT_DIR" "$config_file" "$SCRIPT_PATH" \
+    "$PROFILE_CAPSULE_DIR"; then
+    assert_file_contains "$LOG_FILE" \
+      "profile sentinel cli" \
+      "a built Docker profile runs its sentinel through --profile"
+    assert_file_contains "$LOG_FILE" \
+      "profile sentinel env" \
+      "CAPSULE_PROFILES selects the same built Docker profile"
+  else
+    fail "profiles build and run end to end through Docker"
+  fi
+}
+
+# Verify an absent generated image fails before Compose creates a container.
+test_unbuilt_profile_fails_before_container_creation() {
+  local tdir="$TEST_TMPDIR/profile-unbuilt-e2e"
+  local profile_dir="$tdir/profile"
+  local config_file="$tdir/config"
+  local command_log="$tdir/docker-commands"
+  local mock_bin="$tdir/bin"
+  local real_docker=""
+  local token=""
+  local image=""
+  mkdir -p "$profile_dir" "$mock_bin"
+  log_message "Starting test_unbuilt_profile_fails_before_container_creation"
+
+  if ! require_docker_prereqs "unbuilt profile e2e"; then
+    return
+  fi
+
+  cat >"$profile_dir/capsule.toml" <<'EOF'
+version = 1
+name = "unbuilt-e2e"
+
+[dockerfile]
+content = '''
+RUN true
+'''
+EOF
+  write_approval_config "$config_file" "$EXAMPLE_PROJECT_DIR"
+  token="$(printf '%s\n' "$profile_dir" | cksum | cut -d' ' -f1)"
+  printf -v token '%08x' "$token"
+  image="casual-capsule-p-unbuilt-e2e-${token}:local"
+  docker image rm -f "$image" >/dev/null 2>&1 || true
+  real_docker="$(command -v docker)"
+  : >"$command_log"
+
+  cat >"$mock_bin/docker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${DOCKER_COMMAND_LOG:?}"
+exec "${REAL_DOCKER:?}" "$@"
+EOF
+  chmod +x "$mock_bin/docker"
+
+  if run_logged env \
+    REAL_DOCKER="$real_docker" DOCKER_COMMAND_LOG="$command_log" \
+    PATH="$mock_bin:$PATH" \
+    CAPSULE_CONFIG="$config_file" CAPSULE_RUNTIME=docker \
+    CAPSULE_WORKDIR="$EXAMPLE_PROJECT_DIR" \
+    "$SCRIPT_PATH" --profile "$profile_dir" true; then
+    fail "an unbuilt Docker profile is rejected"
+  else
+    pass "an unbuilt Docker profile is rejected"
+  fi
+  assert_file_contains "$LOG_FILE" \
+    "capsule build --profile $profile_dir --runtime docker" \
+    "the unbuilt profile error gives the exact build command"
+  assert_file_not_contains "$command_log" 'compose' \
+    "an unbuilt profile fails before Compose creates a container"
+}
+
+# Run Capsule from a plain controller container against the host daemon.
+test_profile_from_docker_controller_container() {
+  local host_root=""
+  local host_workspace=""
+  local host_uid=""
+  local host_gid=""
+  host_root="$(resolve_controller_host_root "$ROOT_DIR")"
+  host_workspace="$host_root/tests/fixtures/example-project"
+  mkdir -p "$TEST_TMPDIR/profile-controller-e2e"
+  log_message "Starting test_profile_from_docker_controller_container"
+
+  if ! require_docker_prereqs "controller container profile e2e"; then
+    return
+  fi
+  if [[ ! -S /var/run/docker.sock ]]; then
+    skip "controller container profile e2e requires /var/run/docker.sock"
+    return
+  fi
+  if ! docker image inspect casual-capsule-cli:latest >/dev/null 2>&1; then
+    skip "controller container profile e2e requires the base image"
+    return
+  fi
+
+  host_uid="$(id -u)"
+  host_gid="$(id -g)"
+  # shellcheck disable=SC2016
+  if run_logged docker run --rm \
+    --entrypoint bash \
+    --volume "$host_root:/controller/repo:ro" \
+    --volume /var/run/docker.sock:/controller/docker.sock \
+    --env "CAPSULE_UID=$host_uid" \
+    --env "CAPSULE_GID=$host_gid" \
+    --env GITHUB_API_TOKEN \
+    casual-capsule-cli:latest -c '
+      set -euo pipefail
+      mkdir -p /tmp/controller-bin
+      ln -s /usr/bin/docker /tmp/controller-bin/docker
+      export PATH="/tmp/controller-bin:$PATH"
+      export DOCKER_HOST=unix:///controller/docker.sock
+      export CAPSULE_HOST_PATH_MAP="/controller/repo=$4"
+      printf "%s\n" "$3" >/tmp/capsule-approvals
+      cd /controller/repo/tests/fixtures/example-project
+      CAPSULE_CONFIG=/tmp/capsule-approvals CAPSULE_RUNTIME=docker \
+        "$1" --build-custom --profile "$2" \
+        capsule-profile-sentinel controller
+    ' bash \
+    /controller/repo/capsule.sh \
+    /controller/repo/tests/fixtures/profile-capsule \
+    "$host_workspace" "$host_root"; then
+    assert_file_contains "$LOG_FILE" \
+      "profile sentinel controller" \
+      "a non-Capsule controller runs the selected Docker profile image"
+  else
+    fail "a non-Capsule controller runs a Docker profile"
+  fi
+}
+
 # Verify that capsule.sh can run the example project end to end.
 test_example_project_end_to_end() {
   local tdir="$TEST_TMPDIR/example-project-e2e"
@@ -218,7 +494,7 @@ test_example_project_end_to_end() {
     return
   fi
 
-  printf '%s\n' "$EXAMPLE_PROJECT_DIR" >"$config_file"
+  write_approval_config "$config_file" "$EXAMPLE_PROJECT_DIR"
   printf '%s\n' "$token" >"$token_file"
   check_cmd="bash ./check-env.sh && grep -Fxq '$token' e2e-token.txt"
 
@@ -251,7 +527,7 @@ test_custom_compose_end_to_end() {
     return
   fi
 
-  printf '%s\n' "$EXAMPLE_PROJECT_DIR" >"$config_file"
+  write_approval_config "$config_file" "$EXAMPLE_PROJECT_DIR"
   # shellcheck disable=SC2016
   check_cmd='bash ./check-env.sh && [[ "${CUSTOM_CAPSULE_IMAGE:-}" == "1" ]]'
   check_cmd="$check_cmd && [[ \"\${CUSTOM_CAPSULE_COMPOSE:-}\" == \"1\" ]]"
@@ -287,7 +563,7 @@ test_custom_compose_build_custom_end_to_end() {
     return
   fi
 
-  printf '%s\n' "$EXAMPLE_PROJECT_DIR" >"$config_file"
+  write_approval_config "$config_file" "$EXAMPLE_PROJECT_DIR"
   # shellcheck disable=SC2016
   check_cmd='bash ./check-env.sh && [[ "${CUSTOM_CAPSULE_IMAGE:-}" == "1" ]]'
   check_cmd="$check_cmd && [[ \"\${CUSTOM_CAPSULE_COMPOSE:-}\" == \"1\" ]]"
@@ -313,10 +589,16 @@ test_custom_compose_build_custom_end_to_end() {
 # Run the suite, print the logfile path, and report the final summary.
 main() {
   log_message "Suite started"
+  test_approval_path_resolution
   test_example_project_end_to_end
   test_custom_compose_end_to_end
   test_custom_compose_build_custom_end_to_end
+  test_profile_end_to_end
+  test_unbuilt_profile_fails_before_container_creation
+  test_profile_from_docker_controller_container
   test_podman_backend_end_to_end
+  cleanup_test_images
+  trap - EXIT
 
   log_message \
     "Summary: $PASS_COUNT passed, $FAIL_COUNT failed, $SKIP_COUNT skipped"
@@ -330,4 +612,4 @@ main() {
   [[ "$FAIL_COUNT" -eq 0 ]]
 }
 
-main "$@"
+main "$@" </dev/null

@@ -1,0 +1,14 @@
+version = 1
+name = "test-profile"
+
+[env]
+CUSTOM_CAPSULE_PROFILE = "1"
+
+[dockerfile]
+content = '''
+ENV CUSTOM_CAPSULE_IMAGE=1
+RUN printf '%s\n' '#!/bin/sh' \
+      'printf "profile sentinel %s\n" "$*"' \
+      > /usr/local/bin/capsule-profile-sentinel && \
+    chmod 0755 /usr/local/bin/capsule-profile-sentinel
+'''
