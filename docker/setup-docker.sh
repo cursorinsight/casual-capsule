@@ -18,7 +18,16 @@ echo "deb [arch=$(dpkg --print-architecture) " \
      > /etc/apt/sources.list.d/docker.list
 
 apt-get update
-apt-get -y --no-install-recommends install \
-        docker-buildx-plugin docker-ce-cli docker-compose-plugin
+# Install the Docker client stack, and the Docker Engine itself only when
+# the image is built for it. The Engine is the heavier of the Capsule's two
+# inner engines and only some projects need true Engine behaviour, so
+# CAPSULE_WITH_DOCKERD decides whether it is present.
+packages="docker-buildx-plugin docker-ce-cli docker-compose-plugin"
+if [ "${CAPSULE_WITH_DOCKERD:-0}" = "1" ]; then
+    packages="${packages} docker-ce docker-ce-rootless-extras"
+fi
+
+# shellcheck disable=SC2086
+apt-get -y --no-install-recommends install ${packages}
 
 rm -rf "$0" /var/lib/apt/lists/*

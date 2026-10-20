@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ -n "${CAPSULE_ROOT:-}" ]] || {
+  printf 'capsule: error: run this command through capsule\n' >&2
+  exit 1
+}
+
+# shellcheck source=lib/capsule/common.sh
+# shellcheck disable=SC1091
+source "$CAPSULE_ROOT/lib/capsule/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: capsule build [options]
+
+Options:
+      --all                 Build base and configured custom image (default).
+      --custom              Build only the configured custom image.
+      --no-cache            Disable build cache.
+  -r, --remote HOST[:PORT]  Build on a remote Docker host over SSH.
+      --runtime RUNTIME     Use auto, docker, or podman (default: auto).
+  -h, --help                Show this help message.
+
+Environment:
+  CAPSULE_BUILD, CAPSULE_BUILD_CUSTOM, CAPSULE_NO_CACHE
+  CAPSULE_REMOTE, CAPSULE_RUNTIME, CAPSULE_CUSTOM_COMPOSE
+EOF
+}
+
+args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --all)
+      args+=(--build)
+      shift
+      ;;
+    --custom)
+      args+=(--build-custom)
+      shift
+      ;;
+    --no-cache)
+      args+=("$1")
+      shift
+      ;;
+    -r|--remote|--runtime)
+      if [[ $# -lt 2 ]] || [[ "${2:-}" == -* ]]; then
+        die "$1 requires a value"
+      fi
+      args+=("$1" "$2")
+      shift 2
+      ;;
+    --remote=*|--runtime=*)
+      args+=("$1")
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown build option: $1"
+      ;;
+  esac
+done
+
+BUILD_ONLY=1 main "${args[@]+${args[@]}}"
