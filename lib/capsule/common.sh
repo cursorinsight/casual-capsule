@@ -26,6 +26,10 @@ readonly CAPSULE_INNER_DIR="/var/lib/capsule/inner"
 readonly CAPSULE_HOST_SOCKET="/var/lib/capsule/docker.sock"
 readonly CAPSULE_SECRET_PATH="/run/secrets/github_api_token"
 
+# shellcheck source=lib/capsule/profile.sh
+# shellcheck disable=SC1091
+source "$CAPSULE_ROOT/lib/capsule/profile.sh"
+
 # Mutable runtime state. main() initializes these before use.
 BUILD_MODE=""
 BUILD_MODE_FLAG=""
@@ -51,6 +55,7 @@ PODMAN_SECRET_FILE=""
 PODMAN_INFO_OUTPUT=""
 BASE_COMPOSE_CMD=()
 COMPOSE_CMD=()
+CAPSULE_PROFILE_HOME=""
 
 # Print a Capsule error and exit.
 die() {
@@ -61,6 +66,16 @@ die() {
 # Print a Capsule warning.
 warn() {
   printf 'capsule: warning: %s\n' "$*" >&2
+}
+
+# Reject invalid XDG base directories before using them for trusted state.
+validate_xdg_path() {
+  local name="$1"
+  local value="${!name:-}"
+
+  if [[ -n "$value" && "$value" != /* ]]; then
+    die "$name must be an absolute path: $value"
+  fi
 }
 
 # Return success when a boolean environment option is enabled.
@@ -264,6 +279,7 @@ initialize_runtime_state() {
   PODMAN_INFO_OUTPUT=""
   BASE_COMPOSE_CMD=()
   COMPOSE_CMD=()
+  initialize_profile_state
   unset CAPSULE_HOME_MOUNT 2>/dev/null || true
 }
 
@@ -296,14 +312,15 @@ Usage: capsule run [options] [--] [command...]
        capsule [options] [--] [command...]
 
 Options:
-  -b, --build  Run "docker compose build cli" before runtime.
+  -b, --build  Build base and configured profile/custom image before runtime.
   -p, --private-home  Bind-mount a per-user home directory.
+      --profile NAME|PATH  Apply a Capsule profile. Repeatable.
       --publish HOST[:CONTAINER]  Publish port on host machine. Repeatable.
   -r, --remote HOST[:PORT]:/abs/path  Run on a remote Docker host over SSH.
       --runtime podman|docker|auto  Backend to run in (default: auto).
       --host-docker  Bind the host Docker socket into the Capsule.
   -v, --volume HOST:CONTAINER[:OPTIONS]  Bind-mount a host path. Repeatable.
-      --build-custom  Run the custom compose build before runtime.
+      --build-custom  Build only the configured profile/custom image first.
       --no-cache  Pass --no-cache to build commands run by this script.
   -h, --help   Show this help message.
 
@@ -319,12 +336,13 @@ Environment:
   CAPSULE_BUILD_CUSTOM  Enable --build-custom when true.
   CAPSULE_NO_CACHE  Enable --no-cache when set to a true value.
   CAPSULE_PRIVATE_HOME  Enable --private-home when true.
+  CAPSULE_PROFILES  Semicolon-separated profile names or directory paths.
   CAPSULE_REMOTE   Remote HOST[:PORT]:/absolute/workdir target.
   CAPSULE_HOST_DOCKER  Enable --host-docker when true.
   CAPSULE_PUBLISH  Semicolon-separated --publish specs.
   CAPSULE_VOLUME   Semicolon-separated --volume specs.
   CAPSULE_WORKDIR  Workspace directory (default: cwd).
-  CAPSULE_CUSTOM_COMPOSE  Optional override compose file.
+  CAPSULE_CUSTOM_COMPOSE  Optional legacy Compose override file.
   CAPSULE_RUNTIME  Backend to run in: auto, podman, or docker.
   CAPSULE_IMAGE    Image tag the podman backend builds and runs.
   CAPSULE_HOME_VOLUME  podman volume mounted at /home/user.
@@ -491,6 +509,20 @@ parse_args() {
         PRIVATE_HOME=1
         shift
         ;;
+      --profile)
+        if [[ $# -lt 2 ]] || [[ -z "${2:-}" ]] || [[ "${2:-}" == -* ]]; then
+          die '--profile requires a name or directory path'
+        fi
+        PROFILE_PATHS+=("$2")
+        shift 2
+        ;;
+      --profile=*)
+        if [[ -z "${1#--profile=}" ]]; then
+          die '--profile requires a name or directory path'
+        fi
+        PROFILE_PATHS+=("${1#--profile=}")
+        shift
+        ;;
       --publish)
         if [[ $# -lt 2 ]] || [[ "${2:-}" == -* ]]; then
           die '--publish requires HOST[:CONTAINER] port parameter'
@@ -573,6 +605,10 @@ configure_custom_compose() {
     return
   fi
 
+  if [[ -n "${PROFILE_DIRS[0]+set}" ]]; then
+    die 'profiles cannot be combined with CAPSULE_CUSTOM_COMPOSE'
+  fi
+
   if [[ ! -e "$CAPSULE_CUSTOM_COMPOSE" ]]; then
     die "custom compose file not found: $CAPSULE_CUSTOM_COMPOSE"
   fi
@@ -596,14 +632,80 @@ configure_custom_compose() {
 
 # Reject build modes that require configuration not currently present.
 validate_build_mode() {
-  if [[ "$BUILD_MODE" == "custom" ]] && [[ -z "$CAPSULE_CUSTOM_COMPOSE" ]]; then
-    die '--build-custom requires CAPSULE_CUSTOM_COMPOSE'
+  if [[ "$BUILD_MODE" == "custom" ]] && \
+    [[ -z "$CAPSULE_CUSTOM_COMPOSE" ]] && \
+    [[ -z "${PROFILE_DIRS[0]+set}" ]]; then
+    die '--build-custom requires a profile or CAPSULE_CUSTOM_COMPOSE'
   fi
 }
 
-# Initialize the allowlist file location and its parent directory.
+# Move the legacy approval file out of the new config directory's path.
+migrate_legacy_capsule_config() {
+  local legacy_path="$1"
+  local destination="$2"
+  local temporary="${legacy_path}.migration"
+
+  if [[ -L "$legacy_path" ]]; then
+    die 'replace legacy config symlink with a regular approval file before' \
+      "retrying: $legacy_path"
+  fi
+  if [[ -e "$temporary" || -L "$temporary" ]]; then
+    if [[ -L "$temporary" || ! -f "$temporary" ]]; then
+      die "legacy config recovery path is not a file: $temporary"
+    fi
+    if [[ -e "$destination" || -L "$destination" ]]; then
+      die "legacy config recovery destination exists: $destination"
+    fi
+    if [[ -e "$legacy_path" && ! -d "$legacy_path" ]]; then
+      die "legacy config and recovery file both exist: $legacy_path"
+    fi
+  else
+    if [[ -d "$legacy_path" ]] || [[ ! -e "$legacy_path" ]]; then
+      return
+    fi
+    if [[ ! -f "$legacy_path" ]]; then
+      die "legacy config path is not a file: $legacy_path"
+    fi
+    if ! mv "$legacy_path" "$temporary"; then
+      die "cannot prepare legacy config migration: $legacy_path"
+    fi
+  fi
+  if ! mkdir -p "$(dirname -- "$destination")"; then
+    die "cannot create config directory: $(dirname -- "$destination")"
+  fi
+  if ! mv "$temporary" "$destination"; then
+    die "cannot migrate legacy config to: $destination"
+  fi
+  warn "migrated approval list to $destination"
+}
+
+# Initialize standard config locations before profiles are resolved.
+initialize_capsule_paths() {
+  local config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+  local config_dir=""
+  local default_config=""
+
+  validate_xdg_path XDG_CONFIG_HOME
+  validate_xdg_path XDG_CACHE_HOME
+  validate_xdg_path XDG_RUNTIME_DIR
+
+  config_home="$(trim_trailing_slash "$config_home")"
+  config_dir="$(join_host_path "$config_home" "/capsule")"
+  default_config="$config_dir/approved-directories"
+
+  # Read by resolve_profile_dir() in the sourced profile module.
+  # shellcheck disable=SC2034
+  CAPSULE_PROFILE_HOME="$config_dir/profiles"
+  if [[ -z "${CAPSULE_CONFIG:-}" ]]; then
+    if [[ "$config_dir" == "$HOME/.config/capsule" ]]; then
+      migrate_legacy_capsule_config "$config_dir" "$default_config"
+    fi
+    CAPSULE_CONFIG="$default_config"
+  fi
+}
+
+# Create the allowlist file's parent directory when a run needs it.
 initialize_capsule_config() {
-  CAPSULE_CONFIG="${CAPSULE_CONFIG:-"${HOME}/.config/capsule"}"
   mkdir -p "$(dirname -- "$CAPSULE_CONFIG")"
 }
 
@@ -909,6 +1011,38 @@ podman_vm_path_reason() {
   fi
 }
 
+# Print the first profile path a podman machine cannot access.
+podman_vm_profile_reason() {
+  local index=0
+  local profile_dir=""
+  local reason=""
+  local source=""
+
+  for profile_dir in ${PROFILE_DIRS[@]+"${PROFILE_DIRS[@]}"}; do
+    reason="$(podman_vm_path_reason "$profile_dir" 'a profile directory')"
+    if [[ -n "$reason" ]]; then
+      printf '%s\n' "$reason"
+      return
+    fi
+  done
+
+  [[ "$BUILD_ONLY" -eq 1 ]] && return
+
+  while [[ -n "${PROFILE_VOLUME_SPECS[$index]+set}" ]]; do
+    source="${PROFILE_VOLUME_SPECS[$index]%%:*}"
+    source="$(
+      profile_absolute_source \
+        "$source" "${PROFILE_VOLUME_DIRS[$index]}"
+    )"
+    reason="$(podman_vm_path_reason "$source" 'a profile volume source')"
+    if [[ -n "$reason" ]]; then
+      printf '%s\n' "$reason"
+      return
+    fi
+    index=$((index + 1))
+  done
+}
+
 # Capture how podman sees itself, once, for the checks that read it. One
 # call answers both questions that matter: whether it is rootless, and
 # whether this user has a sub-id range to map containers into.
@@ -948,6 +1082,10 @@ resolve_runtime_backend() {
 
   if [[ -z "$reason" ]]; then
     reason="$(podman_vm_path_reason "$CAPSULE_HOST_WORKDIR" 'the workspace')"
+  fi
+
+  if [[ -z "$reason" ]]; then
+    reason="$(podman_vm_profile_reason)"
   fi
 
   if [[ -z "$reason" ]]; then
@@ -997,11 +1135,16 @@ path_token() {
 # Return a container name that is readable in "podman ps" and unique per run.
 podman_container_name() {
   local workspace_name=""
+  local namespace=""
 
   workspace_name="$(basename -- "$CAPSULE_HOST_WORKDIR")"
   workspace_name="$(printf '%s' "$workspace_name" | tr -c 'A-Za-z0-9_-' '-')"
+  if [[ -n "$PROFILE_NAMESPACE" ]]; then
+    namespace="-${PROFILE_NAMESPACE}"
+  fi
 
-  printf 'capsule-%s-%s\n' "${workspace_name:-workspace}" "$$"
+  printf 'capsule-%s%s-%s\n' \
+    "${workspace_name:-workspace}" "$namespace" "$$"
 }
 
 # Return the volume holding this workspace's inner engine state.
@@ -1010,6 +1153,7 @@ podman_container_name() {
 # volumes and containers, and two projects never share an engine's storage.
 podman_inner_volume() {
   local workspace_name=""
+  local namespace=""
 
   if [[ -n "${CAPSULE_INNER_VOLUME:-}" ]]; then
     printf '%s\n' "$CAPSULE_INNER_VOLUME"
@@ -1018,19 +1162,32 @@ podman_inner_volume() {
 
   workspace_name="$(basename -- "$CAPSULE_HOST_WORKDIR")"
   workspace_name="$(printf '%s' "$workspace_name" | tr -c 'A-Za-z0-9_-' '-')"
+  if [[ -n "$PROFILE_NAMESPACE" ]]; then
+    namespace="-${PROFILE_NAMESPACE}"
+  fi
 
-  printf 'capsule-inner-%s-%s\n' \
-    "${workspace_name:-workspace}" "$(path_token "$CAPSULE_HOST_WORKDIR")"
+  printf 'capsule-inner-%s%s-%s\n' \
+    "${workspace_name:-workspace}" \
+    "$namespace" \
+    "$(path_token "$CAPSULE_HOST_WORKDIR")"
 }
 
-# Write the GitHub token where podman can mount it as the runtime secret the
-# entrypoint reads. It lives under the user home because a podman machine
-# shares that path with its guest.
+# Write the GitHub token where podman can mount it as a runtime secret.
 configure_podman_secret() {
-  local secret_dir="${HOME}/.capsule"
+  local cache_home="${XDG_CACHE_HOME:-$HOME/.cache}"
+  local secret_dir=""
 
   if [[ -z "${GITHUB_API_TOKEN:+set}" ]]; then
     return
+  fi
+
+  # A macOS podman machine shares HOME, not arbitrary host cache paths.
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    secret_dir="$HOME/.cache/capsule/runtime"
+  elif [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+    secret_dir="$cache_home/capsule/runtime"
+  else
+    secret_dir="$XDG_RUNTIME_DIR/capsule"
   fi
 
   mkdir -p "$secret_dir"
@@ -1051,13 +1208,19 @@ cleanup_podman_state() {
   fi
 }
 
+# Remove all per-run files created for container startup.
+cleanup_runtime_state() {
+  cleanup_podman_state
+  cleanup_profile_environment
+}
+
 # Fail early when the local image was never built, because podman would
 # otherwise try to pull a tag that exists on no registry.
 require_podman_image() {
   local image=""
 
-  image="$(podman_image_name)"
-  if [[ -n "${CAPSULE_IMAGE:-}" ]]; then
+  image="$(podman_runtime_image_name)"
+  if [[ -n "${CAPSULE_IMAGE:-}" && "$PROFILE_HAS_FRAGMENT" -eq 0 ]]; then
     return
   fi
 
@@ -1066,6 +1229,15 @@ require_podman_image() {
   fi
 
   die "image ${image} is not built; run: capsule build"
+}
+
+# Return the image selected after applying image-building profiles.
+podman_runtime_image_name() {
+  if [[ "$PROFILE_HAS_FRAGMENT" -eq 1 ]]; then
+    printf '%s\n' "$PROFILE_IMAGE"
+    return
+  fi
+  podman_image_name
 }
 
 # Build the Capsule image with podman, handing it the token as a build
@@ -1107,7 +1279,7 @@ run_podman_build() {
   podman "${build_args[@]}" "$SCRIPT_DIR"
 }
 
-# Translate the collected --publish/--volume options into podman flags.
+# Translate backend-neutral runtime options into podman flags.
 append_podman_runtime_options() {
   local index=0
   local option=""
@@ -1121,6 +1293,9 @@ append_podman_runtime_options() {
     case "$option" in
       --publish) PODMAN_RUN_ARGS+=(--publish "$value") ;;
       --volume) PODMAN_RUN_ARGS+=(--volume "$value") ;;
+      --env) PODMAN_RUN_ARGS+=(--env "$value") ;;
+      --env-file) PODMAN_RUN_ARGS+=(--env-file "$value") ;;
+      --add-host) PODMAN_RUN_ARGS+=(--add-host "$value") ;;
       *) die "unsupported runtime option for podman: $option" ;;
     esac
   done
@@ -1206,9 +1381,18 @@ build_podman_run_args() {
   fi
 
   append_podman_host_docker
+  if [[ "$PROFILE_GPU" == "all" ]]; then
+    PODMAN_RUN_ARGS+=(--device nvidia.com/gpu=all)
+  fi
+  if [[ -n "${PROFILE_RUNTIME_OPTS[0]+set}" ]]; then
+    RUNTIME_OPTS=(
+      "${PROFILE_RUNTIME_OPTS[@]}"
+      ${RUNTIME_OPTS[@]+"${RUNTIME_OPTS[@]}"}
+    )
+  fi
   append_podman_runtime_options
 
-  PODMAN_RUN_ARGS+=("$(podman_image_name)")
+  PODMAN_RUN_ARGS+=("$(podman_runtime_image_name)")
 
   if [[ "${#RUNTIME_ARGS[@]}" -gt 0 ]]; then
     PODMAN_RUN_ARGS+=("${RUNTIME_ARGS[@]}")
@@ -1223,15 +1407,18 @@ run_podman_backend() {
   configure_nested_podman_workdir
   PODMAN_CONTAINER_NAME="$(podman_container_name)"
   configure_podman_secret
-  trap cleanup_podman_state EXIT INT TERM
+  trap cleanup_runtime_state EXIT INT TERM
 
-  if [[ "$BUILD_MODE" != "none" ]]; then
+  if [[ "$BUILD_MODE" == "all" ]]; then
     mise_version="$(fetch_mise_version)"
     run_podman_build "$mise_version"
   fi
+  if [[ "$BUILD_MODE" == "all" || "$BUILD_MODE" == "custom" ]]; then
+    run_profile_build podman "$(podman_image_name)"
+  fi
 
   if [[ "$BUILD_ONLY" -eq 1 ]]; then
-    cleanup_podman_state
+    cleanup_runtime_state
     return
   fi
 
@@ -1239,7 +1426,7 @@ run_podman_backend() {
   build_podman_run_args
   podman "${PODMAN_RUN_ARGS[@]}" || exit_code=$?
 
-  cleanup_podman_state
+  cleanup_runtime_state
   return "$exit_code"
 }
 
@@ -1249,13 +1436,34 @@ initialize_compose_commands() {
     docker compose
     -f "$SCRIPT_DIR/compose.yml"
   )
+  COMPOSE_CMD=(
+    docker compose
+    -f "$SCRIPT_DIR/compose.yml"
+  )
+  if [[ -n "${PROFILE_DIRS[0]+set}" ]]; then
+    BASE_COMPOSE_CMD=(
+      docker compose
+      --project-name "$PROFILE_BASE_PROJECT_NAME"
+      -f "$SCRIPT_DIR/compose.yml"
+    )
+    COMPOSE_CMD=(
+      docker compose
+      --project-name "$CAPSULE_COMPOSE_PROJECT_NAME"
+      -f "$SCRIPT_DIR/compose.yml"
+    )
+  fi
   if [[ -n "${GITHUB_API_TOKEN:+set}" ]]; then
     BASE_COMPOSE_CMD+=(-f "$SCRIPT_DIR/compose.github-token.yml")
+    COMPOSE_CMD+=(-f "$SCRIPT_DIR/compose.github-token.yml")
   fi
-
-  COMPOSE_CMD=("${BASE_COMPOSE_CMD[@]}")
   if [[ -n "$CAPSULE_CUSTOM_COMPOSE" ]]; then
     COMPOSE_CMD+=(-f "$CAPSULE_CUSTOM_COMPOSE")
+  fi
+  if [[ -n "$PROFILE_COMPOSE_OVERRIDE" ]]; then
+    COMPOSE_CMD+=( -f "$PROFILE_COMPOSE_OVERRIDE" )
+  fi
+  if [[ "$PROFILE_GPU" == "all" ]]; then
+    COMPOSE_CMD+=( -f "$SCRIPT_DIR/docker/compose-nvidia.yml" )
   fi
 }
 
@@ -1297,19 +1505,95 @@ run_requested_builds() {
     run_compose_build "$mise_version" "${BASE_COMPOSE_CMD[@]}"
     if [[ -n "$CAPSULE_CUSTOM_COMPOSE" ]]; then
       run_compose_build "$mise_version" "${COMPOSE_CMD[@]}"
+    elif [[ "$PROFILE_HAS_FRAGMENT" -eq 1 ]]; then
+      run_profile_build docker "$(docker_base_image_name)"
     fi
   fi
 
   if [[ "$BUILD_MODE" == "custom" ]]; then
-    run_compose_build "$mise_version" "${COMPOSE_CMD[@]}"
+    if [[ -n "$CAPSULE_CUSTOM_COMPOSE" ]]; then
+      run_compose_build "$mise_version" "${COMPOSE_CMD[@]}"
+    else
+      run_profile_build docker "$(docker_base_image_name)"
+    fi
   fi
 }
 
-# Exec the runtime container, preserving any user-supplied command.
+# Print the command that builds the selected Docker profile image.
+docker_profile_build_command() {
+  local command="capsule build"
+  local profile_dir=""
+  local quoted=""
+
+  for profile_dir in ${PROFILE_DIRS[@]+"${PROFILE_DIRS[@]}"}; do
+    printf -v quoted '%q' "$profile_dir"
+    command="$command --profile $quoted"
+  done
+  command="$command --runtime docker"
+  if [[ -n "$REMOTE_HOST" ]]; then
+    printf -v quoted '%q' "$REMOTE_HOST"
+    command="$command --remote $quoted"
+  fi
+  printf '%s\n' "$command"
+}
+
+# Refuse to let Compose fall back to the base image for a profile runtime.
+require_docker_profile_image() {
+  local inspect_error=""
+
+  [[ "$PROFILE_HAS_FRAGMENT" -eq 1 ]] || return 0
+
+  if inspect_error="$(
+    docker image inspect "$PROFILE_IMAGE" 2>&1 >/dev/null
+  )"; then
+    return
+  fi
+
+  if [[ "$inspect_error" == *"No such image"* ]]; then
+    die "profile image ${PROFILE_IMAGE} is not built; run:" \
+      "$(docker_profile_build_command)"
+  fi
+
+  die "unable to inspect profile image ${PROFILE_IMAGE}:" "$inspect_error"
+}
+
+# Run the runtime container and remove per-run files after it exits.
 run_capsule_runtime() {
-  exec "${COMPOSE_CMD[@]}" run --rm \
+  local exit_code=0
+  local runtime_command=()
+  local runtime_pid=""
+
+  runtime_command=(
+    "${COMPOSE_CMD[@]}" run --rm
+    ${PROFILE_RUNTIME_OPTS[@]+"${PROFILE_RUNTIME_OPTS[@]}"} \
     "${RUNTIME_OPTS[@]+${RUNTIME_OPTS[@]}}" \
     cli "${RUNTIME_ARGS[@]+${RUNTIME_ARGS[@]}}"
+  )
+  if [[ -z "$PROFILE_ENV_FILE" ]]; then
+    exec "${runtime_command[@]}"
+  fi
+
+  (
+    trap - INT TERM
+    exec "${runtime_command[@]}"
+  ) <&0 &
+  runtime_pid=$!
+  trap 'kill -INT "$runtime_pid" 2>/dev/null || true' INT
+  trap 'kill -TERM "$runtime_pid" 2>/dev/null || true' TERM
+  while true; do
+    if wait "$runtime_pid"; then
+      exit_code=0
+      break
+    else
+      exit_code=$?
+    fi
+    if ! kill -0 "$runtime_pid" 2>/dev/null; then
+      break
+    fi
+  done
+  trap - INT TERM
+  cleanup_runtime_state
+  return "$exit_code"
 }
 
 main() {
@@ -1317,6 +1601,7 @@ main() {
 
   initialize_runtime_state
   apply_build_option_env
+  apply_profile_env
   if [[ "$BUILD_ONLY" -ne 1 ]]; then
     apply_run_option_env
     append_runtime_option_env
@@ -1331,6 +1616,9 @@ main() {
 
   initialize_workdir_state
   initialize_user_ids
+  initialize_capsule_paths
+  configure_profiles
+  apply_profile_namespace
   configure_custom_compose
   validate_build_mode
   if [[ "$BUILD_ONLY" -ne 1 ]]; then
@@ -1339,6 +1627,15 @@ main() {
   configure_target_mode
 
   resolve_runtime_backend
+  if [[ "$RUNTIME_BACKEND" == "podman" ]]; then
+    # Consumed by generate_profile_build_files from the sourced profile module.
+    # shellcheck disable=SC2034
+    PROFILE_BASE_IMAGE="$(podman_image_name)"
+  fi
+  generate_profile_build_files
+  if [[ "$BUILD_ONLY" -ne 1 ]]; then
+    configure_profile_runtime
+  fi
 
   if [[ "$BUILD_ONLY" -ne 1 ]] && [[ "$PRIVATE_HOME" -eq 1 ]]; then
     configure_private_home
@@ -1353,7 +1650,9 @@ main() {
   initialize_compose_commands
 
   if [[ "$BUILD_MODE" != "none" ]]; then
-    mise_version="$(fetch_mise_version)"
+    if [[ "$BUILD_MODE" == "all" || -n "$CAPSULE_CUSTOM_COMPOSE" ]]; then
+      mise_version="$(fetch_mise_version)"
+    fi
     run_requested_builds "$mise_version"
   fi
 
@@ -1361,5 +1660,6 @@ main() {
     return
   fi
 
+  require_docker_profile_image
   run_capsule_runtime
 }

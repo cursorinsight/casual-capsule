@@ -84,7 +84,13 @@ check_docker() {
       'install the docker-compose-plugin package'
     return 0
   fi
-  pass 'docker compose v2 is available'
+  if ! docker compose run --help 2>/dev/null |
+    grep -F -- '--env-from-file' >/dev/null; then
+    warn 'docker compose lacks run --env-from-file' \
+      'upgrade Docker Compose to 2.34.0 or newer'
+    return 0
+  fi
+  pass 'docker compose supports profile environment files'
 
   if ! docker info >/dev/null 2>&1; then
     warn 'the Docker daemon does not answer' \

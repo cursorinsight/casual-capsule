@@ -83,8 +83,11 @@ Assisted-by: Copilot:claude-sonnet-4.6
   logic.
 - `lib/capsule/podman.sh`: Shared rootless UID/GID capacity checks for the
   launcher, doctor, E2E tests, and CI.
+- `lib/capsule/profile.sh`: Strict profile parser, generated image build, and
+  backend-neutral runtime-option mapping.
 - `libexec/capsule/`: Implementations of the `run`, `build`, `list`, `doctor`,
   and `completion` subcommands.
+- `profiles/`: Ready-to-use backend-neutral Capsule profiles.
 - `docker/entrypoint.sh`: Root entrypoint; syncs UID/GID, Docker socket
   group, nested Podman ID ranges, and home ownership, then execs as `user`.
   Under podman the container already starts as `user`, so it only refreshes
