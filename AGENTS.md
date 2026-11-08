@@ -83,6 +83,8 @@ Assisted-by: Copilot:claude-sonnet-4.6
   logic.
 - `lib/capsule/podman.sh`: Shared rootless UID/GID capacity checks for the
   launcher, doctor, E2E tests, and CI.
+- `lib/capsule/dns.sh`: DNS servers the podman backend passes to
+  Capsules and builds (`CAPSULE_DNS`, else the Mac's resolvers on macOS).
 - `lib/capsule/profile.sh`: Strict profile parser, generated image build, and
   backend-neutral runtime-option mapping.
 - `libexec/capsule/`: Implementations of the `run`, `build`, `list`, `doctor`,
@@ -109,3 +111,5 @@ Assisted-by: Copilot:claude-sonnet-4.6
 - `tests/suite_e2e.sh`: Docker- and podman-backed end-to-end tests;
   the podman case skips where the host cannot run rootless.
 - `tests/test_all.sh`: Runs fast then e2e suites.
+- `tests/lib/harness.sh`: Shared pass/fail/skip reporting, assertions, and
+  summary for the suites and `check_all.sh`.

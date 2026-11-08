@@ -13,6 +13,8 @@ if [[ -z "${CAPSULE_ROOT:-}" ]]; then
 fi
 # shellcheck disable=SC1091
 source "$CAPSULE_ROOT/lib/capsule/podman.sh"
+# shellcheck disable=SC1091
+source "$CAPSULE_ROOT/lib/capsule/dns.sh"
 SCRIPT_DIR="$CAPSULE_ROOT"
 readonly SCRIPT_DIR
 readonly CAPSULE_CONTAINER_WORKDIR="/home/workspace"
@@ -22,8 +24,9 @@ readonly DEFAULT_DOCKER_GID="999"
 readonly DEFAULT_DARWIN_DOCKER_GID="991"
 readonly DEFAULT_PODMAN_IMAGE="casual-capsule:local"
 readonly DEFAULT_PODMAN_HOME_VOLUME="casual-capsule-home"
-readonly CAPSULE_INNER_DIR="/var/lib/capsule/inner"
-readonly CAPSULE_HOST_SOCKET="/var/lib/capsule/docker.sock"
+readonly CAPSULE_INNER_DIR="${CAPSULE_INNER_DIR:-/var/lib/capsule/inner}"
+CAPSULE_HOST_SOCKET="${CAPSULE_HOST_SOCKET:-/var/lib/capsule/docker.sock}"
+readonly CAPSULE_HOST_SOCKET
 readonly CAPSULE_SECRET_PATH="/run/secrets/github_api_token"
 
 # shellcheck source=lib/capsule/profile.sh
@@ -46,6 +49,12 @@ REMOTE_SSH_PORT=""
 REMOTE_WORKDIR=""
 LOCAL_APPROVAL_PATH=""
 IN_NESTED_CAPSULE=0
+OUTER_CAPSULE_WORKDIR=""
+DOCKER_TARGET_SCOPE=""
+DOCKER_TARGET_ENGINE=""
+DOCKER_TARGET_ENDPOINT=""
+BASE_IMAGE_CONTEXT=""
+BASE_IMAGE_OVERRIDE=""
 RUNTIME_SELECTION=""
 RUNTIME_BACKEND=""
 HOST_DOCKER=0
@@ -53,6 +62,7 @@ PODMAN_RUN_ARGS=()
 PODMAN_CONTAINER_NAME=""
 PODMAN_SECRET_FILE=""
 PODMAN_INFO_OUTPUT=""
+DNS_ARGS=()
 BASE_COMPOSE_CMD=()
 COMPOSE_CMD=()
 CAPSULE_PROFILE_HOME=""
@@ -174,6 +184,9 @@ initialize_workdir_state() {
   local mapped_workdir=""
   local original_host_workdir="${CAPSULE_HOST_WORKDIR:-}"
 
+  # Consumed by profile_daemon_source in the sourced profile module.
+  # shellcheck disable=SC2034
+  OUTER_CAPSULE_WORKDIR="$original_host_workdir"
   export CAPSULE_WORKDIR="${CAPSULE_WORKDIR:-$(pwd -P)}"
   LOCAL_APPROVAL_PATH="$CAPSULE_WORKDIR"
   IN_NESTED_CAPSULE=0
@@ -211,6 +224,54 @@ initialize_workdir_state() {
   # resolve back to a daemon-host path. Without that, fall back to the local
   # path and let Docker surface any mount error.
   export CAPSULE_HOST_WORKDIR="$CAPSULE_WORKDIR"
+}
+
+# Ask the in-Capsule router where the selected daemon sees bind sources.
+# Plain host Docker installations do not need the router or Podman.
+configure_docker_target() {
+  local resolved=""
+  local status=""
+
+  [[ -z "$REMOTE_HOST" ]] || return 0
+  command -v capsule-docker >/dev/null 2>&1 || return 0
+  if ! resolved="$(capsule-docker endpoint 2>/dev/null)"; then
+    # Older Docker-backed images already have the correct host mapping.
+    status="$(capsule-docker status 2>/dev/null || true)"
+    if [[ "$status" == 'engine: host docker socket '* ]]; then
+      return 0
+    fi
+    die 'rebuild the outer Capsule image to resolve its inner engine endpoint'
+  fi
+  IFS=$'\t' read -r DOCKER_TARGET_SCOPE DOCKER_TARGET_ENGINE \
+    DOCKER_TARGET_ENDPOINT <<<"$resolved"
+  case "$DOCKER_TARGET_SCOPE" in
+    host|external) return 0 ;;
+    local)
+      case "$DOCKER_TARGET_ENGINE:$DOCKER_TARGET_ENDPOINT" in
+        podman:unix:///*|dockerd:unix:///*) ;;
+        *) die 'invalid local engine endpoint from capsule-docker' ;;
+      esac
+      export CAPSULE_HOST_WORKDIR="$CAPSULE_WORKDIR"
+      LOCAL_APPROVAL_PATH="$CAPSULE_WORKDIR"
+      export CAPSULE_DOCKER_SOCKET_SOURCE="${DOCKER_TARGET_ENDPOINT#unix://}"
+      ;;
+    *) die 'invalid engine scope from capsule-docker' ;;
+  esac
+}
+
+# Start and pin a private target only after workspace approval.
+start_docker_target() {
+  local resolved=""
+  local expected=""
+
+  [[ "$DOCKER_TARGET_SCOPE" == "local" ]] || return 0
+  resolved="$(capsule-docker endpoint --start)"
+  expected="$(printf 'local\t%s\t%s' \
+    "$DOCKER_TARGET_ENGINE" "$DOCKER_TARGET_ENDPOINT")"
+  [[ "$resolved" == "$expected" ]] || \
+    die 'engine selection changed during launch; retry the command'
+  unset DOCKER_CONTEXT
+  export DOCKER_HOST="$DOCKER_TARGET_ENDPOINT"
 }
 
 # Resolve "id -u" or "id -g", with a default fallback.
@@ -258,6 +319,11 @@ initialize_user_ids() {
 
 # Reset mutable option state before parsing arguments.
 initialize_runtime_state() {
+  DOCKER_TARGET_SCOPE=""
+  DOCKER_TARGET_ENGINE=""
+  DOCKER_TARGET_ENDPOINT=""
+  BASE_IMAGE_CONTEXT=""
+  BASE_IMAGE_OVERRIDE=""
   BUILD_MODE="none"
   BUILD_MODE_FLAG=""
   NO_CACHE=0
@@ -277,6 +343,7 @@ initialize_runtime_state() {
   PODMAN_CONTAINER_NAME=""
   PODMAN_SECRET_FILE=""
   PODMAN_INFO_OUTPUT=""
+  DNS_ARGS=()
   BASE_COMPOSE_CMD=()
   COMPOSE_CMD=()
   initialize_profile_state
@@ -347,6 +414,8 @@ Environment:
   CAPSULE_IMAGE    Image tag the podman backend builds and runs.
   CAPSULE_HOME_VOLUME  podman volume mounted at /home/user.
   CAPSULE_INNER_VOLUME  Volume holding the inner engine state.
+  CAPSULE_DNS      DNS servers for podman Capsules, or none
+                   (default: on macOS, the Mac's).
   CAPSULE_WITH_DOCKERD  Build the image with a real dockerd.
 EOF
 }
@@ -818,12 +887,14 @@ configure_private_home() {
       if [[ -z "$CAPSULE_HOME_HOST_DIR" ]]; then
         die 'failed to resolve remote private home path'
       fi
-    elif [[ "$IN_NESTED_CAPSULE" -eq 1 ]]; then
+    elif [[ "$IN_NESTED_CAPSULE" -eq 1 && \
+            "$DOCKER_TARGET_SCOPE" != "local" ]]; then
       die '--private-home inside Capsule requires CAPSULE_HOME_HOST_DIR or '\
         'an outer Capsule started with --private-home'
     else
       default_home_dir="$(default_private_home_dir)"
-      if [[ -n "${CAPSULE_HOST_PATH_MAP:-}" ]]; then
+      if [[ -n "${CAPSULE_HOST_PATH_MAP:-}" && \
+            "$DOCKER_TARGET_SCOPE" != "local" ]]; then
         CAPSULE_HOME_HOST_DIR="$(
           resolve_mapped_private_home_dir "$default_home_dir"
         )"
@@ -1262,6 +1333,9 @@ run_podman_build() {
     build_args+=(--no-cache)
   fi
 
+  # Build steps resolve names like the Capsule will.
+  build_args+=(${DNS_ARGS[@]+"${DNS_ARGS[@]}"})
+
   if [[ -n "${MISE_SYSTEM_TOOLS:-}" ]]; then
     build_args+=(--build-arg "MISE_SYSTEM_TOOLS=${MISE_SYSTEM_TOOLS}")
   fi
@@ -1365,7 +1439,8 @@ build_podman_run_args() {
     --workdir "$CAPSULE_CONTAINER_WORKDIR"
     --volume "${CAPSULE_HOST_WORKDIR}:${CAPSULE_CONTAINER_WORKDIR}"
     --volume "$home_mount"
-    --volume "$(podman_inner_volume):${CAPSULE_INNER_DIR}"
+    --volume "$(podman_inner_volume):/var/lib/capsule/inner"
+    ${DNS_ARGS[@]+"${DNS_ARGS[@]}"}
     --env "CAPSULE_UID=${CAPSULE_UID}"
     --env "CAPSULE_HOST_WORKDIR=${CAPSULE_HOST_WORKDIR}"
   )
@@ -1406,6 +1481,7 @@ run_podman_backend() {
 
   configure_nested_podman_workdir
   PODMAN_CONTAINER_NAME="$(podman_container_name)"
+  configure_dns
   configure_podman_secret
   trap cleanup_runtime_state EXIT INT TERM
 
@@ -1428,6 +1504,20 @@ run_podman_backend() {
 
   cleanup_runtime_state
   return "$exit_code"
+}
+
+# Collect the --dns flags podman builds and runs share.
+configure_dns() {
+  local servers=""
+  local server=""
+
+  DNS_ARGS=()
+  if ! servers="$(capsule_dns_servers)"; then
+    die "CAPSULE_DNS must list IP addresses or none: ${CAPSULE_DNS}"
+  fi
+  for server in $servers; do
+    DNS_ARGS+=(--dns "$server")
+  done
 }
 
 # Initialize base and merged docker compose command arrays.
@@ -1455,6 +1545,9 @@ initialize_compose_commands() {
   if [[ -n "${GITHUB_API_TOKEN:+set}" ]]; then
     BASE_COMPOSE_CMD+=(-f "$SCRIPT_DIR/compose.github-token.yml")
     COMPOSE_CMD+=(-f "$SCRIPT_DIR/compose.github-token.yml")
+  fi
+  if [[ -n "$BASE_IMAGE_OVERRIDE" ]]; then
+    COMPOSE_CMD+=(-f "$BASE_IMAGE_OVERRIDE")
   fi
   if [[ -n "$CAPSULE_CUSTOM_COMPOSE" ]]; then
     COMPOSE_CMD+=(-f "$CAPSULE_CUSTOM_COMPOSE")
@@ -1497,12 +1590,99 @@ run_compose_build() {
     --build-arg "MISE_VERSION=${mise_version}" cli
 }
 
+# Atomically publish an OCI layout; concurrent exporters may reuse the winner.
+export_local_base_image() (
+  local image_id="$1"
+  local destination="$2"
+  local temporary=""
+
+  temporary="$(mktemp -d "${destination%/*}/.export.XXXXXX")"
+  trap 'rm -rf -- "$temporary"' EXIT
+  mkdir "$temporary/$image_id"
+  podman save --format oci-dir \
+    --output "$temporary/$image_id/layout" "$image_id"
+  printf '%s\n' "$image_id" >"$temporary/$image_id/.complete"
+  # BSD mv can lose a race between checking the target and renaming it.
+  # Reuse a completed winner for this image, but preserve real move errors.
+  if ! mv -n "$temporary/$image_id" "${destination%/*}/" \
+    2>"$temporary/publish-error"; then
+    if [[ -f "$destination/.complete" ]] && \
+      [[ "$(cat "$destination/.complete")" == "$image_id" ]]; then
+      return 0
+    fi
+    cat "$temporary/publish-error" >&2
+    return 1
+  fi
+)
+
+# Make the private Podman image available to the separate BuildKit worker.
+# Normal Docker installations never enter this path or invoke Podman.
+prepare_local_base_context() {
+  local image=""
+  local image_id=""
+  local cache_root="$CAPSULE_INNER_DIR/build-contexts"
+  local cache_dir=""
+  local digest=""
+  local context_spec=""
+  local override_tmp=""
+  local single_quote="'"
+  local doubled_quote="''"
+
+  [[ "$DOCKER_TARGET_SCOPE:$DOCKER_TARGET_ENGINE" == local:podman ]] || \
+    return 0
+  image="$(docker_base_image_name)"
+  if ! image_id="$(docker image inspect --format '{{.Id}}' "$image" \
+    2>/dev/null)"; then
+    die "base image $image is not built; run: capsule build --runtime docker"
+  fi
+  image_id="${image_id#sha256:}"
+  [[ "$image_id" =~ ^[0-9a-f]{64}$ ]] || die 'invalid base image identity'
+  cache_dir="$cache_root/$image_id"
+  mkdir -p "$cache_root"
+  chmod 700 "$cache_root"
+  if [[ ! -e "$cache_dir" ]]; then
+    printf 'capsule: exporting base image context for %s\n' "$image" >&2
+    export_local_base_image "$image_id" "$cache_dir"
+  else
+    printf 'capsule: reusing base image context for %s\n' "$image" >&2
+  fi
+  if [[ ! -f "$cache_dir/.complete" ]] || \
+    [[ "$(cat "$cache_dir/.complete")" != "$image_id" ]]; then
+    die "incomplete base image cache: $cache_dir; clear it when builds stop"
+  fi
+  if ! digest="$(jq -er '.manifests[0].digest | strings |
+    select(test("^sha256:[0-9a-f]{64}$"))' \
+    "$cache_dir/layout/index.json")"; then
+    die "invalid base image cache: $cache_dir; clear it when builds stop"
+  fi
+  BASE_IMAGE_CONTEXT="oci-layout://${cache_dir}/layout@${digest}"
+
+  [[ -n "$CAPSULE_CUSTOM_COMPOSE" ]] || return 0
+  BASE_IMAGE_OVERRIDE="$cache_dir/compose-$(path_token "$image").yml"
+  # Match Buildx's context-name normalization; Bake keeps keys verbatim.
+  context_spec="${image%:latest}=$BASE_IMAGE_CONTEXT"
+  # Escape Compose interpolation and YAML single quotes in generated paths.
+  context_spec="${context_spec//\$/\$\$}"
+  context_spec="${context_spec//$single_quote/$doubled_quote}"
+  override_tmp="$(mktemp "$cache_dir/.compose.XXXXXX")"
+  {
+    printf '%s\n' 'services:' '  cli:' '    build:'
+    printf '%s\n' '      additional_contexts:'
+    printf "        - '%s'\n" "$context_spec"
+  } >"$override_tmp"
+  mv -f "$override_tmp" "$BASE_IMAGE_OVERRIDE"
+  initialize_compose_commands
+}
+
 # Execute the build steps requested by --build or --build-custom.
 run_requested_builds() {
   local mise_version="$1"
 
   if [[ "$BUILD_MODE" == "all" ]]; then
     run_compose_build "$mise_version" "${BASE_COMPOSE_CMD[@]}"
+    if [[ -n "$CAPSULE_CUSTOM_COMPOSE" || "$PROFILE_HAS_FRAGMENT" -eq 1 ]]; then
+      prepare_local_base_context
+    fi
     if [[ -n "$CAPSULE_CUSTOM_COMPOSE" ]]; then
       run_compose_build "$mise_version" "${COMPOSE_CMD[@]}"
     elif [[ "$PROFILE_HAS_FRAGMENT" -eq 1 ]]; then
@@ -1511,6 +1691,7 @@ run_requested_builds() {
   fi
 
   if [[ "$BUILD_MODE" == "custom" ]]; then
+    prepare_local_base_context
     if [[ -n "$CAPSULE_CUSTOM_COMPOSE" ]]; then
       run_compose_build "$mise_version" "${COMPOSE_CMD[@]}"
     else
@@ -1621,12 +1802,15 @@ main() {
   apply_profile_namespace
   configure_custom_compose
   validate_build_mode
+  resolve_runtime_backend
+  if [[ "$RUNTIME_BACKEND" == "docker" ]]; then
+    configure_docker_target
+  fi
   if [[ "$BUILD_ONLY" -ne 1 ]]; then
     initialize_capsule_config
   fi
   configure_target_mode
 
-  resolve_runtime_backend
   if [[ "$RUNTIME_BACKEND" == "podman" ]]; then
     # Consumed by generate_profile_build_files from the sourced profile module.
     # shellcheck disable=SC2034
@@ -1646,6 +1830,7 @@ main() {
     return
   fi
 
+  start_docker_target
   configure_docker_gid
   initialize_compose_commands
 

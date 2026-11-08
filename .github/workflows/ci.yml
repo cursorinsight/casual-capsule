@@ -139,3 +139,23 @@ jobs:
 
       - name: Build image via Docker Compose without a token
         run: docker compose -f compose.yml build cli
+
+  macos:
+    name: macos
+    needs: checks
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Use the system Bash 3.2
+        run: |
+          mkdir -p "$RUNNER_TEMP/system-bash"
+          ln -s /bin/bash "$RUNNER_TEMP/system-bash/bash"
+          printf '%s\n' "$RUNNER_TEMP/system-bash" >>"$GITHUB_PATH"
+
+      - name: Run fast suite
+        run: |
+          bash -c 'printf "Bash %s\n" "$BASH_VERSION"'
+          bash -c '[[ "$BASH_VERSION" == 3.2.* ]]'
+          bash tests/suite_fast.sh

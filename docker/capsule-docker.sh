@@ -65,7 +65,7 @@ socket_responds() {
   local socket_path="$1"
 
   [[ -e "$socket_path" ]] || return 1
-  DOCKER_HOST="unix://${socket_path}" "$REAL_DOCKER" version \
+  DOCKER_CONTEXT='' DOCKER_HOST="unix://${socket_path}" "$REAL_DOCKER" version \
     >/dev/null 2>&1
 }
 
@@ -130,42 +130,85 @@ start_dockerd() {
   fi
 }
 
-# Print the socket of the active engine, starting it when needed.
-ensure_engine_socket() {
+# Resolve routing without starting an engine unless explicitly requested.
+# Output is scope, engine, endpoint, separated by tabs. Configuration flags
+# are forwarded to the real client's context queries.
+resolve_endpoint() {
+  local start="$1"
   local engine=""
+  local context="${DOCKER_CONTEXT:-}"
+  local endpoint="${DOCKER_HOST:-}"
+  shift
 
-  if socket_responds "$HOST_SOCKET"; then
-    printf '%s\n' "$HOST_SOCKET"
+  if [[ -n "$context" ]] || [[ -z "$endpoint" ]]; then
+    if [[ -z "$context" ]]; then
+      context="$("$REAL_DOCKER" "$@" context show)"
+    fi
+    if [[ -n "${DOCKER_CONTEXT:-}" || "$context" != "default" ]]; then
+      endpoint="$("$REAL_DOCKER" "$@" context inspect \
+        --format '{{(index .Endpoints "docker").Host}}' "$context")"
+      [[ -n "$endpoint" ]] || die 'cannot resolve Docker context endpoint'
+    fi
+  fi
+
+  case "$endpoint" in
+    "unix://${PODMAN_SOCKET}") engine=podman ;;
+    "unix://${DOCKERD_SOCKET}") engine=dockerd ;;
+    ''|"unix://${HOST_SOCKET}") ;;
+    *) printf 'external\texternal\t%s\n' "$endpoint"; return ;;
+  esac
+
+  if [[ -z "$engine" ]] && socket_responds "$HOST_SOCKET"; then
+    printf 'host\tdocker\tunix://%s\n' "$HOST_SOCKET"
     return
   fi
 
-  case "${CAPSULE_REQUIRE_HOST_DOCKER:-0}" in
-    1|true|yes|on)
-      die "requested host Docker socket is unavailable: $HOST_SOCKET"
-      ;;
-  esac
+  if [[ -z "$engine" ]]; then
+    case "${CAPSULE_REQUIRE_HOST_DOCKER:-0}" in
+      1|true|yes|on)
+        if [[ "$start" -eq 1 ]]; then
+          die "requested host Docker socket is unavailable: $HOST_SOCKET"
+        fi
+        printf 'host\tdocker\tunix://%s\n' "$HOST_SOCKET"
+        return
+        ;;
+    esac
+    engine="$(current_engine)"
+  fi
 
-  engine="$(current_engine)"
   case "$engine" in
     dockerd)
-      start_dockerd
-      printf '%s\n' "$DOCKERD_SOCKET"
+      [[ "$start" -eq 0 ]] || start_dockerd
+      endpoint="unix://${DOCKERD_SOCKET}"
       ;;
     *)
-      start_podman_service
-      printf '%s\n' "$PODMAN_SOCKET"
+      engine=podman
+      [[ "$start" -eq 0 ]] || start_podman_service
+      endpoint="unix://${PODMAN_SOCKET}"
       ;;
   esac
+  printf 'local\t%s\t%s\n' "$engine" "$endpoint"
+}
+
+# Expose the same routing decision to Capsule's launcher.
+cmd_endpoint() {
+  local start=0
+
+  if [[ "$#" -eq 1 && "$1" == "--start" ]]; then
+    start=1
+  elif [[ "$#" -ne 0 ]]; then
+    die 'usage: capsule-docker endpoint [--start]'
+  fi
+  resolve_endpoint "$start"
 }
 
 # Route a docker command to the active engine.
 run_docker() {
-  local socket_path=""
+  local resolved=""
   local argument=""
   local skip_value=0
   local config_value=0
   local config_args=()
-  local context=""
   local compose=0
 
   if [[ -n "${DOCKER_CONTEXT:-}" ]] ||
@@ -227,16 +270,12 @@ run_docker() {
     exec "$REAL_DOCKER" "$@"
   fi
 
-  if [[ -z "${DOCKER_HOST:-}" ]]; then
-    context="$("$REAL_DOCKER" \
-      ${config_args[@]+"${config_args[@]}"} context show)"
-    if [[ "$context" != "default" ]]; then
-      exec "$REAL_DOCKER" "$@"
-    fi
+  resolved="$(resolve_endpoint 1 \
+    ${config_args[@]+"${config_args[@]}"})" || return
+  if [[ "$resolved" == external$'\t'* ]]; then
+    exec "$REAL_DOCKER" "$@"
   fi
-
-  socket_path="$(ensure_engine_socket)"
-  export DOCKER_HOST="unix://${socket_path}"
+  export DOCKER_HOST="${resolved##*$'\t'}"
   exec "$REAL_DOCKER" "$@"
 }
 
@@ -297,6 +336,7 @@ Commands:
   use-dockerd  Start the real rootless Docker daemon and route to it.
   use-podman   Route to the Podman API socket (the default).
   status       Show the selected engine and what is running.
+  endpoint [--start]  Print scope, engine and endpoint as tab-separated fields.
   stop         Stop the engines this Capsule started.
 EOF
 }
@@ -312,6 +352,7 @@ main() {
     use-dockerd) cmd_use_dockerd ;;
     use-podman) cmd_use_podman ;;
     status) cmd_status ;;
+    endpoint) shift; cmd_endpoint "$@" ;;
     stop) cmd_stop ;;
     -h|--help|"") usage ;;
     *) die "unknown command: $1" ;;

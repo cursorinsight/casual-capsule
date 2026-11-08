@@ -11,8 +11,12 @@ EOF
 
 quote_completion_value() {
   local value="$1"
+  local quote="'"
+  local escaped_quote="'\\''"
 
-  printf "'%s'" "${value//\'/\'\\\'\'}"
+  # Bash 3.2 keeps backslashes from an inline replacement, so both the quote
+  # and its escape come from variables.
+  printf "'%s'" "${value//$quote/$escaped_quote}"
 }
 
 bash_completion() {

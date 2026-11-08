@@ -11,7 +11,9 @@ services:
         - MISE_SYSTEM_TOOLS
     volumes:
       - ${CAPSULE_HOST_WORKDIR:-${CAPSULE_WORKDIR:-${PWD}}}:/home/workspace
-      - /var/run/docker.sock:/var/lib/capsule/docker.sock
+      - type: bind
+        source: ${CAPSULE_DOCKER_SOCKET_SOURCE:-/var/run/docker.sock}
+        target: /var/lib/capsule/docker.sock
       - ${CAPSULE_HOME_MOUNT:-home:/home/user}
     environment:
       - CAPSULE_REQUIRE_HOST_DOCKER=1
