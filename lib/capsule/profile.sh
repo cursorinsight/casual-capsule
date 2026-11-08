@@ -820,6 +820,11 @@ run_profile_build() {
   build_args=(build)
   if [[ "$engine" == "podman" ]]; then
     build_args+=(--format docker)
+  else
+    build_args+=(--load)
+    if [[ -n "$BASE_IMAGE_CONTEXT" ]]; then
+      build_args+=(--build-context "$base_image=$BASE_IMAGE_CONTEXT")
+    fi
   fi
   build_args+=(
     --tag "$PROFILE_IMAGE"
@@ -828,6 +833,10 @@ run_profile_build() {
   )
   if [[ "$NO_CACHE" -eq 1 ]]; then
     build_args+=(--no-cache)
+  fi
+  # Podman profile builds resolve names like the Capsule will.
+  if [[ "$engine" == "podman" ]]; then
+    build_args+=(${DNS_ARGS[@]+"${DNS_ARGS[@]}"})
   fi
   if [[ -n "${GITHUB_API_TOKEN:+set}" ]]; then
     build_args+=(--secret "id=github_api_token,env=GITHUB_API_TOKEN")
@@ -901,6 +910,12 @@ profile_absolute_source() {
   fi
 }
 
+# Return success when the backend drives an engine CLI on this host instead
+# of Compose, so profiles use launcher paths and raw environment files.
+backend_runs_engine_cli() {
+  [[ "$RUNTIME_BACKEND" == "podman" || "$RUNTIME_BACKEND" == "apple" ]]
+}
+
 # Map a launcher-visible source to the path seen by the selected daemon.
 profile_daemon_source() {
   local source="$1"
@@ -911,7 +926,8 @@ profile_daemon_source() {
 
   [[ -n "$home_dir" ]] || home_dir="/"
 
-  if [[ -n "$REMOTE_HOST" || "$RUNTIME_BACKEND" == "podman" ]]; then
+  if [[ -n "$REMOTE_HOST" || "$DOCKER_TARGET_SCOPE" == "local" ]] || \
+    backend_runs_engine_cli; then
     printf '%s\n' "$source"
     return
   fi
@@ -940,12 +956,12 @@ profile_daemon_source() {
       return
     fi
     if [[ "$source" == "$CAPSULE_CONTAINER_WORKDIR" ]]; then
-      printf '%s\n' "$CAPSULE_HOST_WORKDIR"
+      printf '%s\n' "$OUTER_CAPSULE_WORKDIR"
       return
     fi
     if [[ "$source" == "$CAPSULE_CONTAINER_WORKDIR"/* ]]; then
       printf '%s%s\n' \
-        "$CAPSULE_HOST_WORKDIR" \
+        "$OUTER_CAPSULE_WORKDIR" \
         "${source#"$CAPSULE_CONTAINER_WORKDIR"}"
       return
     fi
@@ -1015,11 +1031,13 @@ write_profile_environment() {
   local target="$1"
   local value="$2"
   local escaped=""
+  local quote="'"
+  local escaped_quote="\\'"
 
   if [[ -z "$PROFILE_ENV_FILE" ]]; then
     initialize_profile_environment
   fi
-  if [[ "$RUNTIME_BACKEND" == "podman" ]]; then
+  if backend_runs_engine_cli; then
     if [[ "$value" == *$'\n'* ]]; then
       die "profile environment value contains a newline: $target"
     fi
@@ -1030,7 +1048,9 @@ write_profile_environment() {
     return
   fi
 
-  escaped="${value//\'/\\\'}"
+  # Bash 3.2 keeps backslashes from an inline replacement, so both the quote
+  # and its escape come from variables.
+  escaped="${value//$quote/$escaped_quote}"
   (
     set +x
     printf "%s='%s'\n" "$target" "$escaped" >>"$PROFILE_ENV_FILE"
@@ -1101,7 +1121,7 @@ configure_profile_runtime() {
     index=$((index + 1))
   done
   if [[ -n "$PROFILE_ENV_FILE" ]]; then
-    if [[ "$RUNTIME_BACKEND" == "podman" ]]; then
+    if backend_runs_engine_cli; then
       PROFILE_RUNTIME_OPTS+=(--env-file "$PROFILE_ENV_FILE")
     else
       PROFILE_RUNTIME_OPTS+=(--env-from-file "$PROFILE_ENV_FILE")

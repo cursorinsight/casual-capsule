@@ -31,42 +31,12 @@ shellcheck_files=(
   lib/capsule/*.sh
   libexec/capsule/*
   tests/*.sh
+  tests/lib/*.sh
   tests/fixtures/*/*.sh
 )
 
-PASS_MARK="."
-SKIP_MARK="s"
-PASS_COUNT=0
-FAIL_COUNT=0
-SKIP_COUNT=0
-SKIP_REASONS=()
-
-if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
-  PASS_MARK=$'\033[32m.\033[0m'
-  SKIP_MARK=$'\033[33ms\033[0m'
-fi
-
-pass() {
-  printf '%s' "$PASS_MARK"
-  PASS_COUNT=$((PASS_COUNT + 1))
-}
-
-fail() {
-  printf '\nFAIL: %s\n' "$1" >&2
-  FAIL_COUNT=$((FAIL_COUNT + 1))
-}
-
-skip() {
-  local reason="$1"
-  local recorded=""
-
-  printf '%s' "$SKIP_MARK"
-  SKIP_COUNT=$((SKIP_COUNT + 1))
-  for recorded in ${SKIP_REASONS[@]+"${SKIP_REASONS[@]}"}; do
-    [[ "$recorded" == "$reason" ]] && return
-  done
-  SKIP_REASONS+=("$reason")
-}
+# shellcheck disable=SC1091
+source "$ROOT_DIR/tests/lib/harness.sh"
 
 resolve_docker_mount_root() {
   local root_dir="$1"
@@ -190,11 +160,6 @@ for shellcheck_file in "${shellcheck_files[@]}"; do
     shell "$shellcheck_file" || status=1
 done
 
-printf '\nSummary: %d passed, %d failed, %d skipped\n' \
-  "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT"
-if [[ "${#SKIP_REASONS[@]}" -gt 0 ]]; then
-  printf 'Skipped:\n'
-  printf '  - %s\n' "${SKIP_REASONS[@]}"
-fi
+harness_summary || status=1
 
 exit "$status"

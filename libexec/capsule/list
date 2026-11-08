@@ -18,12 +18,13 @@ Usage: capsule list [options]
 
 Options:
   -r, --remote HOST[:PORT]  Query a remote Docker host over SSH.
-      --runtime RUNTIME     Query auto, docker, or podman (default: auto).
+      --runtime RUNTIME     Query auto, docker, podman, or apple
+                            (default: auto; apple only on macOS).
   -h, --help                Show this help message.
 
 Environment:
   CAPSULE_REMOTE   Remote HOST[:PORT] target.
-  CAPSULE_RUNTIME  Runtime to query: auto, docker, or podman.
+  CAPSULE_RUNTIME  Runtime to query: auto, docker, podman, or apple.
 EOF
 }
 
@@ -43,7 +44,7 @@ parse_args() {
         ;;
       --runtime)
         if [[ $# -lt 2 ]] || [[ "${2:-}" == -* ]]; then
-          die '--runtime requires podman, docker, or auto'
+          die '--runtime requires podman, docker, apple, or auto'
         fi
         set_runtime_selection "$2"
         shift 2
@@ -198,6 +199,77 @@ list_engine_capsules() {
   done <<<"$ps_output"
 }
 
+# Print running Apple container Capsules. The JSON is filtered in one pipe,
+# so neither it nor any other environment value lands in a traced variable.
+list_apple_capsules() {
+  local filter=""
+  local rows=""
+  local line=""
+  local host_user=""
+
+  # Emit "UID<US>ID NAME STARTED IMAGE STATE PORTS HOST_DIR" as TSV. The
+  # dollar signs are jq syntax, not shell expansions.
+  # shellcheck disable=SC2016
+  filter='
+    def env_value($key):
+      (.configuration.initProcess.environment // [])
+      | map(select(startswith($key + "=")))
+      | (first // "") | ltrimstr($key + "=");
+    .[]
+    | select(env_value("CAPSULE_HOST_WORKDIR") != "")
+    | "\(env_value("CAPSULE_UID"))\u001f\([
+        .configuration.id,
+        .configuration.id,
+        (.status.startedDate // ""),
+        (.configuration.image.reference // ""),
+        (.status.state // ""),
+        ((.configuration.publishedPorts // [])
+          | map("\(.hostAddress // "0.0.0.0"):\(.hostPort)->"
+            + "\(.containerPort)/\(.proto // "tcp")")
+          | join(", ")),
+        env_value("CAPSULE_HOST_WORKDIR")
+      ] | @tsv)"
+  '
+
+  if ! rows="$(container ls --format json | jq -r "$filter")"; then
+    return 1
+  fi
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    host_user="$(resolve_host_user "${line%%$'\x1f'*}")"
+    CAPSULE_LIST_ROWS+=(
+      "local"$'\t'"apple"$'\t'"${host_user:-unknown}"$'\t'"${line#*$'\x1f'}"
+    )
+  done <<<"$rows"
+}
+
+# List Apple container Capsules when selected. Under "auto" this happens only
+# on a Mac whose container service runs, so other hosts stay quiet.
+list_selected_apple_capsules() {
+  local reason=""
+
+  reason="$(apple_host_reason)"
+  if ! command -v jq >/dev/null 2>&1; then
+    reason="${reason:-jq is not installed}"
+  fi
+  if [[ -n "$reason" ]]; then
+    if [[ "$RUNTIME_SELECTION" == "apple" ]]; then
+      die "cannot list apple Capsules: $reason"
+    fi
+    return 1
+  fi
+
+  if list_apple_capsules; then
+    return 0
+  fi
+  if [[ "$RUNTIME_SELECTION" == "apple" ]]; then
+    die 'failed to query running Capsules with apple'
+  fi
+  warn 'cannot query apple containers'
+  return 1
+}
+
 # List local Capsules from selected engines, or Docker Capsules remotely.
 list_running_capsules() {
   local queried=0
@@ -207,8 +279,9 @@ list_running_capsules() {
   local resolve_local_user=1
 
   if [[ -n "$REMOTE_HOST" ]]; then
-    if [[ "$RUNTIME_SELECTION" == "podman" ]]; then
-      warn 'remote listing uses Docker; ignoring --runtime podman'
+    if [[ "$RUNTIME_SELECTION" == "podman" ]] || \
+      [[ "$RUNTIME_SELECTION" == "apple" ]]; then
+      warn "remote listing uses Docker; ignoring --runtime $RUNTIME_SELECTION"
     fi
     if ! command -v docker >/dev/null 2>&1; then
       die 'docker is required to query a remote host'
@@ -224,9 +297,10 @@ list_running_capsules() {
     auto) engines=(docker podman) ;;
     docker) engines=(docker) ;;
     podman) engines=(podman) ;;
+    apple) engines=() ;;
   esac
 
-  for engine in "${engines[@]}"; do
+  for engine in ${engines[@]+"${engines[@]}"}; do
     if ! command -v "$engine" >/dev/null 2>&1; then
       if [[ "$RUNTIME_SELECTION" != "auto" ]]; then
         die "$engine is required by --runtime $RUNTIME_SELECTION"
@@ -245,6 +319,14 @@ list_running_capsules() {
       die "failed to query running Capsules with $engine"
     fi
   done
+
+  case "$RUNTIME_SELECTION" in
+    apple|auto)
+      if list_selected_apple_capsules; then
+        queried=1
+      fi
+      ;;
+  esac
 
   if [[ "$queried" -eq 0 ]]; then
     die 'no usable container runtime found'
