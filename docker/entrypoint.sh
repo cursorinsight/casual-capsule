@@ -178,6 +178,16 @@ fi
 # stale ownership from a previous image build.
 TARGET_HOME="$(getent passwd user | cut -d: -f6)"
 TARGET_HOME="${TARGET_HOME:-/home/user}"
+
+# Apple container volumes start empty instead of copying the image's home,
+# so give a brand-new home the account's default dotfiles exactly once.
+if [ "${CAPSULE_INNER_ENGINE:-}" = "none" ] && \
+   [ -z "$(find "$TARGET_HOME" -mindepth 1 -maxdepth 1 \
+     ! -name lost+found -print -quit 2>/dev/null)" ]; then
+  cp -a /etc/skel/. "$TARGET_HOME"/ 2>/dev/null || true
+  CHANGED=1
+fi
+
 OWNER_UID="$(stat -c '%u' "$TARGET_HOME" 2>/dev/null || true)"
 if [ "$CHANGED" = "1" ] || \
    [ "${OWNER_UID:-}" != "$(id -u user)" ]; then

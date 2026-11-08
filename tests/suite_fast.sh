@@ -51,6 +51,9 @@ unset CAPSULE_HOST_SOCKET
 unset CAPSULE_INNER_DIR
 unset CAPSULE_ENGINE_DIR
 unset CAPSULE_IMAGE
+unset CAPSULE_INNER_ENGINE
+unset CAPSULE_MEMORY
+unset CAPSULE_CPUS
 unset CAPSULE_DNS
 unset CAPSULE_RESOLV_CONF
 unset CAPSULE_PUBLISH
@@ -372,6 +375,56 @@ fi
 exit 0
 EOF
 
+  cat >"$dir/container" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Stand in for Apple's container CLI: answer the queries the launcher makes,
+# and log everything else as CONTAINER_ARGS.
+case "${1:-} ${2:-}" in
+  'system status')
+    printf 'CONTAINER_STATUS=%s\n' "$*" >>"${MOCK_LOG:?MOCK_LOG is required}"
+    exit "${MOCK_CONTAINER_STOPPED:-0}"
+    ;;
+  'image inspect')
+    exit "${MOCK_CONTAINER_NO_IMAGE:-0}"
+    ;;
+  'volume inspect')
+    exit "${MOCK_CONTAINER_NO_VOLUME:-0}"
+    ;;
+  'volume create')
+    printf 'CONTAINER_VOLUME_CREATE=%s\n' "$*" >>"${MOCK_LOG:?}"
+    exit 0
+    ;;
+  'ls --format')
+    printf 'CONTAINER_LS_ARGS=%s\n' "$*" >>"${MOCK_LOG:?}"
+    printf '%s\n' "${MOCK_CONTAINER_LS:-[]}"
+    exit "${MOCK_CONTAINER_LS_EXIT:-0}"
+    ;;
+esac
+
+printf 'CONTAINER_ARGS=%s\n' "$*" >>"${MOCK_LOG:?MOCK_LOG is required}"
+previous=""
+for argument in "$@"; do
+  if [[ "$previous" == "--env-file" ]]; then
+    if ! permissions="$(/usr/bin/stat -c '%a' "$argument" 2>/dev/null)"; then
+      permissions="$(/usr/bin/stat -f '%Lp' "$argument")"
+    fi
+    {
+      printf 'PROFILE_ENV_PERMISSIONS=%s\n' "$permissions"
+      while IFS= read -r entry; do
+        printf 'PROFILE_ENV_ENTRY=%s\n' "$entry"
+      done <"$argument"
+    } >>"$MOCK_LOG"
+  fi
+  previous="$argument"
+done
+if [[ "${1:-}" == "run" && -n "${MOCK_CONTAINER_STDIN_FILE:-}" ]]; then
+  cat >"$MOCK_CONTAINER_STDIN_FILE"
+fi
+exit "${MOCK_CONTAINER_EXIT:-0}"
+EOF
+
   cat >"$dir/curl" <<'EOF'
 #!/usr/bin/env bash
 if [[ -n "${MOCK_CURL_FAIL:-}" ]]; then
@@ -382,7 +435,7 @@ EOF
 
   chmod +x "$dir/capsule-docker"
   chmod +x "$dir/docker" "$dir/podman" "$dir/stat" "$dir/uname" "$dir/ls" \
-    "$dir/id" "$dir/curl" "$dir/ssh"
+    "$dir/id" "$dir/curl" "$dir/ssh" "$dir/container"
 }
 
 run_capsule() {
@@ -1578,7 +1631,7 @@ EOF
     chmod +x "$tdir/tests/$suite_name"
   done
 
-  for runtime in docker podman; do
+  for runtime in docker podman apple; do
     if CAPSULE_RUNTIME="$runtime" CAPSULE_E2E_STRICT=1 \
       "$tdir/tests/test_all.sh" >/dev/null; then
       pass "test runner clears inherited $runtime while keeping strict mode"
@@ -1618,7 +1671,8 @@ test_ci_runs_nested_capsules_for_each_backend() {
     "Podman CI preserves group access to the host Docker socket"
 }
 
-# Verify CI runs the fast suite on macOS under the system Bash 3.2.
+# Verify CI runs the fast suite on macOS under the system Bash 3.2 and
+# checks that the Apple container service starts there.
 # shellcheck disable=SC2016
 test_ci_runs_fast_suite_on_macos() {
   assert_file_contains "$CI_PATH" 'runs-on: macos-26' \
@@ -1630,6 +1684,11 @@ test_ci_runs_fast_suite_on_macos() {
     "macOS CI requires Bash 3.2"
   assert_file_contains "$CI_PATH" 'bash tests/suite_fast.sh' \
     "macOS CI runs the fast suite"
+  assert_file_contains "$CI_PATH" \
+    'container system start --enable-kernel-install' \
+    "macOS CI starts the Apple container service with a kernel"
+  assert_file_contains "$CI_PATH" "'the container service is running'" \
+    "macOS CI requires doctor to pass the Apple container host checks"
 }
 
 test_build_flag_without_runtime_args() {
@@ -3107,12 +3166,14 @@ test_legacy_router_compatibility() {
 [[ "${1:-}" == status ]] || exit 1
 printf '%s\n' "${MOCK_LEGACY_STATUS:?}"
 EOF
-  status='engine: host docker socket (--host-docker)'
-  : >"$CASE_LOG"
-  MOCK_LEGACY_STATUS="$status" \
-    run_capsule "$CASE_BIN" "$CASE_LOG" true
-  assert_file_contains "$CASE_LOG" 'run --rm cli true' \
-    "an older router keeps its existing mapping for $status"
+  for status in 'engine: host docker socket (--host-docker)' \
+    'engine: none (apple runtime)'; do
+    : >"$CASE_LOG"
+    MOCK_LEGACY_STATUS="$status" \
+      run_capsule "$CASE_BIN" "$CASE_LOG" true
+    assert_file_contains "$CASE_LOG" 'run --rm cli true' \
+      "an older router keeps its existing mapping for $status"
+  done
   if MOCK_LEGACY_STATUS='engine: podman' \
     run_capsule "$CASE_BIN" "$CASE_LOG" true 2>"$CASE_ERR"; then
     fail "an old private router requires an updated image"
@@ -4797,6 +4858,250 @@ assert_podman_args_lack() {
   fi
 }
 
+# Assert that one of the container invocations carried the given fragment.
+assert_container_args_contain() {
+  local log_file="$1"
+  local needle="$2"
+  local msg="$3"
+
+  if grep -F 'CONTAINER_ARGS=' "$log_file" | grep -Fq -- "$needle"; then
+    pass "$msg"
+  else
+    fail "$msg (missing: $needle)"
+  fi
+}
+
+# Assert that no container invocation carried the given fragment.
+assert_container_args_lack() {
+  local log_file="$1"
+  local needle="$2"
+  local msg="$3"
+
+  if grep -F 'CONTAINER_ARGS=' "$log_file" | grep -Fq -- "$needle"; then
+    fail "$msg (unexpected: $needle)"
+  else
+    pass "$msg"
+  fi
+}
+
+# Run capsule as on an Apple silicon Mac whose container service runs. The
+# case home keeps macOS secret staging out of the real home directory.
+run_apple_capsule() {
+  local log_file="$1"
+  shift
+
+  mkdir -p "$CASE_DIR/home"
+  if [[ ! -e "$CASE_DIR/resolv.conf" ]]; then
+    printf 'nameserver 192.0.2.53\n' >"$CASE_DIR/resolv.conf"
+  fi
+  HOME="$CASE_DIR/home" MOCK_UNAME=Darwin MOCK_UNAME_ARCH=arm64 \
+    CAPSULE_RUNTIME="${CAPSULE_RUNTIME-apple}" \
+    CAPSULE_RESOLV_CONF="${CAPSULE_RESOLV_CONF-$CASE_DIR/resolv.conf}" \
+    run_capsule "$CASE_BIN" "$log_file" "$@"
+}
+
+test_runtime_selection_accepts_apple() {
+  local value=""
+
+  setup_mock_case apple-selection
+  CAPSULE_RUNTIME='' run_apple_capsule "$CASE_LOG" --runtime apple true
+  assert_container_args_contain "$CASE_LOG" 'run --rm --interactive' \
+    "--runtime apple selects the apple backend"
+  : >"$CASE_LOG"
+  CAPSULE_RUNTIME='' run_apple_capsule "$CASE_LOG" --runtime=apple true
+  assert_container_args_contain "$CASE_LOG" 'run --rm --interactive' \
+    "--runtime=apple selects the apple backend"
+  : >"$CASE_LOG"
+  run_apple_capsule "$CASE_LOG" true
+  assert_container_args_contain "$CASE_LOG" 'run --rm --interactive' \
+    "CAPSULE_RUNTIME=apple selects the apple backend"
+
+  if run_apple_capsule "$CASE_LOG" --runtime 2>"$CASE_ERR"; then
+    fail "--runtime without a value is rejected"
+  else
+    pass "--runtime without a value is rejected"
+  fi
+  assert_file_contains "$CASE_ERR" \
+    '--runtime requires podman, docker, apple, or auto' \
+    "the missing runtime error lists apple"
+
+  for value in '' Apple; do
+    if CAPSULE_RUNTIME='' run_apple_capsule "$CASE_LOG" \
+      --runtime "$value" true 2>"$CASE_ERR"; then
+      fail "--runtime '$value' is rejected"
+    else
+      pass "--runtime '$value' is rejected"
+    fi
+    assert_file_contains "$CASE_ERR" \
+      "unknown runtime: $value (use podman, docker, apple, or auto)" \
+      "--runtime '$value' names the accepted values"
+  done
+  if CAPSULE_RUNTIME='' run_apple_capsule "$CASE_LOG" --runtime= true \
+    2>"$CASE_ERR"; then
+    fail "--runtime= is rejected"
+  else
+    pass "--runtime= is rejected"
+  fi
+
+  if run_apple_capsule "$CASE_LOG" build --runtime '' 2>"$CASE_ERR"; then
+    fail "capsule build rejects an empty runtime"
+  else
+    pass "capsule build rejects an empty runtime"
+  fi
+  if run_apple_capsule "$CASE_LOG" list --runtime '' 2>"$CASE_ERR"; then
+    fail "capsule list rejects an empty runtime"
+  else
+    pass "capsule list rejects an empty runtime"
+  fi
+
+  "$SCRIPT_PATH" --help >"$CASE_DIR/help"
+  assert_file_contains "$CASE_DIR/help" '--runtime podman|docker|apple|auto' \
+    "run help offers apple"
+  "$CAPSULE_BIN" build --help >"$CASE_DIR/help"
+  assert_file_contains "$CASE_DIR/help" 'podman, or apple' \
+    "build help offers apple"
+  "$CAPSULE_BIN" list --help >"$CASE_DIR/help"
+  assert_file_contains "$CASE_DIR/help" 'podman, or apple' \
+    "list help offers apple"
+}
+
+# Apple container is opt-in: auto must never probe or start it, even on a
+# Mac where it would work.
+test_auto_never_selects_apple() {
+  setup_mock_case apple-auto
+
+  CAPSULE_RUNTIME=auto DOCKER_GID=1111 \
+    run_apple_capsule "$CASE_LOG" true 2>"$CASE_ERR"
+  CAPSULE_RUNTIME=auto DOCKER_GID=1111 MOCK_PODMAN_INFO_FAIL=1 \
+    run_apple_capsule "$CASE_LOG" true 2>>"$CASE_ERR"
+  assert_file_not_contains "$CASE_LOG" 'CONTAINER_' \
+    "auto never probes or runs Apple container"
+  assert_file_not_contains "$CASE_ERR" 'cannot use apple' \
+    "auto never reports on Apple container"
+  assert_file_not_contains "$CASE_ERR" 'container service' \
+    "auto never checks the Apple container service"
+}
+
+test_apple_backend_runs_with_the_root_entrypoint() {
+  local needle=""
+  local status=0
+
+  setup_mock_case apple-run
+  CAPSULE_UID=501 CAPSULE_GID=20 run_apple_capsule "$CASE_LOG" claude
+
+  for needle in \
+    'run --rm --interactive --name capsule-' \
+    '--workdir /home/workspace' \
+    ':/home/workspace' \
+    '--volume casual-capsule-home:/home/user' \
+    '--memory 8g' \
+    '--env CAPSULE_UID=501' \
+    '--env CAPSULE_GID=20' \
+    '--env CAPSULE_HOST_WORKDIR=' \
+    '--env CAPSULE_INNER_ENGINE=none' \
+    '--env CAPSULE_REQUIRE_HOST_DOCKER=1' \
+    '--env GIT_CONFIG_KEY_0=safe.directory' \
+    '--env GIT_CONFIG_VALUE_0=*' \
+    'casual-capsule:local claude'; do
+    assert_container_args_contain "$CASE_LOG" "$needle" \
+      "apple run passes $needle"
+  done
+  for needle in --privileged --device --userns '--user ' --uid --gid \
+    /var/lib/capsule/inner CAPSULE_RUNTIME= --tty --cpus --hostname; do
+    assert_container_args_lack "$CASE_LOG" "$needle" \
+      "apple run omits $needle"
+  done
+  assert_file_not_contains "$CASE_LOG" 'PODMAN_ARGS=' \
+    "apple run never calls podman"
+  assert_file_not_contains "$CASE_LOG" 'ARGS=compose' \
+    "apple run never calls compose"
+
+  MOCK_CONTAINER_EXIT=7 run_apple_capsule "$CASE_LOG" true || status=$?
+  assert_equals 7 "$status" "apple run returns the Capsule's exit status"
+}
+
+test_apple_backend_sizes_its_vm() {
+  setup_mock_case apple-vm-size
+
+  CAPSULE_MEMORY='' CAPSULE_CPUS='' run_apple_capsule "$CASE_LOG" true
+  assert_container_args_contain "$CASE_LOG" '--memory 8g' \
+    "an empty CAPSULE_MEMORY keeps the 8g default"
+  assert_container_args_lack "$CASE_LOG" '--cpus' \
+    "an empty CAPSULE_CPUS keeps Apple's CPU default"
+
+  : >"$CASE_LOG"
+  CAPSULE_MEMORY=12g CAPSULE_CPUS=6 run_apple_capsule "$CASE_LOG" true
+  assert_container_args_contain "$CASE_LOG" '--memory 12g' \
+    "CAPSULE_MEMORY sizes the VM"
+  assert_container_args_contain "$CASE_LOG" '--cpus 6' \
+    "CAPSULE_CPUS sizes the VM"
+}
+
+# Apple's own VM resolver does not answer on every Mac, so builds and runs
+# get the host's resolvers unless CAPSULE_DNS says otherwise.
+test_apple_backend_passes_dns_servers() {
+  setup_mock_case apple-dns
+  printf '%s\n' 'nameserver 192.168.2.5' 'nameserver 127.0.0.1' \
+    'nameserver fe80::1%en0' 'nameserver 192.168.2.9' \
+    >"$CASE_DIR/resolv.conf"
+
+  run_apple_capsule "$CASE_LOG" --build true
+  assert_container_args_contain "$CASE_LOG" \
+    'build -t casual-capsule:local' \
+    "the DNS case builds the image"
+  if grep -F 'CONTAINER_ARGS=build' "$CASE_LOG" |
+    grep -Fq -- '--dns 192.168.2.5 --dns 192.168.2.9'; then
+    pass "apple builds use the Mac's resolvers"
+  else
+    fail "apple builds use the Mac's resolvers"
+  fi
+  if grep -F 'CONTAINER_ARGS=run' "$CASE_LOG" |
+    grep -Fq -- '--dns 192.168.2.5 --dns 192.168.2.9'; then
+    pass "apple runs use the Mac's resolvers"
+  else
+    fail "apple runs use the Mac's resolvers"
+  fi
+  assert_container_args_lack "$CASE_LOG" '--dns 127.0.0.1' \
+    "apple skips loopback resolvers a VM cannot reach"
+  assert_container_args_lack "$CASE_LOG" 'fe80' \
+    "apple skips link-local IPv6 resolvers"
+
+  : >"$CASE_LOG"
+  CAPSULE_DNS='1.1.1.1,9.9.9.9' run_apple_capsule "$CASE_LOG" true
+  assert_container_args_contain "$CASE_LOG" '--dns 1.1.1.1 --dns 9.9.9.9' \
+    "CAPSULE_DNS replaces the Mac's resolvers"
+  assert_container_args_lack "$CASE_LOG" '192.168.2.5' \
+    "CAPSULE_DNS drops the Mac's resolvers"
+
+  : >"$CASE_LOG"
+  CAPSULE_DNS=none run_apple_capsule "$CASE_LOG" true
+  assert_container_args_lack "$CASE_LOG" '--dns' \
+    "CAPSULE_DNS=none keeps Apple's own resolver"
+
+  : >"$CASE_LOG"
+  CAPSULE_DNS='' run_apple_capsule "$CASE_LOG" true
+  assert_container_args_contain "$CASE_LOG" '--dns 192.168.2.5' \
+    "an empty CAPSULE_DNS keeps the Mac's resolvers"
+
+  : >"$CASE_LOG"
+  if CAPSULE_DNS='1.1.1.1 bogus' run_apple_capsule "$CASE_LOG" true \
+    2>"$CASE_ERR"; then
+    fail "CAPSULE_DNS rejects an entry that is not an address"
+  else
+    pass "CAPSULE_DNS rejects an entry that is not an address"
+  fi
+  assert_file_contains "$CASE_ERR" 'CAPSULE_DNS must list IP addresses' \
+    "a bad CAPSULE_DNS names the variable"
+  assert_container_args_lack "$CASE_LOG" 'run --rm' \
+    "a bad CAPSULE_DNS starts no Capsule"
+
+  : >"$CASE_LOG"
+  printf 'nameserver 127.0.0.1\n' >"$CASE_DIR/resolv.conf"
+  run_apple_capsule "$CASE_LOG" true
+  assert_container_args_lack "$CASE_LOG" '--dns' \
+    "a Mac with only loopback resolvers falls back to Apple's"
+}
+
 # Run capsule's podman backend as on a Mac, from a workspace inside the home
 # that the podman machine shares.
 run_mac_podman_capsule() {
@@ -4894,6 +5199,365 @@ EOF
     "CAPSULE_DNS also sets podman DNS on Linux"
 }
 
+# Apple rejects container IDs longer than 63 characters.
+test_apple_container_name_fits_the_id_limit() {
+  local long_dir=""
+  local name=""
+
+  setup_mock_case apple-name
+  long_dir="$CASE_DIR/$(printf 'w%.0s' $(seq 80))"
+  mkdir -p "$long_dir"
+  CAPSULE_WORKDIR="$long_dir" run_apple_capsule "$CASE_LOG" true
+
+  name="$(grep -F 'CONTAINER_ARGS=run' "$CASE_LOG" |
+    sed 's/.*--name \([^ ]*\).*/\1/')"
+  if [[ "${#name}" -le 63 && "$name" == capsule-www* ]]; then
+    pass "a long workspace name is shortened to a valid container ID"
+  else
+    fail "a long workspace name is shortened to a valid container ID ($name)"
+  fi
+}
+
+test_apple_backend_keeps_piped_output_clean() {
+  setup_mock_case apple-stdin
+
+  printf 'capsule stdin payload\n' |
+    MOCK_CONTAINER_STDIN_FILE="$CASE_DIR/stdin" \
+      run_apple_capsule "$CASE_LOG" cat >"$CASE_DIR/out"
+
+  assert_equals 'capsule stdin payload' "$(cat "$CASE_DIR/stdin")" \
+    "apple run preserves piped stdin"
+  assert_container_args_contain "$CASE_LOG" '--progress none' \
+    "apple run silences progress lines when output is not a terminal"
+  assert_container_args_lack "$CASE_LOG" '--tty' \
+    "apple run allocates no TTY for piped input"
+}
+
+test_apple_backend_translates_runtime_options() {
+  setup_mock_case apple-options
+
+  run_apple_capsule "$CASE_LOG" --publish 8080:80 \
+    --volume /host/data:/data true
+  assert_container_args_contain "$CASE_LOG" '--publish 8080:80' \
+    "apple run forwards --publish"
+  assert_container_args_contain "$CASE_LOG" '--volume /host/data:/data' \
+    "apple run forwards --volume"
+
+  : >"$CASE_LOG"
+  CAPSULE_PUBLISH='9090:90' CAPSULE_VOLUME='/host/x:/x:ro' \
+    run_apple_capsule "$CASE_LOG" true
+  assert_container_args_contain "$CASE_LOG" '--publish 9090:90' \
+    "apple run forwards CAPSULE_PUBLISH"
+  assert_container_args_contain "$CASE_LOG" '--volume /host/x:/x:ro' \
+    "apple run forwards CAPSULE_VOLUME"
+}
+
+test_apple_backend_mounts_the_token_secret() {
+  local leftover=""
+
+  setup_mock_case apple-secret
+  GITHUB_API_TOKEN=token-value run_apple_capsule "$CASE_LOG" true
+  assert_container_args_contain "$CASE_LOG" \
+    "$CASE_DIR/home/.cache/capsule/runtime/github_api_token." \
+    "apple stages the token under the macOS cache"
+  assert_container_args_contain "$CASE_LOG" \
+    ':/run/secrets/github_api_token:ro' \
+    "apple mounts the token read-only as the runtime secret"
+  assert_file_not_contains "$CASE_LOG" 'token-value' \
+    "apple keeps the token off the command line"
+  leftover="$(find "$CASE_DIR/home/.cache/capsule/runtime" \
+    -name 'github_api_token.*' 2>/dev/null)"
+  assert_equals "" "$leftover" "apple removes the staged token afterwards"
+
+  : >"$CASE_LOG"
+  GITHUB_API_TOKEN='' run_apple_capsule "$CASE_LOG" true
+  assert_container_args_lack "$CASE_LOG" '/run/secrets/github_api_token' \
+    "an empty token mounts no secret"
+}
+
+test_apple_build_uses_container_build() {
+  local needle=""
+
+  setup_mock_case apple-build
+  GITHUB_API_TOKEN=token-value \
+    run_apple_capsule "$CASE_LOG" --build --no-cache true
+  for needle in \
+    'build -t casual-capsule:local' \
+    '--build-arg MISE_VERSION=2024.1.0' \
+    '--build-arg CAPSULE_UID=' \
+    '--no-cache' \
+    '--secret id=github_api_token,env=GITHUB_API_TOKEN'; do
+    assert_container_args_contain "$CASE_LOG" "$needle" \
+      "apple build passes $needle"
+  done
+  assert_container_args_lack "$CASE_LOG" '--format docker' \
+    "apple build needs no Docker format switch"
+  assert_file_not_contains "$CASE_LOG" 'token-value' \
+    "apple build keeps the token off the command line"
+
+  : >"$CASE_LOG"
+  run_apple_capsule "$CASE_LOG" build
+  assert_container_args_contain "$CASE_LOG" 'build -t casual-capsule:local' \
+    "capsule build --runtime apple builds the image"
+  assert_container_args_lack "$CASE_LOG" 'run --rm' \
+    "capsule build --runtime apple starts no Capsule"
+}
+
+test_apple_backend_requires_a_built_image() {
+  setup_mock_case apple-noimage
+
+  if MOCK_CONTAINER_NO_IMAGE=1 run_apple_capsule "$CASE_LOG" true \
+    2>"$CASE_ERR"; then
+    fail "apple refuses to run an image that was never built"
+  else
+    pass "apple refuses to run an image that was never built"
+  fi
+  assert_file_contains "$CASE_ERR" 'capsule build --runtime apple' \
+    "apple names the build command for a missing image"
+  assert_container_args_lack "$CASE_LOG" 'run --rm' \
+    "a missing image starts no Capsule"
+
+  : >"$CASE_LOG"
+  MOCK_CONTAINER_NO_IMAGE=1 CAPSULE_IMAGE=prebuilt:1 \
+    run_apple_capsule "$CASE_LOG" true
+  assert_container_args_contain "$CASE_LOG" 'prebuilt:1 true' \
+    "an explicit CAPSULE_IMAGE skips the local build check"
+}
+
+test_apple_backend_prepares_the_home_volume() {
+  setup_mock_case apple-home
+
+  MOCK_CONTAINER_NO_VOLUME=1 run_apple_capsule "$CASE_LOG" true
+  assert_file_contains "$CASE_LOG" \
+    'CONTAINER_VOLUME_CREATE=volume create casual-capsule-home' \
+    "apple creates a missing home volume quietly first"
+
+  : >"$CASE_LOG"
+  run_apple_capsule "$CASE_LOG" true
+  assert_file_not_contains "$CASE_LOG" 'CONTAINER_VOLUME_CREATE=' \
+    "apple reuses an existing home volume"
+
+  : >"$CASE_LOG"
+  CAPSULE_HOME_VOLUME=my-home run_apple_capsule "$CASE_LOG" true
+  assert_container_args_contain "$CASE_LOG" '--volume my-home:/home/user' \
+    "CAPSULE_HOME_VOLUME names the apple home volume"
+
+  : >"$CASE_LOG"
+  CAPSULE_HOME_VOLUME='' run_apple_capsule "$CASE_LOG" true
+  assert_container_args_contain "$CASE_LOG" \
+    '--volume casual-capsule-home:/home/user' \
+    "an empty CAPSULE_HOME_VOLUME keeps the default"
+}
+
+# Check that an explicit apple request failed before anything started.
+check_apple_refusal() {
+  local label="$1"
+  local reason="$2"
+  local status="$3"
+
+  if [[ "$status" -ne 0 ]]; then
+    pass "explicit apple refuses $label"
+  else
+    fail "explicit apple refuses $label"
+  fi
+  assert_file_contains "$CASE_ERR" "cannot use apple: $reason" \
+    "explicit apple explains $label"
+  assert_file_not_contains "$CASE_LOG" 'CONTAINER_ARGS=' \
+    "a refused apple request runs no container for $label"
+  assert_file_not_contains "$CASE_LOG" 'PODMAN_ARGS=' \
+    "a refused apple request never falls back to podman for $label"
+  assert_file_not_contains "$CASE_LOG" 'ARGS=compose' \
+    "a refused apple request never falls back to compose for $label"
+}
+
+test_explicit_apple_fails_closed() {
+  local host_profile=""
+  local custom_compose=""
+  local status=0
+
+  setup_mock_case apple-refusals
+  mkdir -p "$CASE_DIR/home"
+  host_profile="$CASE_DIR/host-profile"
+  mkdir -p "$host_profile"
+  cat >"$host_profile/capsule.toml" <<'EOF'
+version = 1
+name = "host-profile"
+host = ["example.internal=192.0.2.10"]
+EOF
+  make_custom_compose "$CASE_DIR/custom" "apple-refusal:local"
+  custom_compose="$CASE_DIR/custom/compose.yml"
+
+  : >"$CASE_LOG"
+  status=0
+  CAPSULE_RUNTIME=apple run_capsule "$CASE_BIN" "$CASE_LOG" true \
+    2>"$CASE_ERR" || status=$?
+  check_apple_refusal 'Linux hosts' 'Apple container needs macOS' "$status"
+
+  : >"$CASE_LOG"
+  status=0
+  HOME="$CASE_DIR/home" MOCK_UNAME=Darwin MOCK_UNAME_ARCH=x86_64 \
+    CAPSULE_RUNTIME=apple run_capsule "$CASE_BIN" "$CASE_LOG" true \
+    2>"$CASE_ERR" || status=$?
+  check_apple_refusal 'Intel Macs' 'Apple container needs Apple silicon' \
+    "$status"
+
+  : >"$CASE_LOG"
+  status=0
+  MOCK_CONTAINER_STOPPED=1 run_apple_capsule "$CASE_LOG" true \
+    2>"$CASE_ERR" || status=$?
+  check_apple_refusal 'a stopped service' \
+    'the container service is not running (run: container system start)' \
+    "$status"
+
+  : >"$CASE_LOG"
+  status=0
+  CAPSULE_CUSTOM_COMPOSE="$custom_compose" \
+    run_apple_capsule "$CASE_LOG" true 2>"$CASE_ERR" || status=$?
+  check_apple_refusal 'custom compose files' \
+    'a custom compose file needs the Docker backend' "$status"
+
+  : >"$CASE_LOG"
+  status=0
+  run_apple_capsule "$CASE_LOG" --profile nvidia true \
+    2>"$CASE_ERR" || status=$?
+  check_apple_refusal 'GPU profiles' 'a GPU profile cannot reach a GPU' \
+    "$status"
+
+  : >"$CASE_LOG"
+  status=0
+  run_apple_capsule "$CASE_LOG" --profile "$host_profile" true \
+    2>"$CASE_ERR" || status=$?
+  check_apple_refusal 'profile host mappings' \
+    'profile host mappings need --add-host' "$status"
+
+  : >"$CASE_LOG"
+  status=0
+  run_apple_capsule "$CASE_LOG" --profile "$PROFILE_CAPSULE_DIR" true \
+    2>"$CASE_ERR" || status=$?
+  check_apple_refusal 'profile Dockerfile fragments' \
+    'profile Dockerfile fragments need build contexts' "$status"
+
+  : >"$CASE_LOG"
+  status=0
+  run_apple_capsule "$CASE_LOG" --host-docker true \
+    2>"$CASE_ERR" || status=$?
+  check_apple_refusal '--host-docker' \
+    '--host-docker sockets admit only root' "$status"
+
+  : >"$CASE_LOG"
+  status=0
+  run_apple_capsule "$CASE_LOG" --private-home true \
+    2>"$CASE_ERR" || status=$?
+  check_apple_refusal '--private-home' \
+    '--private-home cannot keep file ownership' "$status"
+
+  if command -v container >/dev/null 2>&1; then
+    skip 'a real container CLI on PATH hides the missing-binary case'
+    return
+  fi
+  rm -f "$CASE_BIN/container"
+  : >"$CASE_LOG"
+  status=0
+  run_apple_capsule "$CASE_LOG" true 2>"$CASE_ERR" || status=$?
+  check_apple_refusal 'a missing container CLI' \
+    'container is not installed' "$status"
+}
+
+# Profiles reach Apple container through a raw env file and host paths.
+test_apple_backend_applies_profile_runtime_settings() {
+  local profile_dir=""
+
+  setup_mock_case apple-profile
+  profile_dir="$CASE_DIR/env-profile"
+  mkdir -p "$profile_dir"
+  cat >"$profile_dir/capsule.toml" <<'EOF'
+version = 1
+name = "env-profile"
+volume = [".:/profile"]
+
+[env]
+APPLE_PROFILE = "enabled"
+EOF
+
+  run_apple_capsule "$CASE_LOG" --profile "$profile_dir" true
+  assert_container_args_contain "$CASE_LOG" '--env-file ' \
+    "apple passes profile environment as an env file"
+  assert_file_contains "$CASE_LOG" 'PROFILE_ENV_ENTRY=APPLE_PROFILE=enabled' \
+    "apple writes profile environment in raw KEY=value form"
+  assert_file_contains "$CASE_LOG" 'PROFILE_ENV_PERMISSIONS=600' \
+    "apple keeps the profile env file private"
+  assert_container_args_contain "$CASE_LOG" \
+    "--volume $profile_dir:/profile" \
+    "apple mounts profile volumes from the launcher path"
+}
+
+test_list_finds_apple_capsules() {
+  local json=""
+
+  if ! command -v jq >/dev/null 2>&1; then
+    skip 'apple listing tests need jq'
+    return
+  fi
+  setup_mock_case apple-list
+  json='[{"configuration":{"id":"capsule-ws-1",'
+  json+='"image":{"reference":"docker.io/library/casual-capsule:local"},'
+  json+='"initProcess":{"environment":["CAPSULE_UID=501",'
+  json+='"SECRET_TOKEN=hidden-value","CAPSULE_HOST_WORKDIR=/srv/apple"]},'
+  json+='"publishedPorts":[{"hostAddress":"127.0.0.1","hostPort":8080,'
+  json+='"containerPort":80,"proto":"tcp"}]},"status":{"state":"running",'
+  json+='"startedDate":"2026-11-02T23:22:07Z"}},'
+  json+='{"configuration":{"id":"buildkit","initProcess":'
+  json+='{"environment":["PATH=/bin"]}},"status":{"state":"running"}}]'
+
+  MOCK_CONTAINER_LS="$json" MOCK_ID_USER=bob \
+    run_apple_capsule "$CASE_LOG" list >"$CASE_DIR/out"
+  assert_file_contains "$CASE_DIR/out" 'apple' \
+    "list labels Apple container Capsules"
+  assert_file_contains "$CASE_DIR/out" 'bob' \
+    "list resolves the Apple Capsule creator"
+  assert_file_contains "$CASE_DIR/out" '/srv/apple' \
+    "list reports the Apple Capsule host workdir"
+  assert_file_contains "$CASE_DIR/out" '127.0.0.1:8080->80/tcp' \
+    "list reports the Apple Capsule ports"
+  assert_file_not_contains "$CASE_DIR/out" 'buildkit' \
+    "list skips Apple containers that are not Capsules"
+
+  CAPSULE_DEBUG=1 MOCK_CONTAINER_LS="$json" \
+    run_apple_capsule "$CASE_LOG" list >/dev/null 2>"$CASE_ERR"
+  assert_file_not_contains "$CASE_ERR" 'hidden-value' \
+    "the list debug trace hides other Apple container environment"
+
+  : >"$CASE_LOG"
+  CAPSULE_RUNTIME=auto DOCKER_GID=1111 \
+    run_capsule "$CASE_BIN" "$CASE_LOG" list >/dev/null
+  assert_file_not_contains "$CASE_LOG" 'CONTAINER_LS_ARGS=' \
+    "auto listing off macOS never queries Apple container"
+
+  : >"$CASE_LOG"
+  CAPSULE_RUNTIME=auto MOCK_CONTAINER_STOPPED=1 \
+    run_apple_capsule "$CASE_LOG" list >/dev/null 2>"$CASE_ERR"
+  assert_file_not_contains "$CASE_LOG" 'CONTAINER_LS_ARGS=' \
+    "auto listing skips a stopped Apple container service"
+  assert_file_not_contains "$CASE_ERR" 'apple Capsules' \
+    "auto listing stays quiet about a stopped Apple container service"
+  assert_file_not_contains "$CASE_ERR" 'cannot query apple' \
+    "auto listing does not warn about a stopped Apple container service"
+
+  MOCK_CONTAINER_LS="$json" CAPSULE_RUNTIME=auto \
+    run_apple_capsule "$CASE_LOG" list >"$CASE_DIR/out"
+  assert_file_contains "$CASE_DIR/out" '/srv/apple' \
+    "auto listing on macOS includes Apple container Capsules"
+
+  if MOCK_CONTAINER_STOPPED=1 run_apple_capsule "$CASE_LOG" list \
+    >/dev/null 2>"$CASE_ERR"; then
+    fail "explicit apple listing fails on a stopped service"
+  else
+    pass "explicit apple listing fails on a stopped service"
+  fi
+  assert_file_contains "$CASE_ERR" 'cannot list apple Capsules' \
+    "explicit apple listing says why it failed"
+}
+
 # Build a doctor PATH that looks like an Apple silicon Mac.
 make_apple_doctor_bin() {
   local dir="$1"
@@ -4910,7 +5574,18 @@ else
 fi
 EOF
   printf '#!/usr/bin/env bash\nprintf "27.0.1\\n"\n' >"$dir/sw_vers"
-  chmod +x "$dir/uname" "$dir/sw_vers"
+  cat >"$dir/container" <<'EOF'
+#!/usr/bin/env bash
+kernel='{"kernel":{"binaryPath":"vmlinux"}}'
+case "$*" in
+  'system status') exit "${MOCK_CONTAINER_STOPPED:-0}" ;;
+  'system property list --format json')
+    printf '%s\n' "${MOCK_CONTAINER_PROPERTIES:-$kernel}"
+    ;;
+esac
+exit 0
+EOF
+  chmod +x "$dir/uname" "$dir/sw_vers" "$dir/container"
 }
 
 # On a Mac the doctor names the DNS servers podman Capsules will get.
@@ -4943,6 +5618,134 @@ EOF
   assert_file_contains "$out_file" \
     "podman Capsules use podman machine's own resolver (CAPSULE_DNS=none)" \
     "the doctor reports when podman Capsules keep the machine's resolver"
+}
+
+test_doctor_reports_apple_backend_on_macos() {
+  local tdir="$TEST_TMPDIR/doctor-apple"
+  local bin_dir="$tdir/bin"
+  local out_file="$tdir/out"
+  mkdir -p "$tdir"
+  make_apple_doctor_bin "$bin_dir"
+
+  printf 'nameserver 192.0.2.53\n' >"$tdir/resolv.conf"
+  export CAPSULE_RESOLV_CONF="$tdir/resolv.conf"
+  PATH="$bin_dir" "$DOCTOR_PATH" >"$out_file" 2>&1 || true
+  assert_file_contains "$out_file" \
+    'Apple container backend (opt-in: --runtime apple)' \
+    "the doctor checks Apple container on macOS"
+  assert_file_contains "$out_file" 'PASS  the container service is running' \
+    "the doctor passes a running Apple container service"
+  assert_file_contains "$out_file" \
+    'PASS  a Linux kernel is configured for container VMs' \
+    "the doctor passes a configured Apple container kernel"
+  assert_file_contains "$out_file" \
+    "PASS  container VMs use DNS 192.0.2.53 (from the Mac's resolvers)" \
+    "the doctor names the DNS servers container VMs get"
+
+  PATH="$bin_dir" CAPSULE_DNS='1.1.1.1 bogus' \
+    "$DOCTOR_PATH" >"$out_file" 2>&1 || true
+  assert_file_contains "$out_file" \
+    'FAIL  CAPSULE_DNS lists something that is not an IP address' \
+    "the doctor fails a CAPSULE_DNS that is not an address"
+
+  printf 'nameserver 127.0.0.1\n' >"$tdir/resolv.conf"
+  PATH="$bin_dir" "$DOCTOR_PATH" >"$out_file" 2>&1 || true
+  assert_file_contains "$out_file" 'set CAPSULE_DNS, for example' \
+    "the doctor names the fix when no host resolver is reachable"
+  printf 'nameserver 192.0.2.53\n' >"$tdir/resolv.conf"
+
+  PATH="$bin_dir" MOCK_CONTAINER_STOPPED=1 \
+    "$DOCTOR_PATH" >"$out_file" 2>&1 || true
+  assert_file_contains "$out_file" 'run: container system start' \
+    "the doctor names the fix for a stopped Apple container service"
+
+  PATH="$bin_dir" MOCK_CONTAINER_PROPERTIES='{"kernel":{}}' \
+    "$DOCTOR_PATH" >"$out_file" 2>&1 || true
+  assert_file_contains "$out_file" \
+    'run: container system kernel set --recommended' \
+    "the doctor names the fix for a missing Apple container kernel"
+
+  rm -f "$bin_dir/container"
+  PATH="$bin_dir" "$DOCTOR_PATH" >"$out_file" 2>&1 || true
+  assert_file_contains "$out_file" 'container is not installed' \
+    "the doctor reports a missing Apple container CLI"
+
+  make_doctor_bin "$tdir/linux-bin"
+  PATH="$tdir/linux-bin" "$DOCTOR_PATH" >"$out_file" 2>&1 || true
+  assert_file_not_contains "$out_file" 'Apple container' \
+    "the doctor prints no Apple section off macOS"
+  unset CAPSULE_RESOLV_CONF
+}
+
+test_completion_offers_apple_runtime() {
+  local tdir="$TEST_TMPDIR/completion-apple"
+  local shell=""
+  mkdir -p "$tdir"
+
+  "$CAPSULE_BIN" completion bash >"$tdir/bash"
+  # shellcheck disable=SC2016  # expanded by the completion shell
+  COMPLETION_FILE="$tdir/bash" bash -c '
+    source "$COMPLETION_FILE"
+    COMP_WORDS=(capsule --runtime a)
+    COMP_CWORD=2
+    _capsule
+    printf "%s\n" "${COMPREPLY[@]}"
+  ' >"$tdir/candidates"
+  assert_file_contains "$tdir/candidates" 'apple' \
+    "Bash completion offers the apple runtime"
+  assert_file_contains "$tdir/candidates" 'auto' \
+    "Bash completion still offers the auto runtime"
+  for shell in zsh fish; do
+    "$CAPSULE_BIN" completion "$shell" >"$tdir/$shell"
+    assert_file_contains "$tdir/$shell" 'auto docker podman apple' \
+      "$shell completion offers the apple runtime"
+  done
+}
+
+test_router_fails_fast_without_an_inner_engine() {
+  local dir="$TEST_TMPDIR/router-no-engine"
+  make_router_env "$dir"
+
+  if CAPSULE_INNER_ENGINE=none CAPSULE_REQUIRE_HOST_DOCKER=1 \
+    run_router "$dir" docker ps >"$dir/out" 2>&1; then
+    fail "docker fails in a Capsule without an engine"
+  else
+    pass "docker fails in a Capsule without an engine"
+  fi
+  assert_file_contains "$dir/out" \
+    'this Capsule has no container engine (apple runtime)' \
+    "docker names the missing engine"
+  if [[ -e "$dir/state/podman.sock" || -e "$dir/routed" ]]; then
+    fail "a Capsule without an engine never starts one"
+  else
+    pass "a Capsule without an engine never starts one"
+  fi
+
+  if CAPSULE_INNER_ENGINE=none \
+    run_router "$dir" capsule-docker use-dockerd >"$dir/out" 2>&1; then
+    fail "capsule-docker use-dockerd fails without an engine"
+  else
+    pass "capsule-docker use-dockerd fails without an engine"
+  fi
+  CAPSULE_INNER_ENGINE=none \
+    run_router "$dir" capsule-docker status >"$dir/out" 2>&1 || true
+  assert_file_contains "$dir/out" 'engine: none (apple runtime)' \
+    "capsule-docker status reports the missing engine"
+
+  stop_router_env "$dir"
+}
+
+# shellcheck disable=SC2016
+test_entrypoint_seeds_an_empty_apple_home() {
+  assert_file_contains "$ENTRYPOINT_PATH" \
+    '[ "${CAPSULE_INNER_ENGINE:-}" = "none" ]' \
+    "entrypoint seeds a home only in a Capsule without an engine"
+  assert_file_contains "$ENTRYPOINT_PATH" \
+    '! -name lost+found -print -quit' \
+    "entrypoint seeds only a home that holds nothing but lost+found"
+  assert_file_contains "$ENTRYPOINT_PATH" \
+    'cp -a /etc/skel/. "$TARGET_HOME"/' \
+    "entrypoint seeds the home from /etc/skel"
 }
 
 test_podman_backend_runs_container_with_keep_id() {
@@ -5746,6 +6549,10 @@ test_router_endpoint_contract() {
     "$(run_router "$dir" capsule-docker endpoint)" \
     "endpoint gives the bound host socket precedence"
   rm "$dir/hostsock"
+  assert_equals "$(printf 'none\tnone\t-')" \
+    "$(CAPSULE_INNER_ENGINE=none \
+      run_router "$dir" capsule-docker endpoint)" \
+    "endpoint reports the Apple runtime's absent engine without starting one"
   stop_router_env "$dir"
 }
 
@@ -6855,8 +7662,27 @@ main() {
   test_entrypoint_inner_storage_ownership
   test_podman_image_contract
   test_entrypoint_non_root_contract
+  test_runtime_selection_accepts_apple
+  test_auto_never_selects_apple
+  test_apple_backend_runs_with_the_root_entrypoint
+  test_apple_backend_sizes_its_vm
+  test_apple_backend_passes_dns_servers
   test_podman_backend_passes_mac_dns_servers
+  test_apple_container_name_fits_the_id_limit
+  test_apple_backend_keeps_piped_output_clean
+  test_apple_backend_translates_runtime_options
+  test_apple_backend_mounts_the_token_secret
+  test_apple_build_uses_container_build
+  test_apple_backend_requires_a_built_image
+  test_apple_backend_prepares_the_home_volume
+  test_explicit_apple_fails_closed
+  test_apple_backend_applies_profile_runtime_settings
+  test_list_finds_apple_capsules
+  test_doctor_reports_apple_backend_on_macos
   test_doctor_reports_podman_dns_on_macos
+  test_completion_offers_apple_runtime
+  test_router_fails_fast_without_an_inner_engine
+  test_entrypoint_seeds_an_empty_apple_home
 
   harness_summary
 }

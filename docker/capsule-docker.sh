@@ -164,6 +164,11 @@ resolve_endpoint() {
   fi
 
   if [[ -z "$engine" ]]; then
+    if [[ "${CAPSULE_INNER_ENGINE:-}" == none && ! -e "$HOST_SOCKET" ]]; then
+      [[ "$start" -eq 0 ]] || require_inner_engine
+      printf 'none\tnone\t-\n'
+      return
+    fi
     case "${CAPSULE_REQUIRE_HOST_DOCKER:-0}" in
       1|true|yes|on)
         if [[ "$start" -eq 1 ]]; then
@@ -173,6 +178,11 @@ resolve_endpoint() {
         return
         ;;
     esac
+    if [[ "${CAPSULE_INNER_ENGINE:-}" == "none" ]]; then
+      [[ "$start" -eq 0 ]] || require_inner_engine
+      printf 'none\tnone\t-\n'
+      return
+    fi
     engine="$(current_engine)"
   fi
 
@@ -200,6 +210,16 @@ cmd_endpoint() {
     die 'usage: capsule-docker endpoint [--start]'
   fi
   resolve_endpoint "$start"
+}
+
+# Stop when this Capsule has no engine of its own: an Apple container VM
+# cannot run podman or dockerd, which would otherwise fail only later, at the
+# first container they try to start.
+require_inner_engine() {
+  if [[ "${CAPSULE_INNER_ENGINE:-}" == "none" ]]; then
+    die 'this Capsule has no container engine (apple runtime);' \
+      'use --runtime podman or docker to run containers'
+  fi
 }
 
 # Route a docker command to the active engine.
@@ -281,6 +301,7 @@ run_docker() {
 
 # Switch this Capsule to the real Docker daemon and start it.
 cmd_use_dockerd() {
+  require_inner_engine
   ensure_state_dir
   start_dockerd
   printf 'dockerd\n' >"$ENGINE_FILE"
@@ -306,6 +327,8 @@ cmd_status() {
 
   if socket_responds "$HOST_SOCKET"; then
     printf 'engine: host docker socket (--host-docker)\n'
+  elif [[ "${CAPSULE_INNER_ENGINE:-}" == "none" ]]; then
+    printf 'engine: none (apple runtime)\n'
   else
     printf 'engine: %s\n' "$engine"
   fi

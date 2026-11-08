@@ -14,6 +14,8 @@ set -euo pipefail
 ROOT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
 # shellcheck disable=SC1091
 source "$ROOT_DIR/lib/capsule/podman.sh"
+# shellcheck disable=SC1091
+source "$ROOT_DIR/lib/capsule/apple.sh"
 SCRIPT_PATH="$ROOT_DIR/capsule.sh"
 EXAMPLE_PROJECT_DIR="$ROOT_DIR/tests/fixtures/example-project"
 CUSTOM_CAPSULE_DIR="$ROOT_DIR/tests/fixtures/custom-capsule"
@@ -272,6 +274,88 @@ test_podman_backend_end_to_end() {
   else
     fail "the Capsule writes to its workspace as the calling user"
   fi
+}
+
+# Apple container needs a Mac with its service started, which no CI runner
+# provides, so its case runs only when CAPSULE_E2E_APPLE=1 opts in. Without
+# that it stays silent, so strict CI runs never count it as a skip.
+require_apple_prereqs() {
+  local reason=""
+
+  [[ "${CAPSULE_E2E_APPLE:-}" == "1" ]] || return 1
+  reason="$(apple_host_reason)"
+  if [[ -n "$reason" ]]; then
+    skip "$1: $reason"
+    return 1
+  fi
+}
+
+# Verify the Apple container backend on a real Mac: the root entrypoint
+# drops to the host user, writes land as that user, git accepts the
+# root-looking workspace, and docker fails at once without an engine.
+test_apple_backend_end_to_end() {
+  local tdir="$TEST_TMPDIR/apple-e2e"
+  local config_file="$tdir/config"
+  local workspace="$tdir/workspace"
+  local check_cmd=""
+  local status=0
+
+  if ! require_apple_prereqs "apple e2e"; then
+    return
+  fi
+  mkdir -p "$tdir" "$workspace"
+  log_message "Starting test_apple_backend_end_to_end"
+
+  cp \
+    "$EXAMPLE_PROJECT_DIR/check-env.sh" \
+    "$EXAMPLE_PROJECT_DIR/fixture.txt" \
+    "$workspace/"
+  write_approval_config "$config_file" "$workspace"
+
+  # shellcheck disable=SC2016
+  check_cmd='read -r payload && [[ "$payload" == "capsule stdin ok" ]]'
+  check_cmd+=' && printf "capsule stdin ok\n" && bash ./check-env.sh'
+  check_cmd+=' && touch written-by-capsule'
+  check_cmd+=' && git init -q git-check && git -C git-check status >/dev/null'
+  check_cmd+=' && printf "capsule git ok\n"'
+  check_cmd+=' && ! docker ps 2>docker-err'
+  check_cmd+=' && grep -q "no container engine" docker-err'
+  check_cmd+=' && printf "capsule no engine ok\n"'
+
+  log_message "Running capsule.sh --runtime apple --build"
+  # shellcheck disable=SC2016
+  if printf 'capsule stdin ok\n' | run_logged bash -c '
+    unset CAPSULE_WORKDIR
+    cd "$1" &&
+      CAPSULE_CONFIG="$2" CAPSULE_RUNTIME=apple \
+      "$3" --build bash -lc "$4"
+  ' bash "$workspace" "$config_file" "$SCRIPT_PATH" "$check_cmd"; then
+    assert_file_contains "$LOG_FILE" "capsule stdin ok" \
+      "the Apple Capsule preserves piped stdin end to end"
+    assert_file_contains "$LOG_FILE" "capsule example ok" \
+      "the Apple Capsule runs as the image user in its workspace"
+    assert_file_contains "$LOG_FILE" "capsule git ok" \
+      "git accepts the Apple Capsule's root-looking workspace"
+    assert_file_contains "$LOG_FILE" "capsule no engine ok" \
+      "docker fails at once in the Apple Capsule"
+  else
+    fail "the Apple Capsule runs end to end"
+  fi
+
+  if [[ -f "$workspace/written-by-capsule" ]] && \
+    [[ "$(stat -f %u "$workspace/written-by-capsule")" == "$(id -u)" ]]; then
+    pass "the Apple Capsule writes to its workspace as the calling user"
+  else
+    fail "the Apple Capsule writes to its workspace as the calling user"
+  fi
+
+  # shellcheck disable=SC2016
+  run_logged bash -c '
+    unset CAPSULE_WORKDIR
+    cd "$1" &&
+      CAPSULE_CONFIG="$2" CAPSULE_RUNTIME=apple "$3" sh -c "exit 7"
+  ' bash "$workspace" "$config_file" "$SCRIPT_PATH" || status=$?
+  assert_equals 7 "$status" "the Apple Capsule returns its exit status"
 }
 
 # Verify profile image and runtime settings through the Docker backend.
@@ -545,6 +629,7 @@ main() {
   test_unbuilt_profile_fails_before_container_creation
   test_profile_from_docker_controller_container
   test_podman_backend_end_to_end
+  test_apple_backend_end_to_end
   cleanup_test_images
   trap - EXIT
 

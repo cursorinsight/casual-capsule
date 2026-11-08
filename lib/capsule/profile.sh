@@ -913,7 +913,7 @@ profile_absolute_source() {
 # Return success when the backend drives an engine CLI on this host instead
 # of Compose, so profiles use launcher paths and raw environment files.
 backend_runs_engine_cli() {
-  [[ "$RUNTIME_BACKEND" == "podman" ]]
+  [[ "$RUNTIME_BACKEND" == "podman" || "$RUNTIME_BACKEND" == "apple" ]]
 }
 
 # Map a launcher-visible source to the path seen by the selected daemon.

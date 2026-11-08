@@ -159,3 +159,29 @@ jobs:
           bash -c 'printf "Bash %s\n" "$BASH_VERSION"'
           bash -c '[[ "$BASH_VERSION" == 3.2.* ]]'
           bash tests/suite_fast.sh
+
+      - name: Start Apple container
+        run: |
+          brew install container
+          container system start --enable-kernel-install
+
+      # Each Apple container is a VM, and GitHub's macOS runners are VMs
+      # without nested virtualization, so only the host checks can pass.
+      - name: Check the Apple container host
+        run: |
+          bin/capsule doctor | tee "$RUNNER_TEMP/doctor.txt"
+          for check in \
+            'container is installed' \
+            'the container service is running' \
+            'a Linux kernel is configured for container VMs'; do
+            if ! grep -Fxq "PASS  $check" "$RUNNER_TEMP/doctor.txt"; then
+              printf '::error::doctor did not pass: %s\n' "$check"
+              exit 1
+            fi
+          done
+
+      - name: Probe whether a container VM boots
+        if: github.event_name == 'workflow_dispatch'
+        continue-on-error: true
+        timeout-minutes: 5
+        run: container run --rm debian:trixie-slim true

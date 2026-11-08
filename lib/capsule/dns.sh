@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 
-# On a Mac, the podman backend runs Capsules in a VM whose own resolver
-# does not answer quickly on every network. Pass the Mac's resolvers in
-# instead of forwarding lookups through podman machine's resolver.
+# On a Mac, the apple and podman backends run Capsules in a VM whose own
+# resolver does not answer quickly on every network: Apple container's, and
+# podman machine's, which pasta forwards to. So both pass the Mac's resolvers
+# in instead.
 
 # Print the DNS servers a Capsule should use, one per line, or nothing to keep
 # the engine's own resolver: CAPSULE_DNS when set, else on macOS the IPv4

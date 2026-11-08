@@ -20,7 +20,7 @@ Options:
       --no-cache            Disable build cache.
       --profile NAME|PATH   Apply a Capsule profile. Repeatable.
   -r, --remote HOST[:PORT]  Build on a remote Docker host over SSH.
-      --runtime RUNTIME     Use auto, docker, or podman (default: auto).
+      --runtime RUNTIME     Use auto, docker, podman, or apple (default: auto).
   -h, --help                Show this help message.
 
 Environment:

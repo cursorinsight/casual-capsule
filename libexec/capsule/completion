@@ -64,7 +64,7 @@ _capsule() {
   case "$prev" in
     --runtime)
       # shellcheck disable=SC2207
-      COMPREPLY=($(compgen -W 'auto docker podman' -- "$cur"))
+      COMPREPLY=($(compgen -W 'auto docker podman apple' -- "$cur"))
       return
       ;;
     --profile)
@@ -151,7 +151,7 @@ _capsule_run_arguments() {
     '*--profile[apply a profile]:profile name or path:_capsule_profiles' \
     '--publish[map a port]:port mapping:' \
     '(-r --remote)'{-r,--remote}'[run remotely]:remote target:' \
-    '--runtime[select runtime]:runtime:(auto docker podman)' \
+    '--runtime[select runtime]:runtime:(auto docker podman apple)' \
     '--host-docker[bind the host Docker socket]' \
     '(-v --volume)'{-v,--volume}'[mount a volume]:volume mapping:' \
     '--build-custom[build custom image before running]' \
@@ -194,13 +194,13 @@ _capsule() {
         '--no-cache[disable build cache]' \
         '*--profile[apply a profile]:profile name or path:_capsule_profiles' \
         '(-r --remote)'{-r,--remote}'[build remotely]:remote target:' \
-        '--runtime[select runtime]:runtime:(auto docker podman)' \
+        '--runtime[select runtime]:runtime:(auto docker podman apple)' \
         '(-h --help)'{-h,--help}'[show help]'
       ;;
     list)
       _arguments \
         '(-r --remote)'{-r,--remote}'[query remote host]:remote host:' \
-        '--runtime[select runtime]:runtime:(auto docker podman)' \
+        '--runtime[select runtime]:runtime:(auto docker podman apple)' \
         '(-h --help)'{-h,--help}'[show help]'
       ;;
     doctor|dr)
@@ -276,7 +276,7 @@ complete -c capsule -n '__fish_capsule_using_run' -l profile -r \
 complete -c capsule -n '__fish_capsule_using_run' -l publish -r
 complete -c capsule -n '__fish_capsule_using_run' -s r -l remote -r
 complete -c capsule -n '__fish_capsule_using_run' -l runtime -r \
-  -a 'auto docker podman'
+  -a 'auto docker podman apple'
 complete -c capsule -n '__fish_capsule_using_run' -l host-docker
 complete -c capsule -n '__fish_capsule_using_run' -s v -l volume -r
 complete -c capsule -n '__fish_capsule_using_run' -l build-custom
@@ -289,11 +289,11 @@ complete -c capsule -n '__fish_seen_subcommand_from build' -l profile -r \
   -a '(__fish_capsule_profiles) (__fish_complete_directories)'
 complete -c capsule -n '__fish_seen_subcommand_from build' -s r -l remote -r
 complete -c capsule -n '__fish_seen_subcommand_from build' -l runtime -r \
-  -a 'auto docker podman'
+  -a 'auto docker podman apple'
 
 complete -c capsule -n '__fish_seen_subcommand_from list' -s r -l remote -r
 complete -c capsule -n '__fish_seen_subcommand_from list' -l runtime -r \
-  -a 'auto docker podman'
+  -a 'auto docker podman apple'
 
 complete -c capsule -n '__fish_seen_subcommand_from completion' \
   -a 'bash zsh fish'
