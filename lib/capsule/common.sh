@@ -13,6 +13,10 @@ if [[ -z "${CAPSULE_ROOT:-}" ]]; then
 fi
 # shellcheck disable=SC1091
 source "$CAPSULE_ROOT/lib/capsule/podman.sh"
+# shellcheck disable=SC1091
+source "$CAPSULE_ROOT/lib/capsule/apple.sh"
+# shellcheck disable=SC1091
+source "$CAPSULE_ROOT/lib/capsule/dns.sh"
 SCRIPT_DIR="$CAPSULE_ROOT"
 readonly SCRIPT_DIR
 readonly CAPSULE_CONTAINER_WORKDIR="/home/workspace"
@@ -22,8 +26,10 @@ readonly DEFAULT_DOCKER_GID="999"
 readonly DEFAULT_DARWIN_DOCKER_GID="991"
 readonly DEFAULT_PODMAN_IMAGE="casual-capsule:local"
 readonly DEFAULT_PODMAN_HOME_VOLUME="casual-capsule-home"
-readonly CAPSULE_INNER_DIR="/var/lib/capsule/inner"
-readonly CAPSULE_HOST_SOCKET="/var/lib/capsule/docker.sock"
+readonly DEFAULT_APPLE_MEMORY="8g"
+readonly CAPSULE_INNER_DIR="${CAPSULE_INNER_DIR:-/var/lib/capsule/inner}"
+CAPSULE_HOST_SOCKET="${CAPSULE_HOST_SOCKET:-/var/lib/capsule/docker.sock}"
+readonly CAPSULE_HOST_SOCKET
 readonly CAPSULE_SECRET_PATH="/run/secrets/github_api_token"
 
 # shellcheck source=lib/capsule/profile.sh
@@ -46,6 +52,12 @@ REMOTE_SSH_PORT=""
 REMOTE_WORKDIR=""
 LOCAL_APPROVAL_PATH=""
 IN_NESTED_CAPSULE=0
+OUTER_CAPSULE_WORKDIR=""
+DOCKER_TARGET_SCOPE=""
+DOCKER_TARGET_ENGINE=""
+DOCKER_TARGET_ENDPOINT=""
+BASE_IMAGE_CONTEXT=""
+BASE_IMAGE_OVERRIDE=""
 RUNTIME_SELECTION=""
 RUNTIME_BACKEND=""
 HOST_DOCKER=0
@@ -53,6 +65,8 @@ PODMAN_RUN_ARGS=()
 PODMAN_CONTAINER_NAME=""
 PODMAN_SECRET_FILE=""
 PODMAN_INFO_OUTPUT=""
+APPLE_RUN_ARGS=()
+DNS_ARGS=()
 BASE_COMPOSE_CMD=()
 COMPOSE_CMD=()
 CAPSULE_PROFILE_HOME=""
@@ -174,6 +188,9 @@ initialize_workdir_state() {
   local mapped_workdir=""
   local original_host_workdir="${CAPSULE_HOST_WORKDIR:-}"
 
+  # Consumed by profile_daemon_source in the sourced profile module.
+  # shellcheck disable=SC2034
+  OUTER_CAPSULE_WORKDIR="$original_host_workdir"
   export CAPSULE_WORKDIR="${CAPSULE_WORKDIR:-$(pwd -P)}"
   LOCAL_APPROVAL_PATH="$CAPSULE_WORKDIR"
   IN_NESTED_CAPSULE=0
@@ -211,6 +228,55 @@ initialize_workdir_state() {
   # resolve back to a daemon-host path. Without that, fall back to the local
   # path and let Docker surface any mount error.
   export CAPSULE_HOST_WORKDIR="$CAPSULE_WORKDIR"
+}
+
+# Ask the in-Capsule router where the selected daemon sees bind sources.
+# Plain host Docker installations do not need the router or Podman.
+configure_docker_target() {
+  local resolved=""
+  local status=""
+
+  [[ -z "$REMOTE_HOST" ]] || return 0
+  command -v capsule-docker >/dev/null 2>&1 || return 0
+  if ! resolved="$(capsule-docker endpoint 2>/dev/null)"; then
+    # Older Docker-backed images already have the correct host mapping.
+    status="$(capsule-docker status 2>/dev/null || true)"
+    if [[ "$status" == 'engine: host docker socket '* || \
+          "$status" == 'engine: none '* ]]; then
+      return 0
+    fi
+    die 'rebuild the outer Capsule image to resolve its inner engine endpoint'
+  fi
+  IFS=$'\t' read -r DOCKER_TARGET_SCOPE DOCKER_TARGET_ENGINE \
+    DOCKER_TARGET_ENDPOINT <<<"$resolved"
+  case "$DOCKER_TARGET_SCOPE" in
+    host|external|none) return 0 ;;
+    local)
+      case "$DOCKER_TARGET_ENGINE:$DOCKER_TARGET_ENDPOINT" in
+        podman:unix:///*|dockerd:unix:///*) ;;
+        *) die 'invalid local engine endpoint from capsule-docker' ;;
+      esac
+      export CAPSULE_HOST_WORKDIR="$CAPSULE_WORKDIR"
+      LOCAL_APPROVAL_PATH="$CAPSULE_WORKDIR"
+      export CAPSULE_DOCKER_SOCKET_SOURCE="${DOCKER_TARGET_ENDPOINT#unix://}"
+      ;;
+    *) die 'invalid engine scope from capsule-docker' ;;
+  esac
+}
+
+# Start and pin a private target only after workspace approval.
+start_docker_target() {
+  local resolved=""
+  local expected=""
+
+  [[ "$DOCKER_TARGET_SCOPE" == "local" ]] || return 0
+  resolved="$(capsule-docker endpoint --start)"
+  expected="$(printf 'local\t%s\t%s' \
+    "$DOCKER_TARGET_ENGINE" "$DOCKER_TARGET_ENDPOINT")"
+  [[ "$resolved" == "$expected" ]] || \
+    die 'engine selection changed during launch; retry the command'
+  unset DOCKER_CONTEXT
+  export DOCKER_HOST="$DOCKER_TARGET_ENDPOINT"
 }
 
 # Resolve "id -u" or "id -g", with a default fallback.
@@ -258,6 +324,11 @@ initialize_user_ids() {
 
 # Reset mutable option state before parsing arguments.
 initialize_runtime_state() {
+  DOCKER_TARGET_SCOPE=""
+  DOCKER_TARGET_ENGINE=""
+  DOCKER_TARGET_ENDPOINT=""
+  BASE_IMAGE_CONTEXT=""
+  BASE_IMAGE_OVERRIDE=""
   BUILD_MODE="none"
   BUILD_MODE_FLAG=""
   NO_CACHE=0
@@ -277,6 +348,8 @@ initialize_runtime_state() {
   PODMAN_CONTAINER_NAME=""
   PODMAN_SECRET_FILE=""
   PODMAN_INFO_OUTPUT=""
+  APPLE_RUN_ARGS=()
+  DNS_ARGS=()
   BASE_COMPOSE_CMD=()
   COMPOSE_CMD=()
   initialize_profile_state
@@ -317,7 +390,7 @@ Options:
       --profile NAME|PATH  Apply a Capsule profile. Repeatable.
       --publish HOST[:CONTAINER]  Publish port on host machine. Repeatable.
   -r, --remote HOST[:PORT]:/abs/path  Run on a remote Docker host over SSH.
-      --runtime podman|docker|auto  Backend to run in (default: auto).
+      --runtime podman|docker|apple|auto  Backend (default: auto).
       --host-docker  Bind the host Docker socket into the Capsule.
   -v, --volume HOST:CONTAINER[:OPTIONS]  Bind-mount a host path. Repeatable.
       --build-custom  Build only the configured profile/custom image first.
@@ -343,10 +416,14 @@ Environment:
   CAPSULE_VOLUME   Semicolon-separated --volume specs.
   CAPSULE_WORKDIR  Workspace directory (default: cwd).
   CAPSULE_CUSTOM_COMPOSE  Optional legacy Compose override file.
-  CAPSULE_RUNTIME  Backend to run in: auto, podman, or docker.
-  CAPSULE_IMAGE    Image tag the podman backend builds and runs.
-  CAPSULE_HOME_VOLUME  podman volume mounted at /home/user.
-  CAPSULE_INNER_VOLUME  Volume holding the inner engine state.
+  CAPSULE_RUNTIME  Backend to run in: auto, podman, docker, or apple.
+  CAPSULE_IMAGE    Image tag the podman and apple backends build and run.
+  CAPSULE_HOME_VOLUME  podman or apple volume mounted at /home/user.
+  CAPSULE_INNER_VOLUME  Volume holding the podman inner engine state.
+  CAPSULE_MEMORY   Apple container VM memory (default: 8g).
+  CAPSULE_CPUS     Apple container VM CPUs (default: Apple's).
+  CAPSULE_DNS      DNS servers for apple and podman Capsules, or none
+                   (default: on macOS, the Mac's).
   CAPSULE_WITH_DOCKERD  Build the image with a real dockerd.
 EOF
 }
@@ -480,11 +557,11 @@ set_runtime_selection() {
   local selection="$1"
 
   case "$selection" in
-    auto|docker|podman)
+    auto|docker|podman|apple)
       RUNTIME_SELECTION="$selection"
       ;;
     *)
-      die "unknown runtime: $selection (use podman, docker, or auto)"
+      die "unknown runtime: $selection (use podman, docker, apple, or auto)"
       ;;
   esac
 }
@@ -550,7 +627,7 @@ parse_args() {
         ;;
       --runtime)
         if [[ $# -lt 2 ]] || [[ "${2:-}" == -* ]]; then
-          die '--runtime requires podman, docker, or auto'
+          die '--runtime requires podman, docker, apple, or auto'
         fi
         set_runtime_selection "$2"
         shift 2
@@ -818,12 +895,14 @@ configure_private_home() {
       if [[ -z "$CAPSULE_HOME_HOST_DIR" ]]; then
         die 'failed to resolve remote private home path'
       fi
-    elif [[ "$IN_NESTED_CAPSULE" -eq 1 ]]; then
+    elif [[ "$IN_NESTED_CAPSULE" -eq 1 && \
+            "$DOCKER_TARGET_SCOPE" != "local" ]]; then
       die '--private-home inside Capsule requires CAPSULE_HOME_HOST_DIR or '\
         'an outer Capsule started with --private-home'
     else
       default_home_dir="$(default_private_home_dir)"
-      if [[ -n "${CAPSULE_HOST_PATH_MAP:-}" ]]; then
+      if [[ -n "${CAPSULE_HOST_PATH_MAP:-}" && \
+            "$DOCKER_TARGET_SCOPE" != "local" ]]; then
         CAPSULE_HOME_HOST_DIR="$(
           resolve_mapped_private_home_dir "$default_home_dir"
         )"
@@ -1062,6 +1141,27 @@ podman_request_reason() {
   fi
 }
 
+# Print the reason this invocation cannot use Apple container, if any. Each
+# names a feature the container CLI or its VM bind mounts do not provide.
+apple_request_reason() {
+  local reason=""
+
+  reason="$(podman_request_reason)"
+  if [[ -n "$reason" ]]; then
+    printf '%s\n' "$reason"
+  elif [[ "$PROFILE_GPU" == "all" ]]; then
+    printf '%s\n' 'a GPU profile cannot reach a GPU from a container VM'
+  elif [[ -n "${PROFILE_HOST_SPECS[0]+set}" ]]; then
+    printf '%s\n' 'profile host mappings need --add-host, which it lacks'
+  elif [[ "$PROFILE_HAS_FRAGMENT" -eq 1 ]]; then
+    printf '%s\n' 'profile Dockerfile fragments need build contexts'
+  elif [[ "$HOST_DOCKER" -eq 1 ]]; then
+    printf '%s\n' '--host-docker sockets admit only root in a container VM'
+  elif [[ "$PRIVATE_HOME" -eq 1 ]]; then
+    printf '%s\n' '--private-home cannot keep file ownership on its mounts'
+  fi
+}
+
 # Choose the backend, preferring podman and naming the reason whenever it
 # falls back, so the runtime in use is never a surprise.
 resolve_runtime_backend() {
@@ -1070,6 +1170,21 @@ resolve_runtime_backend() {
 
   if [[ "$RUNTIME_SELECTION" == "docker" ]]; then
     RUNTIME_BACKEND="docker"
+    return
+  fi
+
+  # Apple container is opt-in: "auto" never probes it, and an explicit
+  # request never falls back to another backend.
+  if [[ "$RUNTIME_SELECTION" == "apple" ]]; then
+    reason="$(apple_host_reason)"
+    if [[ -z "$reason" ]]; then
+      reason="$(apple_request_reason)"
+    fi
+    if [[ -n "$reason" ]]; then
+      die "cannot use apple: ${reason}; choose --runtime auto, podman," \
+        "or docker"
+    fi
+    RUNTIME_BACKEND="apple"
     return
   fi
 
@@ -1133,18 +1248,29 @@ path_token() {
 }
 
 # Return a container name that is readable in "podman ps" and unique per run.
+# An optional maximum length shortens the workspace part to fit it.
 podman_container_name() {
+  local max_length="${1:-}"
   local workspace_name=""
   local namespace=""
+  local suffix=""
+  local room=0
 
   workspace_name="$(basename -- "$CAPSULE_HOST_WORKDIR")"
   workspace_name="$(printf '%s' "$workspace_name" | tr -c 'A-Za-z0-9_-' '-')"
+  workspace_name="${workspace_name:-workspace}"
   if [[ -n "$PROFILE_NAMESPACE" ]]; then
     namespace="-${PROFILE_NAMESPACE}"
   fi
+  suffix="${namespace}-$$"
 
-  printf 'capsule-%s%s-%s\n' \
-    "${workspace_name:-workspace}" "$namespace" "$$"
+  if [[ -n "$max_length" ]]; then
+    room=$((max_length - 8 - ${#suffix}))
+    [[ "$room" -ge 1 ]] || room=1
+    workspace_name="${workspace_name:0:$room}"
+  fi
+
+  printf 'capsule-%s%s\n' "$workspace_name" "$suffix"
 }
 
 # Return the volume holding this workspace's inner engine state.
@@ -1240,18 +1366,21 @@ podman_runtime_image_name() {
   podman_image_name
 }
 
-# Build the Capsule image with podman, handing it the token as a build
-# secret so it reaches the build without reaching a layer.
-run_podman_build() {
-  local mise_version="$1"
-  local build_args=()
+# Build the Capsule image with podman or Apple container, handing it the
+# token as a build secret so it reaches the build without reaching a layer.
+run_image_build() {
+  local engine="$1"
+  local mise_version="$2"
+  local build_args=(build)
 
   # Build in Docker format: the OCI format podman defaults to drops
   # the Dockerfile SHELL directive, which would run every RUN step
-  # under /bin/sh instead of the bash the image expects.
-  build_args=(
-    build
-    --format docker
+  # under /bin/sh instead of the bash the image expects. Apple's
+  # BuildKit-based builder keeps it.
+  if [[ "$engine" == "podman" ]]; then
+    build_args+=(--format docker)
+  fi
+  build_args+=(
     -t "$(podman_image_name)"
     --build-arg "MISE_VERSION=${mise_version}"
     --build-arg "CAPSULE_UID=${CAPSULE_UID}"
@@ -1261,6 +1390,9 @@ run_podman_build() {
   if [[ "$NO_CACHE" -eq 1 ]]; then
     build_args+=(--no-cache)
   fi
+
+  # Build steps resolve names like the Capsule will.
+  build_args+=(${DNS_ARGS[@]+"${DNS_ARGS[@]}"})
 
   if [[ -n "${MISE_SYSTEM_TOOLS:-}" ]]; then
     build_args+=(--build-arg "MISE_SYSTEM_TOOLS=${MISE_SYSTEM_TOOLS}")
@@ -1276,7 +1408,7 @@ run_podman_build() {
     )
   fi
 
-  podman "${build_args[@]}" "$SCRIPT_DIR"
+  "$engine" "${build_args[@]}" "$SCRIPT_DIR"
 }
 
 # Translate backend-neutral runtime options into podman flags.
@@ -1365,7 +1497,8 @@ build_podman_run_args() {
     --workdir "$CAPSULE_CONTAINER_WORKDIR"
     --volume "${CAPSULE_HOST_WORKDIR}:${CAPSULE_CONTAINER_WORKDIR}"
     --volume "$home_mount"
-    --volume "$(podman_inner_volume):${CAPSULE_INNER_DIR}"
+    --volume "$(podman_inner_volume):/var/lib/capsule/inner"
+    ${DNS_ARGS[@]+"${DNS_ARGS[@]}"}
     --env "CAPSULE_UID=${CAPSULE_UID}"
     --env "CAPSULE_HOST_WORKDIR=${CAPSULE_HOST_WORKDIR}"
   )
@@ -1406,12 +1539,13 @@ run_podman_backend() {
 
   configure_nested_podman_workdir
   PODMAN_CONTAINER_NAME="$(podman_container_name)"
+  configure_dns
   configure_podman_secret
   trap cleanup_runtime_state EXIT INT TERM
 
   if [[ "$BUILD_MODE" == "all" ]]; then
     mise_version="$(fetch_mise_version)"
-    run_podman_build "$mise_version"
+    run_image_build podman "$mise_version"
   fi
   if [[ "$BUILD_MODE" == "all" || "$BUILD_MODE" == "custom" ]]; then
     run_profile_build podman "$(podman_image_name)"
@@ -1425,6 +1559,158 @@ run_podman_backend() {
   require_podman_image
   build_podman_run_args
   podman "${PODMAN_RUN_ARGS[@]}" || exit_code=$?
+
+  cleanup_runtime_state
+  return "$exit_code"
+}
+
+# Fail early when the local image was never built, because Apple container
+# would otherwise try to pull the tag from docker.io.
+require_apple_image() {
+  local image=""
+
+  [[ -z "${CAPSULE_IMAGE:-}" ]] || return 0
+  image="$(podman_image_name)"
+  if ! container image inspect "$image" >/dev/null 2>&1; then
+    die "image ${image} is not built; run: capsule build --runtime apple"
+  fi
+}
+
+# Create the home volume up front. "container run" would create it too, but
+# then prints a notice into the Capsule's output on first use.
+ensure_apple_home_volume() {
+  local volume="$1"
+
+  if container volume inspect "$volume" >/dev/null 2>&1; then
+    return
+  fi
+  if ! container volume create "$volume" >/dev/null; then
+    die "cannot create container volume: $volume"
+  fi
+}
+
+# Translate backend-neutral runtime options into container flags.
+append_apple_runtime_options() {
+  local index=0
+  local option=""
+  local value=""
+
+  while [[ "$index" -lt "${#RUNTIME_OPTS[@]}" ]]; do
+    option="${RUNTIME_OPTS[$index]}"
+    value="${RUNTIME_OPTS[$((index + 1))]}"
+    index=$((index + 2))
+
+    case "$option" in
+      --publish) APPLE_RUN_ARGS+=(--publish "$value") ;;
+      --volume) APPLE_RUN_ARGS+=(--volume "$value") ;;
+      --env) APPLE_RUN_ARGS+=(--env "$value") ;;
+      --env-file) APPLE_RUN_ARGS+=(--env-file "$value") ;;
+      *) die "unsupported runtime option for apple: $option" ;;
+    esac
+  done
+}
+
+# Assemble the "container run" invocation for this run.
+#
+# The VM starts the image as root, so the entrypoint's root path matches the
+# account to the host user and drops privileges, as on Docker. Bind mounts
+# write as the host user but show every file as root-owned, which git would
+# otherwise refuse as dubious ownership. The Capsule has no engine of its
+# own, so "docker" inside fails at once instead of at the first container.
+build_apple_run_args() {
+  local home_volume="$1"
+
+  APPLE_RUN_ARGS=(
+    run --rm --interactive
+    --name "$(podman_container_name 63)"
+    --workdir "$CAPSULE_CONTAINER_WORKDIR"
+    --volume "${CAPSULE_HOST_WORKDIR}:${CAPSULE_CONTAINER_WORKDIR}"
+    --volume "${home_volume}:/home/user"
+    --memory "${CAPSULE_MEMORY:-$DEFAULT_APPLE_MEMORY}"
+    ${DNS_ARGS[@]+"${DNS_ARGS[@]}"}
+    --env "CAPSULE_UID=${CAPSULE_UID}"
+    --env "CAPSULE_GID=${CAPSULE_GID}"
+    --env "CAPSULE_HOST_WORKDIR=${CAPSULE_HOST_WORKDIR}"
+    --env CAPSULE_INNER_ENGINE=none
+    --env CAPSULE_REQUIRE_HOST_DOCKER=1
+    --env GIT_CONFIG_COUNT=1
+    --env GIT_CONFIG_KEY_0=safe.directory
+    --env 'GIT_CONFIG_VALUE_0=*'
+  )
+
+  if [[ -n "${CAPSULE_CPUS:-}" ]]; then
+    APPLE_RUN_ARGS+=(--cpus "$CAPSULE_CPUS")
+  fi
+
+  if [[ -n "$PODMAN_SECRET_FILE" ]]; then
+    APPLE_RUN_ARGS+=(
+      --volume "${PODMAN_SECRET_FILE}:${CAPSULE_SECRET_PATH}:ro"
+    )
+  fi
+
+  if [[ -t 0 ]] && [[ -t 1 ]]; then
+    APPLE_RUN_ARGS+=(--tty)
+  fi
+  # Image and VM progress lines would otherwise land in piped output.
+  if [[ ! -t 1 ]]; then
+    APPLE_RUN_ARGS+=(--progress none)
+  fi
+
+  if [[ -n "${PROFILE_RUNTIME_OPTS[0]+set}" ]]; then
+    RUNTIME_OPTS=(
+      "${PROFILE_RUNTIME_OPTS[@]}"
+      ${RUNTIME_OPTS[@]+"${RUNTIME_OPTS[@]}"}
+    )
+  fi
+  append_apple_runtime_options
+
+  APPLE_RUN_ARGS+=("$(podman_image_name)")
+
+  if [[ "${#RUNTIME_ARGS[@]}" -gt 0 ]]; then
+    APPLE_RUN_ARGS+=("${RUNTIME_ARGS[@]}")
+  fi
+}
+
+# Collect the --dns flags apple and podman builds and runs share.
+configure_dns() {
+  local servers=""
+  local server=""
+
+  DNS_ARGS=()
+  if ! servers="$(capsule_dns_servers)"; then
+    die "CAPSULE_DNS must list IP addresses or none: ${CAPSULE_DNS}"
+  fi
+  for server in $servers; do
+    DNS_ARGS+=(--dns "$server")
+  done
+}
+
+# Run the whole Apple container path: build when asked, then start the
+# Capsule. Profile images are never built, since resolution rejects the
+# Dockerfile fragments that would need them.
+run_apple_backend() {
+  local mise_version=""
+  local exit_code=0
+  local home_volume="${CAPSULE_HOME_VOLUME:-$DEFAULT_PODMAN_HOME_VOLUME}"
+
+  configure_dns
+  configure_podman_secret
+  trap cleanup_runtime_state EXIT INT TERM
+
+  if [[ "$BUILD_MODE" == "all" ]]; then
+    mise_version="$(fetch_mise_version)"
+    run_image_build container "$mise_version"
+  fi
+
+  if [[ "$BUILD_ONLY" -eq 1 ]]; then
+    cleanup_runtime_state
+    return
+  fi
+
+  require_apple_image
+  ensure_apple_home_volume "$home_volume"
+  build_apple_run_args "$home_volume"
+  container "${APPLE_RUN_ARGS[@]}" || exit_code=$?
 
   cleanup_runtime_state
   return "$exit_code"
@@ -1455,6 +1741,9 @@ initialize_compose_commands() {
   if [[ -n "${GITHUB_API_TOKEN:+set}" ]]; then
     BASE_COMPOSE_CMD+=(-f "$SCRIPT_DIR/compose.github-token.yml")
     COMPOSE_CMD+=(-f "$SCRIPT_DIR/compose.github-token.yml")
+  fi
+  if [[ -n "$BASE_IMAGE_OVERRIDE" ]]; then
+    COMPOSE_CMD+=(-f "$BASE_IMAGE_OVERRIDE")
   fi
   if [[ -n "$CAPSULE_CUSTOM_COMPOSE" ]]; then
     COMPOSE_CMD+=(-f "$CAPSULE_CUSTOM_COMPOSE")
@@ -1497,12 +1786,99 @@ run_compose_build() {
     --build-arg "MISE_VERSION=${mise_version}" cli
 }
 
+# Atomically publish an OCI layout; concurrent exporters may reuse the winner.
+export_local_base_image() (
+  local image_id="$1"
+  local destination="$2"
+  local temporary=""
+
+  temporary="$(mktemp -d "${destination%/*}/.export.XXXXXX")"
+  trap 'rm -rf -- "$temporary"' EXIT
+  mkdir "$temporary/$image_id"
+  podman save --format oci-dir \
+    --output "$temporary/$image_id/layout" "$image_id"
+  printf '%s\n' "$image_id" >"$temporary/$image_id/.complete"
+  # BSD mv can lose a race between checking the target and renaming it.
+  # Reuse a completed winner for this image, but preserve real move errors.
+  if ! mv -n "$temporary/$image_id" "${destination%/*}/" \
+    2>"$temporary/publish-error"; then
+    if [[ -f "$destination/.complete" ]] && \
+      [[ "$(cat "$destination/.complete")" == "$image_id" ]]; then
+      return 0
+    fi
+    cat "$temporary/publish-error" >&2
+    return 1
+  fi
+)
+
+# Make the private Podman image available to the separate BuildKit worker.
+# Normal Docker installations never enter this path or invoke Podman.
+prepare_local_base_context() {
+  local image=""
+  local image_id=""
+  local cache_root="$CAPSULE_INNER_DIR/build-contexts"
+  local cache_dir=""
+  local digest=""
+  local context_spec=""
+  local override_tmp=""
+  local single_quote="'"
+  local doubled_quote="''"
+
+  [[ "$DOCKER_TARGET_SCOPE:$DOCKER_TARGET_ENGINE" == local:podman ]] || \
+    return 0
+  image="$(docker_base_image_name)"
+  if ! image_id="$(docker image inspect --format '{{.Id}}' "$image" \
+    2>/dev/null)"; then
+    die "base image $image is not built; run: capsule build --runtime docker"
+  fi
+  image_id="${image_id#sha256:}"
+  [[ "$image_id" =~ ^[0-9a-f]{64}$ ]] || die 'invalid base image identity'
+  cache_dir="$cache_root/$image_id"
+  mkdir -p "$cache_root"
+  chmod 700 "$cache_root"
+  if [[ ! -e "$cache_dir" ]]; then
+    printf 'capsule: exporting base image context for %s\n' "$image" >&2
+    export_local_base_image "$image_id" "$cache_dir"
+  else
+    printf 'capsule: reusing base image context for %s\n' "$image" >&2
+  fi
+  if [[ ! -f "$cache_dir/.complete" ]] || \
+    [[ "$(cat "$cache_dir/.complete")" != "$image_id" ]]; then
+    die "incomplete base image cache: $cache_dir; clear it when builds stop"
+  fi
+  if ! digest="$(jq -er '.manifests[0].digest | strings |
+    select(test("^sha256:[0-9a-f]{64}$"))' \
+    "$cache_dir/layout/index.json")"; then
+    die "invalid base image cache: $cache_dir; clear it when builds stop"
+  fi
+  BASE_IMAGE_CONTEXT="oci-layout://${cache_dir}/layout@${digest}"
+
+  [[ -n "$CAPSULE_CUSTOM_COMPOSE" ]] || return 0
+  BASE_IMAGE_OVERRIDE="$cache_dir/compose-$(path_token "$image").yml"
+  # Match Buildx's context-name normalization; Bake keeps keys verbatim.
+  context_spec="${image%:latest}=$BASE_IMAGE_CONTEXT"
+  # Escape Compose interpolation and YAML single quotes in generated paths.
+  context_spec="${context_spec//\$/\$\$}"
+  context_spec="${context_spec//$single_quote/$doubled_quote}"
+  override_tmp="$(mktemp "$cache_dir/.compose.XXXXXX")"
+  {
+    printf '%s\n' 'services:' '  cli:' '    build:'
+    printf '%s\n' '      additional_contexts:'
+    printf "        - '%s'\n" "$context_spec"
+  } >"$override_tmp"
+  mv -f "$override_tmp" "$BASE_IMAGE_OVERRIDE"
+  initialize_compose_commands
+}
+
 # Execute the build steps requested by --build or --build-custom.
 run_requested_builds() {
   local mise_version="$1"
 
   if [[ "$BUILD_MODE" == "all" ]]; then
     run_compose_build "$mise_version" "${BASE_COMPOSE_CMD[@]}"
+    if [[ -n "$CAPSULE_CUSTOM_COMPOSE" || "$PROFILE_HAS_FRAGMENT" -eq 1 ]]; then
+      prepare_local_base_context
+    fi
     if [[ -n "$CAPSULE_CUSTOM_COMPOSE" ]]; then
       run_compose_build "$mise_version" "${COMPOSE_CMD[@]}"
     elif [[ "$PROFILE_HAS_FRAGMENT" -eq 1 ]]; then
@@ -1511,6 +1887,7 @@ run_requested_builds() {
   fi
 
   if [[ "$BUILD_MODE" == "custom" ]]; then
+    prepare_local_base_context
     if [[ -n "$CAPSULE_CUSTOM_COMPOSE" ]]; then
       run_compose_build "$mise_version" "${COMPOSE_CMD[@]}"
     else
@@ -1621,12 +1998,15 @@ main() {
   apply_profile_namespace
   configure_custom_compose
   validate_build_mode
+  resolve_runtime_backend
+  if [[ "$RUNTIME_BACKEND" == "docker" ]]; then
+    configure_docker_target
+  fi
   if [[ "$BUILD_ONLY" -ne 1 ]]; then
     initialize_capsule_config
   fi
   configure_target_mode
 
-  resolve_runtime_backend
   if [[ "$RUNTIME_BACKEND" == "podman" ]]; then
     # Consumed by generate_profile_build_files from the sourced profile module.
     # shellcheck disable=SC2034
@@ -1645,7 +2025,12 @@ main() {
     run_podman_backend
     return
   fi
+  if [[ "$RUNTIME_BACKEND" == "apple" ]]; then
+    run_apple_backend
+    return
+  fi
 
+  start_docker_target
   configure_docker_gid
   initialize_compose_commands
 

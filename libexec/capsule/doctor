@@ -16,12 +16,17 @@ set -euo pipefail
 
 # shellcheck disable=SC1091
 source "$(dirname -- "${BASH_SOURCE[0]}")/../../lib/capsule/podman.sh"
+# shellcheck disable=SC1091
+source "$(dirname -- "${BASH_SOURCE[0]}")/../../lib/capsule/apple.sh"
+# shellcheck disable=SC1091
+source "$(dirname -- "${BASH_SOURCE[0]}")/../../lib/capsule/dns.sh"
 
 PASS_COUNT=0
 WARN_COUNT=0
 FAIL_COUNT=0
 DOCKER_USABLE=0
 PODMAN_USABLE=0
+APPLE_USABLE=0
 PASS_LABEL="PASS"
 WARN_LABEL="WARN"
 FAIL_LABEL="FAIL"
@@ -262,6 +267,7 @@ check_podman() {
 
   if [[ "$(uname -s)" == "Darwin" ]]; then
     check_podman_machine || return 0
+    check_vm_dns 'podman Capsules' 'podman machine' || return 0
   else
     check_session_bus || return 0
     check_podman_cgroups || return 0
@@ -270,6 +276,80 @@ check_podman() {
 
   check_podman_runtime
   PODMAN_USABLE=1
+}
+
+# Report the DNS servers Capsules in a Mac VM will get: SUBJECT names them
+# and OWNER the VM resolver that CAPSULE_DNS=none keeps. That resolver does
+# not answer quickly on every Mac, so the backend passes the host's instead.
+check_vm_dns() {
+  local subject="$1"
+  local owner="$2"
+  local servers=""
+  local source="the Mac's resolvers"
+
+  if ! servers="$(capsule_dns_servers)"; then
+    fail 'CAPSULE_DNS lists something that is not an IP address' \
+      "set CAPSULE_DNS to IP addresses, or to none for ${owner}'s resolver"
+    return 1
+  fi
+  [[ -z "${CAPSULE_DNS:-}" ]] || source="CAPSULE_DNS"
+
+  if [[ "${CAPSULE_DNS:-}" == "none" ]]; then
+    pass "$subject use ${owner}'s own resolver (CAPSULE_DNS=none)"
+  elif [[ -n "$servers" ]]; then
+    pass "$subject use DNS ${servers//$'\n'/ } (from $source)"
+  else
+    warn "the Mac lists no DNS server that $subject can reach" \
+      'set CAPSULE_DNS, for example CAPSULE_DNS=1.1.1.1'
+  fi
+}
+
+# Check the opt-in Apple container backend. It exists only on macOS, so other
+# hosts print nothing for it.
+check_apple() {
+  local major=""
+
+  [[ "$(uname -s)" == "Darwin" ]] || return 0
+  section 'Apple container backend (opt-in: --runtime apple)'
+
+  if [[ "$(uname -m)" != "arm64" ]]; then
+    warn 'this Mac is not Apple silicon' \
+      'Apple container needs Apple silicon; use Docker or podman'
+    return 0
+  fi
+
+  if ! have container; then
+    warn 'container is not installed' \
+      'install container 1.6+ from github.com/apple/container/releases'
+    return 0
+  fi
+  pass 'container is installed'
+
+  if ! apple_system_running; then
+    fail 'the container service is not running' \
+      'run: container system start'
+    return 0
+  fi
+  pass 'the container service is running'
+
+  # Homebrew installs leave this unset, and every VM, builds included, then
+  # fails with "default kernel not configured".
+  if ! container system property list --format json 2>/dev/null |
+    grep -q '"binaryPath" *: *"[^"]'; then
+    warn 'no Linux kernel appears to be configured for container VMs' \
+      'run: container system kernel set --recommended'
+    return 0
+  fi
+  pass 'a Linux kernel is configured for container VMs'
+
+  check_vm_dns 'container VMs' Apple || return 0
+
+  major="$(sw_vers -productVersion 2>/dev/null | cut -d. -f1 || true)"
+  if [[ "$major" =~ ^[0-9]+$ ]] && [[ "$major" -lt 26 ]]; then
+    warn "macOS $major lacks networking that container relies on" \
+      'upgrade to macOS 26 or newer'
+  fi
+  APPLE_USABLE=1
 }
 
 # Check the tools this repository's own checks and builds reach for.
@@ -314,14 +394,16 @@ main() {
 
   check_docker
   check_podman
+  check_apple
   check_tooling
 
   section 'Summary'
-  if [[ "$DOCKER_USABLE" -eq 1 ]] || [[ "$PODMAN_USABLE" -eq 1 ]]; then
+  if [[ "$DOCKER_USABLE" -eq 1 ]] || [[ "$PODMAN_USABLE" -eq 1 ]] ||
+    [[ "$APPLE_USABLE" -eq 1 ]]; then
     pass 'at least one backend can run the Capsule'
   else
     fail 'no backend can run the Capsule' \
-      'fix the Docker or podman findings above'
+      'fix the backend findings above'
   fi
 
   printf '\n%d passed, %d warnings, %d failed\n' \

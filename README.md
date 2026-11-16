@@ -27,6 +27,7 @@ common developer tools.
   - [Checking your environment](#checking-your-environment)
   - [Shell completion](#shell-completion)
   - [Runtime backends: podman and Docker](#runtime-backends-podman-and-docker)
+  - [Apple container backend](#apple-container-backend)
   - [Listing running Capsules](#listing-running-capsules)
   - [UID and GID detection](#uid-and-gid-detection)
   - [Directory approval list](#directory-approval-list)
@@ -52,6 +53,9 @@ common developer tools.
 - Optionally rootless [podman](https://podman.io) 4.9+, to run the Capsule
   with a container engine of its own instead of the host daemon
   ([what it needs](#what-the-podman-backend-needs))
+- Optionally Apple's [`container`](https://github.com/apple/container) 1.6+ on
+  macOS 26+ with Apple silicon, opted into with `--runtime apple`
+  ([what differs](#apple-container-backend))
 - Access to Claude or Codex.
 
 Run [`capsule doctor`](#checking-your-environment) to check all of this and get
@@ -350,7 +354,8 @@ capsule doctor
 It covers both backends -- the Docker client, its compose plugin and daemon;
 podman's rootless mode, sub-id range, systemd user scopes, delegated cgroup
 controllers, OCI runtime and lingering, or the podman machine on macOS -- and
-the linters this repository's own checks reach for.
+the linters this repository's own checks reach for. On macOS it also checks
+the opt-in Apple container backend: the CLI, its service, and the VM kernel.
 
 A warning costs a capability and leaves the host usable. A failure means
 something that looks available cannot actually run, and the command exits
@@ -382,9 +387,22 @@ capsule completion fish >~/.config/fish/completions/capsule.fish
 
 ### Runtime backends: podman and Docker
 
-Capsule can start its container two ways. The Docker backend runs
-`docker compose run cli`, as it always has, and shares the host's Docker
-daemon. The podman backend runs the same image as a rootless
+Current Capsule engine support:
+
+| Backend | Inner Podman | Inner `dockerd` | Default `docker` target |
+| --- | --- | --- | --- |
+| Docker | Supported | Optional | Host Docker |
+| Podman | Default inner engine | Optional | Inner Podman Docker API |
+| Apple container | Unsupported | Unsupported | No local engine |
+
+Inner `dockerd` requires an image built with `CAPSULE_WITH_DOCKERD=1`.
+A bound host Docker socket takes priority; select an explicit endpoint to
+use an inner daemon instead. Podman binds the host socket only when requested
+with `--host-docker`. Inner Podman is covered by E2E tests; inner `dockerd`
+requires separate validation. Host Podman remains optional for Docker builds.
+
+The Docker backend runs `docker compose run cli` and shares the host's Docker
+daemon. The Podman backend runs the same image as a rootless
 [podman](https://podman.io) container that carries **its own container
 engine**, so the chain becomes:
 
@@ -417,6 +435,10 @@ CAPSULE_RUNTIME=podman capsule     # the same choice, from the environment
 naming the reason. Explicit `podman` selection fails instead of falling back:
 it never silently exchanges the private engine for host-daemon access.
 
+Podman is optional on the host. When it is not installed, `auto` selects
+Docker quietly. Docker base, custom Compose, and profile builds require no
+host Podman installation.
+
 The selected backend applies only to the current invocation. Podman does not
 set `CAPSULE_RUNTIME` inside the Capsule: nested commands default to `auto`,
 so remote and custom-Compose requests can use Docker. Set a nested command's
@@ -441,7 +463,12 @@ so remote and custom-Compose requests can use Docker. Set a nested command's
 
 *   **A Linux VM on macOS**, which podman manages itself (`podman machine
     init && podman machine start`). The workspace must live under `$HOME`
-    for the machine to see it.
+    for the machine to see it. The machine's own resolver, which pasta
+    forwards container lookups to, can take minutes per lookup on some
+    networks, so on a Mac the Capsule and its image builds get your Mac's
+    DNS servers instead, as with the apple backend (see `CAPSULE_DNS`). A
+    running Capsule keeps the servers it started with; restart it after
+    the Mac changes networks.
 
 Unlike the Docker backend, no AppArmor or sysctl change is needed on Ubuntu
 23.10+: podman's rootless path works there as shipped.
@@ -622,6 +649,41 @@ commands using `--remote` therefore reach the requested remote daemon. The
 context lookup honors `--config DIR`, `--config=DIR`, and `DOCKER_CONFIG`.
 The image's own default socket still uses normal Capsule routing.
 
+`capsule-docker endpoint` reports the same routing decision without starting
+an engine. Its output has three tab-separated fields: scope (`local`, `host`,
+`external`, or `none`), engine (`podman`, `dockerd`, `docker`, `external`, or
+`none`), and endpoint URI (`-` when there is no engine). Add `--start` to start
+a selected local engine when needed. Capsule uses this interface to resolve
+nested mounts and pins that endpoint for the invocation.
+
+When Capsule builds its own custom or profile image through the private
+Podman API, BuildKit runs in a separate container and cannot read Podman's
+local image store. Capsule exports its base image as an OCI layout and passes
+it as an additional build context. A custom Compose file's explicit context
+with the same name takes precedence. This context name omits the default
+`:latest` tag, for example `casual-capsule-cli`, matching Buildx's lookup.
+Docker profile builds load their result
+into the selected engine so the image is ready to run.
+
+The export cache lives at `/var/lib/capsule/inner/build-contexts/` in the
+workspace's private engine volume. Entries are keyed by the immutable base
+image ID and published atomically, including during concurrent builds.
+Repeated builds reuse an entry; changing the base image creates a new one.
+`--no-cache` still rebuilds Dockerfile steps while reusing an unchanged base
+export. An export can occupy roughly the base image's size. Old entries are
+retained until removed manually. With all builds stopped, inspect and clear
+only this export cache from inside its owning Capsule:
+
+```bash
+du -sh /var/lib/capsule/inner/build-contexts
+rm -rI -- /var/lib/capsule/inner/build-contexts
+```
+
+The removal command asks for confirmation. A later build recreates the cache;
+engine images and volumes are kept. This integration covers Capsule's own
+builds. Other projects using local base images with a containerized BuildKit
+worker must supply their build contexts themselves.
+
 Both backends preserve piped and redirected stdin without allocating a TTY:
 
 ```bash
@@ -656,6 +718,13 @@ still enforce the selected endpoint and fail if it cannot be reached.
     If a requested host socket does not answer, commands fail instead of
     silently starting a private engine.
 
+*   **The inner engine's default network is `10.87.0.0/16`.** podman's usual
+    `10.88.0.0/16` is also where a host's podman, such as a rootful podman
+    machine, puts the Capsule itself, and the same subnet inside would cut
+    `docker run` and BuildKit off from the outside. Set `default_subnet` in
+    `~/.config/containers/containers.conf` if that range is taken on your
+    network.
+
 *   **Publishing a port takes two hops.** The project publishes to the
     Capsule, and `capsule --publish` publishes the Capsule to the host, so
     a service on 8080 wants `capsule --publish 8080:8080` as well as the
@@ -669,6 +738,73 @@ still enforce the selected endpoint and fail if it cannot be reached.
     invocations use the Docker backend under `auto` and say so. Explicit
     `--runtime podman` rejects them.
 
+### Apple container backend
+
+On macOS 26 or newer with Apple silicon, Capsule can also run on Apple's
+[`container`](https://github.com/apple/container) CLI, which starts every
+container in a lightweight Linux VM of its own:
+
+```
+host -> container (one VM per container) -> capsule
+```
+
+This backend is opt-in. `auto` never probes or selects it, and an explicit
+selection never falls back to another backend; it fails and names the reason.
+
+```bash
+container system start                     # once per boot
+container system kernel set --recommended  # once; Homebrew installs skip it
+capsule build --runtime apple              # Apple keeps its own image store
+capsule --runtime apple
+CAPSULE_RUNTIME=apple capsule claude
+```
+
+`capsule doctor` checks the service, the VM kernel, the DNS servers VMs get,
+and the macOS version.
+
+#### What differs inside an Apple container Capsule
+
+*   **Inner engines are currently unsupported.** Capsule sets
+    `CAPSULE_INNER_ENGINE=none`, so local engine use fails immediately.
+    Use the Podman or Docker backend for projects that run containers.
+
+*   **The host Docker socket is out of reach.** A socket bound into the VM is
+    usable only by root inside it, so `--host-docker` is rejected.
+
+*   **Workspace files look root-owned.** Writes land as your Mac user, but
+    inside the VM every bind-mounted file shows `root:root` and `chown` has no
+    effect. Capsule sets git's `safe.directory=*` through `GIT_CONFIG_*`, so
+    git still accepts the repository. `--private-home` is rejected because a
+    bind-mounted home cannot keep its ownership.
+
+*   **Images and the home live in Apple's store.** `capsule build --runtime
+    apple` builds `casual-capsule:local` there, and the home is the
+    `casual-capsule-home` volume (`CAPSULE_HOME_VOLUME`). A new home volume
+    starts empty, so the entrypoint copies `/etc/skel` into it once.
+
+*   **The VM gets 8 GiB of memory.** Apple's default is 1 GiB, which is tight
+    for agents. Set `CAPSULE_MEMORY` (for example `16g`) or `CAPSULE_CPUS` to
+    resize it.
+
+*   **Builds and the Capsule use your Mac's DNS servers.** Apple's own VM
+    resolver does not answer on every Mac, for example behind some VPN
+    clients; `apt-get update` then shows only `Ign:` lines and nothing
+    resolves. Capsule passes the IPv4 servers from `/etc/resolv.conf` as
+    `--dns`, skipping loopback ones a VM cannot reach. Set `CAPSULE_DNS`
+    (for example `1.1.1.1`) to choose others, or `CAPSULE_DNS=none` to keep
+    Apple's resolver.
+
+*   **Some features are unavailable:** GPU profiles, `--remote`, custom
+    compose files, and profiles with `host` mappings or Dockerfile fragments,
+    because the CLI has no `--add-host` and no build contexts. Profiles with
+    `[env]`, `volume`, and `publish` work.
+
+*   **The hostname is the container name** (`capsule-<workspace>-<pid>`),
+    because the CLI has no `--hostname`.
+
+*   **Nothing is privileged.** The Capsule runs unprivileged, and its VM is
+    the isolation boundary.
+
 ### Listing running Capsules
 
 Use `capsule list` to query running Capsules without starting one:
@@ -677,11 +813,14 @@ Use `capsule list` to query running Capsules without starting one:
 capsule list
 capsule list --runtime docker
 capsule list --runtime podman
+capsule list --runtime apple
 ```
 
 The default `auto` selection queries Docker's configured endpoint and local
-podman. The output includes the runtime, host user, container ID and name,
-uptime, image, status, published ports, and host workspace directory.
+podman, and on macOS also Apple container when its service is running. Apple
+listing reads `container ls` JSON with `jq`, which macOS ships. The output
+includes the runtime, host user, container ID and name, uptime, image, status,
+published ports, and host workspace directory.
 
 When `DOCKER_HOST`, `DOCKER_CONTEXT`, or the active Docker context selects a
 non-local endpoint, the target column shows that endpoint. Capsule leaves its
@@ -1010,9 +1149,11 @@ path back to the daemon-host path before asking Docker to create the
 `/home/workspace` bind mount.
 
 Inside a Capsule, do not reset `CAPSULE_HOST_WORKDIR`. The outer Capsule sets
-it to the daemon-host workspace root, and nested launches reuse it
-automatically when they use Docker. When a nested launch selects local podman,
-Capsule automatically uses the current container path instead. Use
+it to the daemon-host workspace root. Nested launches reuse it when targeting
+that daemon, and use the current container path when targeting a local
+Podman or dockerd engine, including through the Docker API. Profile bind
+sources follow the same rule. Compose also mounts the selected local engine
+socket into the child Capsule. Use
 `CAPSULE_HOST_PATH_MAP` only when the current non-Capsule container sees the
 same files under a different absolute path.
 
@@ -1078,12 +1219,15 @@ Run options:
     `docker compose` against `ssh://HOST[:PORT]` and mount `/abs/path` as
     `/home/workspace` on that remote host.
 
-*   `--runtime podman|docker|auto`: Choose the backend that runs the Capsule.
-    `auto`, the default, prefers podman and falls back to Docker with the
-    reason named. Explicit `podman` fails if unavailable or incompatible.
+*   `--runtime podman|docker|apple|auto`: Choose the backend that runs the
+    Capsule. `auto`, the default, prefers podman and falls back to Docker with
+    the reason named. Explicit `podman` fails if unavailable or incompatible.
+    `apple` is never chosen by `auto`; see
+    [Apple container backend](#apple-container-backend).
 
 *   `--host-docker`: Bind the host's Docker socket into the Capsule. Only
     meaningful on the podman backend, which is otherwise isolated from it.
+    The apple backend rejects it.
 
 *   `--publish HOST[:CONTAINER]`: Publish a container port on the host when
     running the container. May be passed multiple times.
@@ -1115,15 +1259,16 @@ Build options:
 
 *   `-r`, `--remote HOST[:PORT]`: Build on a remote Docker host.
 
-*   `--runtime podman|docker|auto`: Select the build backend.
+*   `--runtime podman|docker|apple|auto`: Select the build backend.
 
 List options:
 
 *   `-r`, `--remote HOST[:PORT]`: Query a remote Docker host. A workdir suffix
     is accepted but ignored.
 
-*   `--runtime podman|docker|auto`: Select local runtimes to query. `auto`
-    queries both.
+*   `--runtime podman|docker|apple|auto`: Select local runtimes to query.
+    `auto` queries Docker and podman, plus Apple container on macOS when its
+    service is running.
 
 Other subcommands:
 
@@ -1167,27 +1312,45 @@ empty value, `0`, `false`, `no`, or `off`.
     Default: empty.
 
 *   `CAPSULE_RUNTIME`: Backend used by run, build, or list: `auto`, `podman`,
-    or `docker`.
+    `docker`, or `apple`.
 
-    Default: `auto`, which prefers podman when the host can run it rootless.
+    Default: `auto`, which prefers podman when the host can run it rootless
+    and never selects `apple`.
 
-*   `CAPSULE_IMAGE`: Image tag the podman backend builds and runs.
+*   `CAPSULE_IMAGE`: Image tag the podman and apple backends build and run.
 
     Default: `casual-capsule:local`. Set it to run a prebuilt image, which
     also turns off the "image is not built" check.
 
-    A prebuilt image must have been built with the same
+    On podman, a prebuilt image must have been built with the same
     `CAPSULE_UID`/`CAPSULE_GID` as the host account, because keep-id
     maps you onto that uid and nothing inside can adjust it.
 
-*   `CAPSULE_HOME_VOLUME`: podman volume mounted at `/home/user`.
+*   `CAPSULE_HOME_VOLUME`: podman or apple volume mounted at `/home/user`.
 
     Default: `casual-capsule-home`. Ignored under `--private-home`.
 
-*   `CAPSULE_INNER_VOLUME`: Volume holding the inner engine's images,
+*   `CAPSULE_INNER_VOLUME`: Volume holding the podman inner engine's images,
     volumes and containers.
 
     Default: derived from the workspace path, so each project gets its own.
+
+*   `CAPSULE_MEMORY`: Memory for the apple backend's VM, such as `16g`.
+
+    Default: `8g`. Docker and podman ignore it.
+
+*   `CAPSULE_CPUS`: CPUs for the apple backend's VM.
+
+    Default: empty, which keeps Apple's own default. Docker and podman ignore
+    it.
+
+*   `CAPSULE_DNS`: DNS servers for the apple and podman backends' builds and
+    Capsules, as IP addresses separated by spaces or commas, or `none` for
+    the engine's own resolver.
+
+    Default: empty, which uses the Mac's IPv4 resolvers from
+    `/etc/resolv.conf` on macOS and podman's own DNS on Linux. Docker
+    ignores it.
 
 *   `CAPSULE_WITH_DOCKERD`: Build the image with a real Docker Engine.
 
@@ -1214,6 +1377,11 @@ empty value, `0`, `false`, `no`, or `off`.
 *   `DOCKER_HOST`: Docker daemon endpoint for `docker compose`.
 
     Default: Docker CLI default. `--remote` sets `ssh://HOST[:PORT]`.
+
+*   `CAPSULE_DOCKER_SOCKET_SOURCE`: Daemon-visible socket source in Compose.
+
+    Default: `/var/run/docker.sock`. The launcher sets this to the private
+    socket when using an engine inside the current Capsule.
 
 *   `CAPSULE_HOME_HOST_DIR`: Host path bound to `/home/user` when
     `--private-home` is active.
@@ -1294,17 +1462,53 @@ running inside it, use the untracked operator check:
 $ tmp/verify-podman-backend.sh
 ```
 
+The apple backend is covered by the fast suite with a mocked `container` CLI.
+GitHub CI also runs the fast suite in a `macos` job on Apple silicon under
+the system Bash 3.2, which keeps the scripts within the Bash 3.2 baseline.
+That job then installs `container`, starts its service, and requires
+`capsule doctor` to pass the Apple container host checks. GitHub's macOS
+runners cannot nest VMs, so they cannot start an Apple container; a manual
+run of the workflow only probes whether one boots. The end-to-end case
+therefore runs only on a Mac that opts in:
+
+```bash
+$ CAPSULE_E2E_APPLE=1 tests/suite_e2e.sh
+```
+
+The untracked operator probe `tmp/probe-apple-container.sh` records the
+`container` CLI behavior the backend relies on.
+
 Run checks and tests inside a Capsule:
 
 ```bash
-$ capsule tests/check_all.sh
-$ capsule tests/test_all.sh
+$ capsule --runtime docker -- tests/check_all.sh
+$ capsule --runtime docker -- tests/test_all.sh
+$ capsule --runtime podman -- tests/test_all.sh
 ```
+
+Rebuild the outer image with `--build` when testing updated engine-router
+code. An older image can still use its bound host Docker socket; private
+engine routing requires the updated `endpoint` interface.
+
+| Outer backend | Docker/Compose E2E target | Expected coverage |
+| --- | --- | --- |
+| Docker | Bound host Docker | Base, custom, profile, and nested Podman cases. |
+| Podman | Private Podman API by default | The same cases without host Docker. |
+| Apple | No inner engine | Fast suite and engine-independent E2E checks. |
+
+Fast storage permission checks require a mapped user namespace and can skip
+on Docker and Apple. The controller-container E2E additionally requires
+`/var/run/docker.sock`; the router's alternate socket alone does not satisfy
+that fixture. Apple Capsule skips Docker and Podman E2E prerequisites by
+design. To test the Apple backend itself, run the opt-in command above on
+the Mac host, where the `container` service can start VMs.
 
 `check_all.sh` runs `dclint`, `hadolint`, and `shellcheck` on discovered files.
 When one of these tools is missing, it prints a warning and skips that linter.
 
-`test_all.sh` prints each suite name before running it.
+`test_all.sh` prints each suite name before running it. Both suites and
+`check_all.sh` report through `tests/lib/harness.sh`, so they share one
+pass, fail, and skip format and one summary.
 
 GitHub CI runs the same two nested checks as separate matrix jobs. It enables
 strict e2e mode there, so a missing Docker or rootless Podman prerequisite
@@ -1316,10 +1520,14 @@ The native Podman end-to-end test still uses its own private engine. The test
 runner clears inherited `CAPSULE_RUNTIME` so each suite chooses its backend.
 
 *   The fast suite uses command stubs, so it does not require a running Docker
-    daemon. Its temporary fixtures live under `_build/tests/` and are removed
-    after the run. Native capability checks need a filesystem that permits
-    file-capability execution; they deliberately avoid the system temporary
-    directory, which is often mounted with `nosuid`.
+    daemon. Its temporary fixtures live in the system temporary directory and
+    are removed after the run. The stubs need a mount without `noexec`, and
+    native capability checks one without `nosuid`; when the temporary
+    directory has either option, the fixtures live under `_build/tests/`
+    instead. They otherwise stay off the workspace, because a workspace
+    shared with a VM can change files behind the suite: Colima's mount
+    inotify replays file events as `chmod` calls, which can clear a stub's
+    execute bit.
 
 *   The end-to-end suite builds and runs the real capsule image when Docker and
     Compose are available. It skips cleanly when the daemon is unavailable.
@@ -1391,6 +1599,9 @@ The Docker backend runs the Capsule as a privileged container and mounts the
 host Docker socket at `/var/lib/capsule/docker.sock`. Either capability can
 provide host-level access. Do not use this setup with untrusted code or on
 shared hosts.
+
+The apple backend runs the Capsule unprivileged in a VM of its own and binds
+no Docker socket into it.
 
 ## 📄 License
 

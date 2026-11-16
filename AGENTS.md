@@ -83,6 +83,10 @@ Assisted-by: Copilot:claude-sonnet-4.6
   logic.
 - `lib/capsule/podman.sh`: Shared rootless UID/GID capacity checks for the
   launcher, doctor, E2E tests, and CI.
+- `lib/capsule/apple.sh`: Shared Apple container host checks (macOS, Apple
+  silicon, running service) for the launcher, list, doctor, and E2E tests.
+- `lib/capsule/dns.sh`: DNS servers the apple and podman backends pass to
+  Capsules and builds (`CAPSULE_DNS`, else the Mac's resolvers on macOS).
 - `lib/capsule/profile.sh`: Strict profile parser, generated image build, and
   backend-neutral runtime-option mapping.
 - `libexec/capsule/`: Implementations of the `run`, `build`, `list`, `doctor`,
@@ -91,10 +95,12 @@ Assisted-by: Copilot:claude-sonnet-4.6
 - `docker/entrypoint.sh`: Root entrypoint; syncs UID/GID, Docker socket
   group, nested Podman ID ranges, and home ownership, then execs as `user`.
   Under podman the container already starts as `user`, so it only refreshes
-  credentials.
+  credentials. Under Apple container the VM starts as root, so the root path
+  applies and also seeds an empty home volume from `/etc/skel` once.
 - `docker/capsule-docker.sh`: The Capsule's `docker` router and the
   `capsule-docker` engine switch; starts the podman API socket or a
-  rootless `dockerd` on first use.
+  rootless `dockerd` on first use, and fails at once in a Capsule without an
+  engine (`CAPSULE_INNER_ENGINE=none`, the apple backend).
 - `docker/remap-storage.c`: Native storage ownership migration; preserves
   set-ID modes and file capabilities, including namespace-root UID remapping.
 - `docker/containers.conf`, `docker/registries.conf`,
@@ -107,5 +113,8 @@ Assisted-by: Copilot:claude-sonnet-4.6
 - `tests/check_all.sh`: Repo-wide lint/check script.
 - `tests/suite_fast.sh`: Fast Bash contract tests.
 - `tests/suite_e2e.sh`: Docker- and podman-backed end-to-end tests;
-  the podman case skips where the host cannot run rootless.
+  the podman case skips where the host cannot run rootless, and the Apple
+  container case runs only on a Mac with `CAPSULE_E2E_APPLE=1`.
 - `tests/test_all.sh`: Runs fast then e2e suites.
+- `tests/lib/harness.sh`: Shared pass/fail/skip reporting, assertions, and
+  summary for the suites and `check_all.sh`.
